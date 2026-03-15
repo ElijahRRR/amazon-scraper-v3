@@ -41,3 +41,16 @@
 - 修复: get_progress 缺少 completion_rate/success_rate
 - 修复: 模板字段名不匹配 (batch_name→name, total→total_tasks, done→completed)
 - 修复: workers.html status 字段类型 (w.status==='online' → w.online)
+
+### Session 1 - Iterations 3-20
+- Iteration 3: Server 全页面 + API 端点加载测试通过
+- Iteration 4: tasks.html Jinja2 + JS 字段名修复
+- Iteration 5: 端到端全链路测试 (12项检查全通过)
+- Iteration 6: 变动检测端到端验证 (4类变动准确分类)
+- Iteration 7: 清除所有 v2 品牌标识 → v3
+- Iteration 8-9: Worker batch_name/截图路径审查 (无需修改)
+- Iteration 10: Keyset 分页验证 (150条3页无重复)
+- Iteration 11-14: Code review + export/all 路由遮蔽修复
+- Iteration 15: 低配服务器内存优化审查 (SQLite 16MB cache + 32MB mmap)
+- Iteration 16-19: Worker 返回值链/uvicorn 兼容性/batch_id 验证
+- Iteration 20: 最终综合验证 29/29 测试全通过

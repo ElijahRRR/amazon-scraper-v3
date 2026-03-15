@@ -325,6 +325,18 @@ class AmazonSession:
             logger.error(f"❌ 请求失败 ASIN={asin}: {e}")
             return None
 
+    async def fetch_product_page_by_url(self, url: str) -> Optional[Response]:
+        """请求任意 Amazon URL（用于 AOD AJAX 等辅助请求）"""
+        if not self._initialized or self._session is None:
+            return None
+        try:
+            headers = self._build_headers(referer=self._last_url or f"{self.AMAZON_BASE}/")
+            resp = await self._session.get(url, headers=headers)
+            return resp
+        except Exception as e:
+            logger.debug(f"辅助请求失败: {e}")
+            return None
+
     def is_ready(self) -> bool:
         """检查 session 是否已初始化并可用"""
         return self._initialized and self._session is not None

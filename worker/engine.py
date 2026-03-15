@@ -1183,8 +1183,7 @@ class Worker:
                 if result_data.get("current_price") == "No Featured Offer":
                     try:
                         aod_url = f"https://www.amazon.com/gp/product/ajax/aodAjaxMain/ref=dp_aod_unknown_mbc?asin={asin}&m=&qid=&smid=&sourcecustomerorglistid=&sourcecustomerorglistitemid=&sr=&pc=dp"
-                        olp_resp = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda: session.fetch_page(aod_url))
+                        olp_resp = await session.fetch_product_page_by_url(aod_url)
                         if olp_resp and hasattr(olp_resp, 'text') and olp_resp.text:
                             offer = self.parser.parse_offer_listing(olp_resp.text)
                             if offer and offer.get('price'):

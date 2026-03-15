@@ -666,7 +666,7 @@ async def api_update_settings(request: Request):
 
     _settings_version += 1
     _save_settings()
-    return {"ok": True, "version": _settings_version}
+    return {"ok": True, "version": _settings_version, "settings": _runtime_settings}
 
 
 # ==================== API: 导出 ====================

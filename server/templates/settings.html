@@ -58,57 +58,15 @@
                     <div class="row g-3">
                         <div class="col-md-4">
                             <label class="form-label">代理模式</label>
-                            <select class="form-select" name="proxy_mode" id="proxyModeSelect"
-                                    onchange="toggleTunnelConfig()">
-                                <option value="tps" {{ 'selected' if settings.proxy_mode == 'tps' }}>TPS（每次换IP）</option>
-                                <option value="tunnel" {{ 'selected' if settings.proxy_mode == 'tunnel' }}>隧道（定时换IP）</option>
-                            </select>
-                            <small class="text-secondary">切换模式将联动调整 QPS/并发/带宽等参数</small>
+                            <input type="text" class="form-control" value="TPS（每次请求自动换 IP）" disabled>
+                            <small class="text-secondary">v3 仅支持 TPS 模式</small>
                         </div>
                         <div class="col-8">
                             <label class="form-label">代理地址</label>
-                            <input type="text" class="form-control" name="tunnel_proxy_url"
-                                   value="{{ settings.tunnel_proxy_url or settings.proxy_api_url }}"
-                                   placeholder="支持：ip:port@user:pwd / user:pwd@host:port / http://user:pwd@host:port">
-                            <small class="text-secondary">填入代理地址保存后自动转换格式，支持快代理 API 地址或帐密隧道代理</small>
-                        </div>
-                    </div>
-                    <div id="tunnelConfig" class="row g-3 mt-1" style="{{ '' if settings.proxy_mode == 'tunnel' else 'display:none' }}">
-                        <div class="col-md-4">
-                            <label class="form-label">通道数</label>
-                            <input type="number" class="form-control" name="tunnel_channels"
-                                   value="{{ settings.tunnel_channels }}" min="1" max="32">
-                            <small class="text-secondary">同时获取的代理数量</small>
-                        </div>
-                        <div class="col-md-4">
-                            <label class="form-label">IP 轮换周期</label>
-                            <input type="number" class="form-control" name="tunnel_rotate_interval"
-                                   value="{{ settings.tunnel_rotate_interval }}" min="10" max="300">
-                            <small class="text-secondary">秒，到期后重新获取代理</small>
-                        </div>
-                        <div class="col-md-4">
-                            <label class="form-label">DPS 最大并发</label>
-                            <input type="number" class="form-control" name="tunnel_max_concurrency"
-                                   value="{{ settings.tunnel_max_concurrency }}" min="8" max="200">
-                            <small class="text-secondary">隧道模式并发上限（所有通道合计）</small>
-                        </div>
-                        <div class="col-md-4">
-                            <label class="form-label">DPS 初始并发</label>
-                            <input type="number" class="form-control" name="tunnel_initial_concurrency"
-                                   value="{{ settings.tunnel_initial_concurrency }}" min="2" max="100">
-                            <small class="text-secondary">隧道模式冷启动并发数</small>
-                        </div>
-                        <div class="col-md-4">
-                            <label class="form-label">Per-Channel QPS</label>
-                            <input type="number" class="form-control" name="per_channel_qps"
-                                   value="{{ settings.per_channel_qps }}" step="0.5" min="0.5" max="20">
-                            <small class="text-secondary">每通道独立限流速率</small>
-                        </div>
-                        <div class="col-md-4">
-                            <label class="form-label">Per-Channel 最大并发</label>
-                            <input type="number" class="form-control" name="per_channel_max_concurrency"
-                                   value="{{ settings.per_channel_max_concurrency }}" min="1" max="30">
-                            <small class="text-secondary">每通道 AIMD 并发上限</small>
+                            <input type="text" class="form-control" name="proxy_url"
+                                   value="{{ settings.proxy_url }}"
+                                   placeholder="http://user:pwd@host:port">
+                            <small class="text-secondary">TPS 隧道代理地址（帐密认证，每次请求自动换 IP）</small>
                         </div>
                     </div>
 
@@ -116,8 +74,7 @@
 
                     <!-- 速率与并发 -->
                     <h6 class="mb-3" style="color:var(--accent-light);"><i class="bi bi-speedometer2"></i> 速率与并发</h6>
-                    <!-- TPS 专属字段 -->
-                    <div id="tpsConfig" class="row g-3" style="{{ '' if settings.proxy_mode == 'tps' else 'display:none' }}">
+                    <div class="row g-3">
                         <div class="col-md-3">
                             <label class="form-label">全局总并发上限</label>
                             <input type="number" class="form-control" name="global_max_concurrency"
@@ -332,13 +289,11 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     // 数值类型转换
     const intFields = ['max_retries', 'request_timeout', 'session_rotate_every', 'initial_concurrency',
                        'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
-                       'proxy_bandwidth_mbps', 'screenshot_browsers', 'screenshot_pages_per_browser', 'global_max_concurrency',
-                       'tunnel_channels', 'tunnel_rotate_interval',
-                       'tunnel_max_concurrency', 'tunnel_initial_concurrency',
-                       'per_channel_max_concurrency'];
+                       'proxy_bandwidth_mbps', 'screenshot_browsers', 'screenshot_pages_per_browser',
+                       'global_max_concurrency'];
     const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
                          'target_success_rate', 'min_success_rate', 'block_rate_threshold',
-                         'global_max_qps', 'per_channel_qps'];
+                         'global_max_qps'];
     intFields.forEach(f => { if (data[f] !== undefined) data[f] = parseInt(data[f]); });
     floatFields.forEach(f => { if (data[f] !== undefined) data[f] = parseFloat(data[f]); });
 
@@ -353,23 +308,12 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
         if (resp.ok) {
             resultDiv.style.display = 'block';
             resultDiv.innerHTML = `<div class="alert alert-success">设置已保存，Worker 将在 30 秒内自动同步</div>`;
-            // 保存成功后更新初始模式基线 & 移除高亮
-            _initialMode = document.getElementById('proxyModeSelect').value;
-            for (const k of Object.keys(_modePresets.tps)) {
-                const el = document.querySelector(`[name="${k}"]`);
-                if (el) el.style.border = '';
-            }
             // 用服务器返回的最新值刷新表单
             const s = result.settings;
             if (s) {
                 for (const [k,v] of Object.entries(s)) {
                     const el = document.querySelector(`[name="${k}"]`);
-                    if (el) el.value = v;
-                }
-                // 代理地址框：优先显示 tunnel_proxy_url，为空则显示 proxy_api_url
-                const proxyEl = document.querySelector('[name="tunnel_proxy_url"]');
-                if (proxyEl) {
-                    proxyEl.value = s.tunnel_proxy_url || s.proxy_api_url || '';
+                    if (el && v !== null && v !== undefined) el.value = v;
                 }
             }
         } else {
@@ -398,36 +342,7 @@ document.getElementById('settingsForm').addEventListener('submit', async (e) => 
     setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
 });
 
-const _modePresets = {
-    tps:    { token_bucket_rate: 5, initial_concurrency: 8, min_concurrency: 4,
-              cooldown_after_block: 15, proxy_bandwidth_mbps: 0, global_max_qps: 5,
-              request_timeout: 15 },
-    tunnel: { token_bucket_rate: 15, initial_concurrency: 28, min_concurrency: 12,
-              max_concurrency: 80, cooldown_after_block: 60, proxy_bandwidth_mbps: 0,
-              global_max_qps: 15, request_timeout: 45, target_latency: 25,
-              max_latency: 35, min_success_rate: 0.75 }
-};
-let _initialMode = '{{ settings.proxy_mode }}';
-
-function toggleTunnelConfig() {
-    const mode = document.getElementById('proxyModeSelect').value;
-    document.getElementById('tunnelConfig').style.display = mode === 'tunnel' ? '' : 'none';
-    document.getElementById('tpsConfig').style.display = mode === 'tps' ? '' : 'none';
-    // 模式切换时自动填充预设值并高亮
-    if (mode !== _initialMode) {
-        const preset = _modePresets[mode] || {};
-        for (const [k, v] of Object.entries(preset)) {
-            const el = document.querySelector(`[name="${k}"]`);
-            if (el) { el.value = v; el.style.border = '2px solid #f59e0b'; }
-        }
-    } else {
-        // 切回原模式，移除高亮
-        for (const k of Object.keys(_modePresets.tps).concat(Object.keys(_modePresets.tunnel))) {
-            const el = document.querySelector(`[name="${k}"]`);
-            if (el) el.style.border = '';
-        }
-    }
-}
+// v3: TPS only, no mode switching needed
 
 async function resetDefaults() {
     if (!confirm('确定要恢复所有设置为默认值吗？')) return;

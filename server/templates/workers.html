@@ -88,6 +88,30 @@
         return m + 'm';
     }
 
+    // 速度计算：基于 results_submitted 增量
+    const _workerSpeedState = {};
+    function calcWorkerSpeed(w) {
+        const wid = w.worker_id;
+        const now = Date.now();
+        const submitted = w.results_submitted || 0;
+        if (!_workerSpeedState[wid]) {
+            _workerSpeedState[wid] = { submitted, time: now, speed: 0 };
+            return '-';
+        }
+        const prev = _workerSpeedState[wid];
+        const dt = (now - prev.time) / 1000; // 秒
+        if (dt < 1) return prev.speed > 0 ? prev.speed.toFixed(1) + '/min' : '-';
+        const delta = submitted - prev.submitted;
+        const instantSpeed = delta / dt * 60; // 每分钟
+        // EWMA 平滑
+        const alpha = 0.3;
+        const speed = prev.speed === 0 ? instantSpeed : alpha * instantSpeed + (1 - alpha) * prev.speed;
+        _workerSpeedState[wid] = { submitted, time: now, speed };
+        if (speed <= 0 && w.online && submitted > 0) return '0/min';
+        if (speed <= 0) return '-';
+        return speed.toFixed(1) + '/min';
+    }
+
     function successRateClass(rate) {
         if (rate == null) return '';
         if (rate >= 95) return 'text-metric-good';
@@ -182,6 +206,7 @@
                         '<div class="wm-item"><span class="wm-label">封锁率</span><span class="wm-value ' + blockRateClass(w.block_rate) + '">' + val(w.block_rate, '%', 1) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">延迟 p50</span><span class="wm-value">' + val(w.latency_p50, 's', 1) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">在飞请求</span><span class="wm-value">' + val(w.inflight) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">采集速度</span><span class="wm-value" style="color:var(--accent)">' + calcWorkerSpeed(w) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">已拉取</span><span class="wm-value">' + val(w.tasks_pulled) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">已提交</span><span class="wm-value">' + val(w.results_submitted) + '</span></div>' +
                     '</div>' +

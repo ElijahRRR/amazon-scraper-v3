@@ -1183,9 +1183,9 @@ class Worker:
 
                 # 邮编/货币校验：检测是否采集到了非美国地区的数据
                 price = result_data.get("current_price", "")
-                if price and price not in ["N/A", "不可售", "See price in cart"]:
-                    # 价格应包含 $ 符号；出现 CNY/¥/€/£ 说明邮编没生效
-                    if any(c in price for c in ["¥", "€", "£", "CNY"]) or "$" not in price:
+                if price and price not in ["N/A", "不可售", "See price in cart", "No Featured Offer"]:
+                    # v3: [非USD] 前缀或直接出现非美国货币符号
+                    if "[非USD]" in price or any(c in price for c in ["¥", "€", "£", "CNY"]) or ("$" not in price and price.replace(",","").replace(".","").strip().isdigit()):
                         self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
                         attempt += 1
                         last_error_type = "parse_error"
@@ -1198,14 +1198,17 @@ class Worker:
                         continue
 
                 # 核心字段缺失检测：有标题但价格/库存/品牌全为空 → 页面降级，重试
+                # v3: "No Featured Offer" 和 "不可售" 是有效状态，不算降级
+                _is_nfo = result_data.get("current_price") == "No Featured Offer"
+                _is_unavail = result_data.get("current_price") == "不可售"
                 _na = {"", "N/A", "N/a", "n/a", "None", None, "0"}
                 _core_fields = ["current_price", "buybox_price", "stock_status", "brand"]
-                _is_degraded = all(result_data.get(f) in _na for f in _core_fields)
+                _is_degraded = all(result_data.get(f) in _na for f in _core_fields) and not _is_nfo and not _is_unavail
 
                 # 价格 N/A + 库存 999 = 页面部分解析但价格区块缺失，重试
                 _price_na = result_data.get("current_price") in _na and result_data.get("buybox_price") in _na
                 _stock_999 = str(result_data.get("stock_count", "")).strip() == "999"
-                _is_incomplete = _price_na and _stock_999
+                _is_incomplete = _price_na and _stock_999 and not _is_nfo and not _is_unavail
 
                 if _is_degraded or _is_incomplete:
                     self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)

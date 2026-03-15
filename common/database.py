@@ -596,11 +596,11 @@ class Database:
                             (asin, batch_id, change_type, detail, prev_val, new_val)
                         )
 
-                    # 更新主表
+                    # 更新主表（screenshot_path 由截图上传 API 单独管理，不在此覆盖）
                     update_fields = []
                     update_values = []
                     for f in ASIN_DATA_FIELDS:
-                        if f == "asin":
+                        if f in ("asin", "screenshot_path"):
                             continue
                         val = data.get(f)
                         if val is not None:
@@ -616,11 +616,11 @@ class Database:
                         update_values
                     )
                 else:
-                    # 新 ASIN，插入
+                    # 新 ASIN，插入（screenshot_path 由截图上传 API 单独管理）
                     insert_fields = ["asin"]
                     insert_values = [asin]
                     for f in ASIN_DATA_FIELDS:
-                        if f == "asin":
+                        if f in ("asin", "screenshot_path"):
                             continue
                         val = data.get(f)
                         if val is not None:

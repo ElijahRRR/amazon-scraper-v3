@@ -25,7 +25,7 @@
     "category": "core",
     "description": "Server核心API - FastAPI应用、上传批次、任务拉取、结果提交、心跳同步",
     "steps": ["确认server可启动", "确认/api/upload端点存在", "确认/api/tasks/pull端点存在", "确认/api/tasks/result端点存在", "确认/api/worker/sync端点存在"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 5,

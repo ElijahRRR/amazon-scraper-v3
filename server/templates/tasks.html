@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% set active_page = "tasks" %}
-{% block title %}任务管理 - Amazon Scraper v2{% endblock %}
+{% block title %}任务管理 - Amazon Scraper v3{% endblock %}
 
 {% block content %}
 <h2 class="page-title">任务管理</h2>
@@ -67,10 +67,10 @@
                 {% for b in batches %}
                 <tr>
                     <td>{{ b.name }}</td>
-                    <td>{{ b.total }}</td>
+                    <td>{{ b.total_tasks }}</td>
                     <td><span class="badge-status badge-pending">{{ b.pending }}</span></td>
                     <td><span class="badge-status badge-processing">{{ b.processing }}</span></td>
-                    <td><span class="badge-status badge-done">{{ b.done }}</span></td>
+                    <td><span class="badge-status badge-done">{{ b.completed }}</span></td>
                     <td>
                         <span class="badge-status badge-failed">{{ b.failed }}</span>
                         {% if b.failed > 0 %}
@@ -81,13 +81,13 @@
                     </td>
                     <td>
                         <div class="progress" style="width:100px; height:6px;">
-                            <div class="progress-bar bg-success" style="width:{{ b.progress }}%"></div>
+                            <div class="progress-bar bg-success" style="width:{% if b.total_tasks > 0 %}{{ (b.completed * 100 / b.total_tasks)|round|int }}{% else %}0{% endif %}%"></div>
                         </div>
-                        <small>{{ b.progress }}%</small>
+                        <small>{% if b.total_tasks > 0 %}{{ (b.completed * 100 / b.total_tasks)|round|int }}{% else %}0{% endif %}%</small>
                     </td>
                     <td>
                         <div class="btn-group btn-group-sm">
-                            <a href="/results?batch_name={{ b.name|urlencode }}" class="btn btn-outline-accent" title="查看结果">
+                            <a href="/results?batch_id={{ b.id }}" class="btn btn-outline-accent" title="查看结果">
                                 <i class="bi bi-eye"></i>
                             </a>
                             <a href="/api/export/{{ b.name|urlencode }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
@@ -96,7 +96,7 @@
                             <a href="/api/export/{{ b.name|urlencode }}/screenshots" class="btn btn-outline-accent" title="下载截图 ZIP">
                                 <i class="bi bi-images"></i>
                             </a>
-                            <button class="btn btn-outline-danger" onclick="prioritizeBatch('{{ b.name }}')" title="优先采集">
+                            <button class="btn btn-outline-danger" onclick="prioritizeBatch({{ b.id }}, '{{ b.name }}')" title="优先采集">
                                 <i class="bi bi-lightning-charge"></i>
                             </button>
                             <button class="btn btn-outline-accent" onclick="retryBatch('{{ b.name }}')" title="重试失败">
@@ -186,9 +186,9 @@ async function retryBatch(name) {
     location.reload();
 }
 
-async function prioritizeBatch(name) {
+async function prioritizeBatch(batchId, name) {
     if (!confirm(`确定将批次 "${name}" 设为优先采集？Worker 将立即切换到该批次。`)) return;
-    const resp = await fetch(`/api/batches/${encodeURIComponent(name)}/prioritize`, { method: 'POST' });
+    const resp = await fetch(`/api/batches/${batchId}/prioritize`, { method: 'POST' });
     const data = await resp.json();
     if (resp.ok) {
         alert(`已将 ${data.updated} 个待处理任务设为优先采集`);
@@ -220,17 +220,17 @@ async function showErrors(batchName) {
 
         let html = '<h6 style="color:var(--accent-light);">错误类型分布</h6>';
         html += '<div class="row g-2 mb-3">';
-        for (const [etype, count] of Object.entries(data.summary || {})) {
+        for (const item of (data.error_summary || [])) { const etype = item.error_type; const count = item.cnt;
             const label = ERROR_LABELS[etype] || etype;
             html += `<div class="col-auto"><span class="badge bg-danger bg-opacity-75 px-3 py-2">${esc(label)} <strong>${count}</strong></span></div>`;
         }
         html += '</div>';
 
-        if (data.tasks && data.tasks.length > 0) {
+        if (data.failed_tasks && data.failed_tasks.length > 0) {
             html += '<h6 style="color:var(--accent-light);">失败任务列表</h6>';
             html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0"><thead><tr>';
             html += '<th>ASIN</th><th>错误类型</th><th>详情</th><th>重试</th><th>时间</th></tr></thead><tbody>';
-            for (const t of data.tasks) {
+            for (const t of data.failed_tasks) {
                 const label = ERROR_LABELS[t.error_type] || t.error_type || '未知';
                 html += `<tr>
                     <td><a href="https://www.amazon.com/dp/${encodeURIComponent(t.asin)}" target="_blank"

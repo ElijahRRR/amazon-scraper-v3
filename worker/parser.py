@@ -96,12 +96,23 @@ class AmazonParser:
         # 商品可售状态检测
         is_unavailable = self._slx_check_unavailable(tree)
         is_see_price_in_cart = self._slx_check_see_price_in_cart(tree)
+        is_no_featured_offer = self._slx_check_no_featured_offer(tree, html_text)
 
         # 品牌（v3 增强: JSON-LD → 表格 → CSS → meta）
         result["brand"] = self._slx_parse_brand_enhanced(tree, jsonld, page_details, sp_data)
 
         # 价格 & 库存 & 配送
-        if is_unavailable:
+        if is_no_featured_offer:
+            result["current_price"] = "No Featured Offer"
+            result["buybox_price"] = "N/A"
+            result["original_price"] = "N/A"
+            result["buybox_shipping"] = "N/A"
+            result["is_fba"] = "N/A"
+            result["stock_status"] = "No Featured Offer"
+            result["stock_count"] = "0"
+            result["delivery_date"] = "N/A"
+            result["delivery_time"] = "N/A"
+        elif is_unavailable:
             result["current_price"] = "不可售"
             result["buybox_price"] = "N/A"
             result["original_price"] = "N/A"
@@ -273,6 +284,9 @@ class AmazonParser:
                     p = node.text(strip=True)
                     if p and "$" in p:
                         return p
+                    # v3: 检测非 USD 价格（CNY, EUR, GBP 等）— 标记但仍提取
+                    if p and re.search(r'(?:CNY|EUR|GBP|JPY|¥|€|£)\s*[\d,]+\.?\d*', p):
+                        return f"[非USD]{p}"
             # 方法2: 拆分整数+小数（限定到价格容器）
             for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
                               '#price', '#apex_offerDisplay_desktop']:
@@ -363,6 +377,27 @@ class AmazonParser:
             return "currently unavailable" in full
         except Exception:
             return False
+
+    def _slx_check_no_featured_offer(self, tree, html_text: str) -> bool:
+        """v3: 检测 'No featured offers available' 页面"""
+        try:
+            # 方法1: 页面文本检测
+            if "no featured offer" in html_text.lower()[:50000]:
+                # 确认没有 add-to-cart 按钮
+                atc = tree.css_first('#add-to-cart-button')
+                if not atc:
+                    return True
+            # 方法2: 检查 "See All Buying Options" 按钮存在但无价格区域
+            see_all = any("see all buying" in (n.text(strip=True) or "").lower()
+                         for n in tree.css('a, span')
+                         if n.text(strip=True))
+            if see_all:
+                has_price = tree.css_first('#corePrice_feature_div') or tree.css_first('#corePriceDisplay_desktop_feature_div')
+                if not has_price:
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _slx_check_see_price_in_cart(self, tree) -> bool:
         try:

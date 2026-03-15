@@ -39,42 +39,42 @@
     "category": "core",
     "description": "Worker核心 - 任务拉取、采集流水线、结果提交、心跳同步、自适应并发",
     "steps": ["确认worker可导入", "确认任务拉取逻辑存在", "确认采集流水线存在", "确认结果提交逻辑存在"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 7,
     "category": "core",
     "description": "Session管理 - curl_cffi会话、TPS/Tunnel双模式代理、浏览器指纹、zip_code设置",
     "steps": ["确认session模块可导入", "确认TPS模式实现", "确认Tunnel模式实现", "确认浏览器指纹轮换"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 8,
     "category": "core",
     "description": "自适应并发控制 - AIMD控制器、TokenBucket、ChannelRateLimiter、全局协调",
     "steps": ["确认adaptive模块可导入", "确认AIMD控制器存在", "确认TokenBucket存在"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 9,
     "category": "core",
     "description": "高效分页和筛选 - keyset分页、batch_asins直接JOIN、变动筛选4类、复合索引",
     "steps": ["确认分页查询使用keyset而非OFFSET", "确认batch筛选通过batch_asins JOIN", "确认4类变动筛选实现"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 10,
     "category": "core",
     "description": "变动检测系统 - 价格/库存变动、标题/五点描述变动、新增ASIN，预计算asin_changes表",
     "steps": ["确认变动检测在结果保存时触发", "确认asin_changes表记录变动类型", "确认4种变动类型正确分类"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 11,
     "category": "core",
     "description": "截图系统重构 - 可靠的截图任务追踪、失败重试、状态管理、跨平台兼容",
     "steps": ["确认screenshots表存在", "确认截图状态追踪", "确认失败重试机制", "确认截图文件关联清晰"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 12,

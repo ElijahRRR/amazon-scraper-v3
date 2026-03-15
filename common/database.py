@@ -677,8 +677,8 @@ class Database:
 
         # 搜索
         if search:
-            where_parts.append("(d.asin LIKE ? OR d.title LIKE ?)")
-            params.extend([f"%{search}%", f"%{search}%"])
+            where_parts.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
 
         # 变动筛选 - 通过 asin_changes JOIN（核心优化）
         if change_filter == "price_stock":

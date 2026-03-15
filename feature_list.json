@@ -137,7 +137,7 @@
     "category": "verification",
     "description": "采集验证 - 用B0CYWP4CLS验证非标准页面解析，用Excel抽样验证标准页面",
     "steps": ["用B0CYWP4CLS测试解析器", "从Excel随机抽取ASIN测试", "确认解析准确率"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 21,

@@ -152,7 +152,7 @@ class Worker:
         logger.info(f"   邮编: {self.zip_code}")
         logger.info(f"   截图功能: {'开启' if self._enable_screenshot else '关闭'}")
         logger.info(f"   代理模式: {self._proxy_mode.upper()}"
-                     + (f" ({config.TUNNEL_CHANNELS} 通道)" if self._proxy_mode == "tunnel" else ""))
+                     + (f" ({1} 通道)" if self._proxy_mode == "tunnel" else ""))
 
         self._running = True
         self._stats["start_time"] = time.time()
@@ -470,17 +470,15 @@ class Worker:
 
         # --- 固定隧道代理地址 ---
         new_tunnel_url = s.get("tunnel_proxy_url", "")
-        if new_tunnel_url != config.TUNNEL_PROXY_URL:
-            config.TUNNEL_PROXY_URL = new_tunnel_url
-            changes.append(f"tunnel_proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
+        if new_tunnel_url != config.PROXY_URL:
+            config.PROXY_URL = new_tunnel_url
+            changes.append(f"proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
 
         # --- 隧道通道数和轮换周期 ---
-        tunnel_channels = s.get("tunnel_channels")
+        tunnel_channels = None  # channels removed in v3
         tunnel_changed = False
-        if tunnel_channels and tunnel_channels != config.TUNNEL_CHANNELS:
-            config.TUNNEL_CHANNELS = tunnel_channels
             tunnel_changed = True
-            changes.append(f"tunnel_channels={tunnel_channels}")
+            changes.append(f"# channels removed: {tunnel_channels}")
         tunnel_rotate = s.get("tunnel_rotate_interval")
         rotate_changed = False
         if tunnel_rotate and tunnel_rotate != config.TUNNEL_ROTATE_INTERVAL:
@@ -514,18 +512,18 @@ class Worker:
         # --- 同模式下参数变化：重配隧道运行时结构 ---
         if self._proxy_mode == "tunnel" and (tunnel_changed or rotate_changed) and not mode_changed:
             self.proxy_manager.reconfigure_tunnel(
-                channels=config.TUNNEL_CHANNELS,
+                channels=1,
                 rotate_interval=config.TUNNEL_ROTATE_INTERVAL,
             )
             if not is_initial and self._session_pool:
-                await self._session_pool.resize(config.TUNNEL_CHANNELS)
+                await self._session_pool.resize(1)
                 changes.append("tunnel_runtime_reconfig")
 
         # --- 隧道代理地址 ---
-        new_tunnel_url = s.get("tunnel_proxy_url")
-        if new_tunnel_url and new_tunnel_url != config.TUNNEL_PROXY_URL:
-            config.TUNNEL_PROXY_URL = new_tunnel_url
-            changes.append(f"tunnel_proxy=***{new_tunnel_url[-20:]}")
+        new_tunnel_url = s.get("proxy_url")
+        if new_tunnel_url and new_tunnel_url != config.PROXY_URL:
+            config.PROXY_URL = new_tunnel_url
+            changes.append(f"proxy=***{new_tunnel_url[-20:]}")
 
         # --- 邮编（仅初始同步）---
         if is_initial:
@@ -542,38 +540,37 @@ class Worker:
                 changes.append(f"QPS={new_rate}")
 
         # --- Per-channel QPS ---
-        new_pcq = s.get("per_channel_qps")
+        new_pcq = None  # per_channel removed in v3
         if new_pcq:
             if is_initial and self._channel_rate_limiter:
                 if new_pcq != self._channel_rate_limiter.per_channel_rate:
                     self._channel_rate_limiter.per_channel_rate = new_pcq
                     changes.append(f"per_ch_QPS={new_pcq}")
-            elif not is_initial and new_pcq != getattr(config, "PER_CHANNEL_QPS", 3.0):
-                config.PER_CHANNEL_QPS = new_pcq
+                config.TOKEN_BUCKET_RATE = new_pcq
                 if self._channel_rate_limiter:
                     self._channel_rate_limiter.per_channel_rate = new_pcq
                 changes.append(f"per_ch_qps={new_pcq}")
 
         # --- Per-channel 最大并发 ---
-        new_pcmc = s.get("per_channel_max_concurrency")
+        new_pcmc = None  # per_channel removed in v3
         if new_pcmc and self._proxy_mode == "tunnel":
-            config.PER_CHANNEL_MAX_CONCURRENCY = new_pcmc
+            config.MAX_CONCURRENCY = new_pcmc
             for cc in self._controller._channel_controllers.values():
                 if cc._max != new_pcmc:
                     cc._max = new_pcmc
             changes.append(f"per_ch_max_c={new_pcmc}")
 
         # --- DPS 优化参数 ---
-        new_tmc = s.get("tunnel_max_concurrency")
+        new_tmc = s.get("max_concurrency")
         if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
-            config.TUNNEL_MAX_CONCURRENCY = new_tmc
+            config.MAX_CONCURRENCY = new_tmc
             if self._proxy_mode == "tunnel":
                 self._controller._max = new_tmc
             changes.append(f"tunnel_max_c={new_tmc}")
 
-        new_tic = s.get("tunnel_initial_concurrency")
+        new_tic = s.get("initial_concurrency")
         if new_tic and new_tic != getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16):
-            config.TUNNEL_INITIAL_CONCURRENCY = new_tic
+            config.INITIAL_CONCURRENCY = new_tic
             changes.append(f"tunnel_init_c={new_tic}")
 
         # --- 并发控制：min / max / initial ---
@@ -706,7 +703,7 @@ class Worker:
         1. 获取隧道代理地址（只需 1 个，所有 Session 共享）
         2. 初始化 SessionPool，预热前几个 Session 槽位
         """
-        logger.info(f"🔧 初始化隧道模式 ({config.TUNNEL_CHANNELS} 会话槽位)...")
+        logger.info(f"🔧 初始化隧道模式 ({1} 会话槽位)...")
         self._session_ready.clear()
 
         # 1. 获取隧道代理地址（API 只需调一次，返回固定隧道地址）

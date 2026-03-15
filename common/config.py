@@ -46,7 +46,6 @@ SESSION_ROTATE_EVERY = 1000
 
 # 令牌桶限流
 TOKEN_BUCKET_RATE = 5.0
-PER_CHANNEL_QPS = 5.0
 
 # ============================================================
 # 自适应并发控制
@@ -57,9 +56,6 @@ MAX_CONCURRENCY = 16
 TUNNEL_MAX_CONCURRENCY = 20
 TUNNEL_INITIAL_CONCURRENCY = 8
 
-PER_CHANNEL_INITIAL_CONCURRENCY = 3
-PER_CHANNEL_MIN_CONCURRENCY = 1
-PER_CHANNEL_MAX_CONCURRENCY = 4
 
 PROXY_BANDWIDTH_MBPS = 15
 ADJUST_INTERVAL_S = 10
@@ -78,13 +74,9 @@ TASK_PREFETCH_THRESHOLD = 0.5
 # ============================================================
 # 代理配置
 # ============================================================
-# 代理模式: "tunnel" = 隧道代理（推荐）
-PROXY_MODE = os.environ.get("PROXY_MODE", "tunnel")
-
-# 隧道代理地址（帐密模式）: http://user:pwd@host:port
-TUNNEL_PROXY_URL = os.environ.get("TUNNEL_PROXY_URL", "")
-TUNNEL_CHANNELS = int(os.environ.get("TUNNEL_CHANNELS", "8"))
-TUNNEL_ROTATE_INTERVAL = 60
+# 代理地址（帐密模式）: http://user:pwd@host:port
+# 每次请求自动换 IP（TPS 模式），无需多通道
+PROXY_URL = os.environ.get("PROXY_URL", os.environ.get("TUNNEL_PROXY_URL", ""))
 PROXY_REFRESH_INTERVAL = 30
 
 # ============================================================

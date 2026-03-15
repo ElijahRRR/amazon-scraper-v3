@@ -665,6 +665,14 @@ async def api_update_settings(request: Request):
 
 # ==================== API: 导出 ====================
 
+@app.get("/api/export/all")
+async def api_export_all(format: str = "xlsx"):
+    if format == "csv":
+        return await _export_csv(None, "all")
+    else:
+        return await _export_xlsx(None, "all")
+
+
 @app.get("/api/export/{batch_name}")
 async def api_export_batch(batch_name: str, format: str = "xlsx"):
     batch = await db.get_batch_by_name(batch_name)
@@ -677,14 +685,6 @@ async def api_export_batch(batch_name: str, format: str = "xlsx"):
         return await _export_csv(batch_id, batch_name)
     else:
         return await _export_xlsx(batch_id, batch_name)
-
-
-@app.get("/api/export/all")
-async def api_export_all(format: str = "xlsx"):
-    if format == "csv":
-        return await _export_csv(None, "all")
-    else:
-        return await _export_xlsx(None, "all")
 
 
 async def _export_xlsx(batch_id: int = None, name: str = "export"):

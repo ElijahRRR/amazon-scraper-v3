@@ -25,12 +25,20 @@ _NA_VALUES = {"", "N/A", "n/a", "None", "none", None}
 
 
 def _is_parse_failure(data: dict) -> bool:
-    """检测采集结果是否为解析失败"""
+    """检测采集结果是否为解析失败（真正的空壳数据才算失败）
+    v3: 如果有有效标题和品牌，即使价格为N/A也不算失败（可能是变体/NFO页面）
+    """
+    # 有有效标题和品牌的数据不是解析失败
+    title = data.get("title", "")
+    brand = data.get("brand", "")
+    has_valid_info = (title and title not in _NA_VALUES and not title.startswith("[")
+                      and brand and brand not in _NA_VALUES)
+    if has_valid_info:
+        return False
+
     key_fields = ["current_price", "buybox_price", "stock_count", "stock_status", "brand"]
     all_empty = all(data.get(f) in _NA_VALUES for f in key_fields)
-    price_na = data.get("current_price") in _NA_VALUES and data.get("buybox_price") in _NA_VALUES
-    stock_999 = str(data.get("stock_count", "")).strip() == "999"
-    return all_empty or (price_na and stock_999)
+    return all_empty
 
 
 def _parse_price_float(s) -> Optional[float]:

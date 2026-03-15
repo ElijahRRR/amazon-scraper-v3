@@ -151,6 +151,6 @@
     "category": "optimization",
     "description": "部署配置 - server/worker分离部署脚本、systemd服务文件、启动说明",
     "steps": ["确认server启动脚本存在", "确认worker启动脚本存在", "确认部署文档"],
-    "passes": false
+    "passes": true
   }
 ]

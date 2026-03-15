@@ -24,7 +24,7 @@ def main():
         zip_code=args.zip_code,
         enable_screenshot=not args.no_screenshot,
     )
-    asyncio.run(worker.run())
+    asyncio.run(worker.start())
 
 
 if __name__ == "__main__":

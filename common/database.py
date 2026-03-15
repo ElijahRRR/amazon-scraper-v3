@@ -375,11 +375,11 @@ class Database:
                 ss_filter = ""
                 ss_params = []
                 if needs_screenshot is not None:
-                    ss_filter = " AND needs_screenshot = ?"
+                    ss_filter = " AND t.needs_screenshot = ?"
                     ss_params = [1 if needs_screenshot else 0]
 
                 async with self._db.execute(
-                    f"SELECT MAX(priority) FROM tasks WHERE status = 'pending'{ss_filter}",
+                    f"SELECT MAX(priority) FROM tasks t WHERE t.status = 'pending'{ss_filter}",
                     ss_params
                 ) as cur:
                     row = await cur.fetchone()

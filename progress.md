@@ -29,3 +29,15 @@
 - 性能测试: 10万ASIN下分页3.6ms, 变动筛选6-8ms, 批次筛选207ms
 - 解析器增强: 4类页面类型测试通过(标准/非标准/不可售/反爬)
 - 项目完成
+
+### Session 1 - Iteration 2
+- Code review 发现 12 个关键问题（v2 复制残留）
+- 修复: 模板渲染上下文变量缺失 (dashboard/tasks/settings 页面会崩溃)
+- 修复: _default_settings 缺少 15 个字段
+- 修复: 新增 8 个缺失 API 端点 (retry/delete/errors/coordinator/reset等)
+- 修复: Worker payload 结构错误 (result嵌套→扁平化, 缺 batch_id)
+- 修复: Settings 同步 version key 不匹配 (_version→version/settings_version)
+- 修复: 截图子进程文件名 (screenshot_worker.py→screenshot.py)
+- 修复: get_progress 缺少 completion_rate/success_rate
+- 修复: 模板字段名不匹配 (batch_name→name, total→total_tasks, done→completed)
+- 修复: workers.html status 字段类型 (w.status==='online' → w.online)

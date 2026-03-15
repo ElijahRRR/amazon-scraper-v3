@@ -1220,12 +1220,12 @@ class Worker:
                     await asyncio.sleep(2)
                     continue
 
-                # v3: No Featured Offer 产品自动请求 offer-listing 补充价格
+                # v3: No Featured Offer 产品请求 AOD AJAX 端点补充价格/运费/配送/FBA
                 if result_data.get("current_price") == "No Featured Offer":
                     try:
-                        olp_url = f"https://www.amazon.com/gp/offer-listing/{asin}"
+                        aod_url = f"https://www.amazon.com/gp/product/ajax/aodAjaxMain/ref=dp_aod_unknown_mbc?asin={asin}&m=&qid=&smid=&sourcecustomerorglistid=&sourcecustomerorglistitemid=&sr=&pc=dp"
                         olp_resp = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda: session.fetch_page(olp_url))
+                            None, lambda: session.fetch_page(aod_url))
                         if olp_resp and hasattr(olp_resp, 'text') and olp_resp.text:
                             offer = self.parser.parse_offer_listing(olp_resp.text)
                             if offer and offer.get('price'):
@@ -1233,10 +1233,12 @@ class Worker:
                                 result_data["buybox_price"] = offer['price']
                                 if offer.get('is_fba'):
                                     result_data["is_fba"] = offer['is_fba']
+                                if offer.get('shipping'):
+                                    result_data["buybox_shipping"] = offer['shipping']
                                 if offer.get('delivery'):
                                     result_data["delivery_date"] = offer['delivery']
                                 result_data["stock_status"] = "In Stock (via offer-listing)"
-                                logger.info(f"NFO {asin} offer-listing 补充价格: {offer['price']}")
+                                logger.info(f"NFO {asin} OLP: {offer['price']} ship={offer.get('shipping','?')} {offer.get('is_fba','?')} del={offer.get('delivery','?')}")
                     except Exception as e:
                         logger.debug(f"NFO {asin} offer-listing 请求失败: {e}")
 

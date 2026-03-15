@@ -976,9 +976,9 @@ class AmazonParser:
         return ""
 
     def parse_offer_listing(self, html_text: str) -> Optional[Dict[str, Any]]:
-        """v3: 解析 /gp/offer-listing/{ASIN} 页面，提取最低价 offer
-        用于 No Featured Offer 产品的价格补充
-        返回 {'price': '$xx.xx', 'shipping': 'FREE', 'seller': 'xxx', 'ships_from': 'xxx', 'delivery': 'xxx'} 或 None
+        """v3: 解析 /gp/offer-listing/{ASIN} 页面，提取第一个 offer 完整信息
+        限定在 #aod-offer / #aod-offer-list 区域内，避免提取到推荐产品的价格
+        返回: {'price','shipping','delivery','seller','ships_from','is_fba'} 或 None
         """
         if not html_text or "validateCaptcha" in html_text:
             return None
@@ -988,47 +988,100 @@ class AmazonParser:
             if not tree:
                 return None
 
-            # 方法1: 取第一个 span.a-price（offer-listing 页面中排在最前面的就是最优 offer）
+            # 在 #aod-offer / #aod-offer-list / #aod-pinned-offer 区域内搜索
+            # 这些是 Amazon AOD (All Offers Display) 的标准容器
+            offer_containers = ['#aod-pinned-offer', '#aod-offer', '#aod-offer-list']
+
             best_offer = {}
 
-            for price_node in tree.css('span.a-price'):
-                offscreen = price_node.css_first('span.a-offscreen')
-                if offscreen:
-                    p = offscreen.text(strip=True)
-                    if p and "$" in p:
-                        best_offer['price'] = p
-                        break
+            for container_sel in offer_containers:
+                container = tree.css_first(container_sel)
+                if not container:
+                    continue
 
-                whole = price_node.css_first('span.a-price-whole')
-                frac = price_node.css_first('span.a-price-fraction')
-                if whole and frac:
-                    w = whole.text(strip=True).replace('.', '')
-                    f = frac.text(strip=True)
-                    if w and f:
-                        best_offer['price'] = f"${w}.{f}"
-                        break
+                # 价格：先试 a-offscreen，再试 whole+fraction
+                price_found = False
+                for price_node in container.css('span.a-price'):
+                    offscreen = price_node.css_first('span.a-offscreen')
+                    if offscreen:
+                        p = offscreen.text(strip=True)
+                        if p and "$" in p:
+                            best_offer['price'] = p
+                            price_found = True
+                            break
 
-            if not best_offer:
-                return None
+                    whole = price_node.css_first('span.a-price-whole')
+                    frac = price_node.css_first('span.a-price-fraction')
+                    if whole and frac:
+                        w = whole.text(strip=True).replace('.', '')
+                        f = frac.text(strip=True)
+                        if w and f:
+                            best_offer['price'] = f"${w}.{f}"
+                            price_found = True
+                            break
 
-            # 提取配送信息
-            delivery_node = tree.css_first('#aod-offer-list [data-csa-c-delivery-time]')
-            if delivery_node:
-                best_offer['delivery'] = delivery_node.text(strip=True)[:60]
+                if not price_found:
+                    continue
 
-            # 提取卖家
-            seller_node = tree.css_first('#aod-offer-list #aod-offer-soldBy a')
-            if seller_node:
-                best_offer['seller'] = seller_node.text(strip=True)
+                # 运费
+                shipping_node = container.css_first('[data-csa-c-delivery-price]')
+                if shipping_node:
+                    sp = shipping_node.attributes.get('data-csa-c-delivery-price', '')
+                    if sp:
+                        best_offer['shipping'] = sp.strip()
+                    else:
+                        sp_text = shipping_node.text(strip=True)
+                        # 只取运费部分，不要配送时间
+                        sp_match = re.match(r'(FREE|\$[\d.]+)', sp_text)
+                        if sp_match:
+                            best_offer['shipping'] = sp_match.group(1)
+                        elif sp_text:
+                            best_offer['shipping'] = sp_text[:20]
+                if 'shipping' not in best_offer:
+                    delivery_block = container.text(strip=True).lower()
+                    if 'free delivery' in delivery_block or 'free shipping' in delivery_block:
+                        best_offer['shipping'] = 'FREE'
 
-            # 提取配送方
-            ships_node = tree.css_first('#aod-offer-list #aod-offer-shipsFrom .a-color-base')
-            if ships_node:
-                ships_text = ships_node.text(strip=True)
-                best_offer['ships_from'] = ships_text
-                best_offer['is_fba'] = 'FBA' if 'amazon' in ships_text.lower() else 'FBM'
+                # 配送时间
+                delivery_node = container.css_first('[data-csa-c-delivery-time]')
+                if delivery_node:
+                    d_text = delivery_node.text(strip=True)
+                    # 提取日期部分（支持单日和范围）
+                    date_match = re.search(
+                        r'(Tomorrow|Today|'
+                        r'(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*,?\s+)?'
+                        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\.?\s+\d+'
+                        r'(?:\s*-\s*\d+)?)',
+                        d_text, re.IGNORECASE
+                    )
+                    if date_match:
+                        best_offer['delivery'] = date_match.group(0).strip()
+                    else:
+                        # 清理多余文本
+                        clean = re.sub(r'(Details|Or fastest|FREE delivery|\.)', '', d_text).strip()
+                        best_offer['delivery'] = clean[:60] if clean else d_text[:60]
 
-            return best_offer
+                # 卖家
+                seller_node = container.css_first('#aod-offer-soldBy a.a-link-normal')
+                if not seller_node:
+                    seller_node = container.css_first('#aod-offer-soldBy a')
+                if seller_node:
+                    best_offer['seller'] = seller_node.text(strip=True)
+
+                # Ships from → FBA/FBM 判断
+                ships_node = container.css_first('#aod-offer-shipsFrom .a-color-base')
+                if ships_node:
+                    ships_text = ships_node.text(strip=True)
+                    best_offer['ships_from'] = ships_text
+                    best_offer['is_fba'] = 'FBA' if 'amazon' in ships_text.lower() else 'FBM'
+                else:
+                    best_offer['is_fba'] = 'FBM'
+
+                # 找到第一个有效 offer 就返回
+                if best_offer.get('price'):
+                    return best_offer
+
+            return best_offer if best_offer.get('price') else None
 
         except Exception as e:
             logger.debug(f"offer-listing 解析异常: {e}")

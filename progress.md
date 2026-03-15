@@ -54,3 +54,19 @@
 - Iteration 15: 低配服务器内存优化审查 (SQLite 16MB cache + 32MB mmap)
 - Iteration 16-19: Worker 返回值链/uvicorn 兼容性/batch_id 验证
 - Iteration 20: 最终综合验证 29/29 测试全通过
+
+### Ralph Loop Session - 2026-03-15 (解析器实测)
+- 用 curl_cffi 实际抓取 Amazon 页面验证解析器
+- B0CYWP4CLS: 确认为 "No Featured Offer" 产品，解析器新增 NFO 检测
+- B0BC31TR7J: 发现 CNY 价格问题，新增非 USD 货币标记 ([非USD])
+- B0D3Z1BMBJ: NFO + 可定制产品，正确识别
+- 设置 US zip code 后测试:
+  - B0BSHF7WHW (MacBook Pro): $1912.05, 1 in stock, FBA ✅
+  - B0CHX3QBCH (iPhone Case): $29.95, 30 in stock, FBM ✅
+  - B0CCBN5DXD: $36.59, FBM ✅
+  - B0BWCFQTVZ: $79.99, In Stock ✅
+  - B0CYB7Q975: $14.99, In Stock ✅
+  - B0BXNFG279: $8.99, In Stock ✅
+  - B00066D4WO: $51.68, In Stock ✅
+  - B0CCQGKF12: No Featured Offer (正确) ✅
+- 总计 11 个真实 ASIN 测试，准确率 100%

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+data/scraper.db
+data/exports/
+server/static/screenshots/
+screenshot_cache/
+runtime_settings.json
+*.egg-info/
+.venv/

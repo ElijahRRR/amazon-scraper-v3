@@ -553,6 +553,20 @@ async def api_upload_screenshot(request: Request,
     return {"ok": True, "path": rel_path}
 
 
+@app.post("/api/tasks/screenshot/fail")
+async def api_screenshot_fail(request: Request):
+    """截图渲染失败上报（触发重试或标记永久失败）"""
+    body = await request.json()
+    asin = body.get("asin", "")
+    batch_name = body.get("batch_name", "")
+    error = body.get("error", "unknown")
+    batch = await db.get_batch_by_name(batch_name)
+    if not batch:
+        raise HTTPException(400, f"批次不存在: {batch_name}")
+    await db.update_screenshot_status(asin, batch["id"], "failed", error=error)
+    return {"ok": True}
+
+
 # ==================== API: Worker 同步 ====================
 
 @app.post("/api/worker/sync")

@@ -140,7 +140,17 @@ class ScreenshotWorker:
                 logger.warning(f"截图上传失败，保留 HTML 待重试: {asin}")
         else:
             logger.warning(f"截图渲染失败: {asin}")
-            # 渲染失败删除 HTML（避免无限重试）
+            # 通知 server 标记为 failed（触发重试机制，3次后永久失败）
+            try:
+                await self._http_client.post(
+                    f"{self.server_url}/api/tasks/screenshot/fail",
+                    json={"asin": asin, "batch_name": batch_name,
+                          "error": "render_blank_or_failed"},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            # 渲染失败删除 HTML（避免无限重试空白页面）
             try:
                 os.remove(html_path)
             except OSError:

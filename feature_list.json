@@ -18,7 +18,7 @@
     "category": "infrastructure",
     "description": "数据库CRUD层 - 异步SQLite操作、写锁、连接池",
     "steps": ["确认init_db可执行", "确认CRUD函数存在", "确认写锁机制工作"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 4,

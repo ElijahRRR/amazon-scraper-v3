@@ -135,7 +135,7 @@ class Database:
 
     async def connect(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._db = await aiosqlite.connect(self.db_path)
+        self._db = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA busy_timeout=5000")
         # 低配服务器：限制缓存 16MB（v2 用 32MB，v3 降低以适应 2GB 内存）
@@ -269,18 +269,18 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_screenshots_status ON screenshots(status);
             CREATE INDEX IF NOT EXISTS idx_screenshots_batch ON screenshots(batch_id);
         """)
-        await self._db.commit()
 
     # ==================== 批次操作 ====================
 
     async def create_batch(self, name: str, needs_screenshot: bool = False) -> int:
         """创建批次，返回 batch_id"""
         async with self._write_lock:
+            await self._db.execute("BEGIN")
             await self._db.execute(
                 "INSERT OR IGNORE INTO batches (name, needs_screenshot) VALUES (?, ?)",
                 (name, 1 if needs_screenshot else 0)
             )
-            await self._db.commit()
+            await self._db.execute("COMMIT")
             async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name,)) as c:
                 row = await c.fetchone()
                 return row[0] if row else 0
@@ -326,36 +326,40 @@ class Database:
             return 0
 
         async with self._write_lock:
-            before = self._db.total_changes
+            await self._db.execute("BEGIN")
+            try:
+                before = self._db.total_changes
 
-            # 插入任务
-            await self._db.executemany(
-                "INSERT OR IGNORE INTO tasks (batch_id, asin, zip_code, needs_screenshot) VALUES (?, ?, ?, ?)",
-                [(batch_id, asin, zip_code, ss_val) for asin in clean_asins]
-            )
-
-            # 维护 batch_asins（判断是否新 ASIN）
-            for asin in clean_asins:
-                # 检查是否已存在于 asin_data
-                async with self._db.execute(
-                    "SELECT 1 FROM asin_data WHERE asin = ?", (asin,)
-                ) as c:
-                    exists = await c.fetchone()
-                is_new = 0 if exists else 1
-                await self._db.execute(
-                    "INSERT OR IGNORE INTO batch_asins (batch_id, asin, is_new) VALUES (?, ?, ?)",
-                    (batch_id, asin, is_new)
-                )
-
-            # 如果需要截图，创建截图任务
-            if needs_screenshot:
+                # 插入任务
                 await self._db.executemany(
-                    "INSERT OR IGNORE INTO screenshots (asin, batch_id) VALUES (?, ?)",
-                    [(asin, batch_id) for asin in clean_asins]
+                    "INSERT OR IGNORE INTO tasks (batch_id, asin, zip_code, needs_screenshot) VALUES (?, ?, ?, ?)",
+                    [(batch_id, asin, zip_code, ss_val) for asin in clean_asins]
                 )
 
-            await self._db.commit()
-            inserted = self._db.total_changes - before
+                # 维护 batch_asins（判断是否新 ASIN）
+                for asin in clean_asins:
+                    async with self._db.execute(
+                        "SELECT 1 FROM asin_data WHERE asin = ?", (asin,)
+                    ) as c:
+                        exists = await c.fetchone()
+                    is_new = 0 if exists else 1
+                    await self._db.execute(
+                        "INSERT OR IGNORE INTO batch_asins (batch_id, asin, is_new) VALUES (?, ?, ?)",
+                        (batch_id, asin, is_new)
+                    )
+
+                # 如果需要截图，创建截图任务
+                if needs_screenshot:
+                    await self._db.executemany(
+                        "INSERT OR IGNORE INTO screenshots (asin, batch_id) VALUES (?, ?)",
+                        [(asin, batch_id) for asin in clean_asins]
+                    )
+
+                inserted = self._db.total_changes - before
+                await self._db.execute("COMMIT")
+            except Exception:
+                await self._db.execute("ROLLBACK")
+                raise
         return inserted
 
     async def pull_tasks(self, worker_id: str, count: int = 10,
@@ -437,8 +441,9 @@ class Database:
 
     async def reset_timeout_tasks(self):
         async with self._write_lock:
+            await self._db.execute("BEGIN")
             await self._reset_timeout_tasks_unlocked()
-            await self._db.commit()
+            await self._db.execute("COMMIT")
 
     async def fail_task(self, task_id: int, error_type: str = "", error_detail: str = ""):
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -451,6 +456,7 @@ class Database:
                     return
                 retry_count = row[0] + 1
 
+            await self._db.execute("BEGIN")
             if retry_count >= config.MAX_RETRIES:
                 await self._db.execute(
                     "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? WHERE id=?",
@@ -461,16 +467,17 @@ class Database:
                     "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, worker_id=NULL, updated_at=? WHERE id=?",
                     (retry_count, error_type, error_detail, now, task_id)
                 )
-            await self._db.commit()
+            await self._db.execute("COMMIT")
 
     async def complete_task(self, task_id: int):
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         async with self._write_lock:
+            await self._db.execute("BEGIN")
             await self._db.execute(
                 "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
                 (now, task_id)
             )
-            await self._db.commit()
+            await self._db.execute("COMMIT")
 
     async def release_tasks(self, task_ids: List[int]):
         """释放任务回 pending 状态"""
@@ -478,20 +485,22 @@ class Database:
             return
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         async with self._write_lock:
+            await self._db.execute("BEGIN")
             placeholders = ",".join("?" * len(task_ids))
             await self._db.execute(
                 f"UPDATE tasks SET status='pending', worker_id=NULL, updated_at=? WHERE id IN ({placeholders})",
                 [now] + task_ids
             )
-            await self._db.commit()
+            await self._db.execute("COMMIT")
 
     async def prioritize_batch(self, batch_id: int, priority: int = 10):
         async with self._write_lock:
+            await self._db.execute("BEGIN")
             await self._db.execute(
                 "UPDATE tasks SET priority=? WHERE batch_id=? AND status='pending'",
                 (priority, batch_id)
             )
-            await self._db.commit()
+            await self._db.execute("COMMIT")
 
     async def get_progress(self, batch_id: int = None) -> Dict:
         """获取任务进度"""
@@ -532,96 +541,104 @@ class Database:
             ) as c:
                 existing = await c.fetchone()
 
-            if existing:
-                existing_dict = dict(existing)
-                changes = []
+            await self._db.execute("BEGIN")
+            try:
+                if existing:
+                    existing_dict = dict(existing)
+                    changes = []
 
-                # 1. 价格/库存变动检测
-                price_change = _compare_price(existing_dict.get("current_price"), data.get("current_price"))
-                buybox_change = _compare_price(existing_dict.get("buybox_price"), data.get("buybox_price"))
-                stock_qty_change = _compare_stock_qty(existing_dict.get("stock_count"), data.get("stock_count"))
-                stock_status_change = _compare_stock_status(existing_dict.get("stock_status"), data.get("stock_status"))
+                    # 1. 价格/库存变动检测
+                    price_change = _compare_price(existing_dict.get("current_price"), data.get("current_price"))
+                    buybox_change = _compare_price(existing_dict.get("buybox_price"), data.get("buybox_price"))
+                    stock_qty_change = _compare_stock_qty(existing_dict.get("stock_count"), data.get("stock_count"))
+                    stock_status_change = _compare_stock_status(existing_dict.get("stock_status"), data.get("stock_status"))
 
-                if any([price_change, buybox_change, stock_qty_change, stock_status_change]):
-                    detail_parts = []
-                    if price_change:
-                        detail_parts.append(f"price:{price_change}")
-                    if buybox_change:
-                        detail_parts.append(f"buybox:{buybox_change}")
-                    if stock_qty_change:
-                        detail_parts.append(f"stock_qty:{stock_qty_change}")
-                    if stock_status_change:
-                        detail_parts.append(f"stock_status:{stock_status_change}")
+                    if any([price_change, buybox_change, stock_qty_change, stock_status_change]):
+                        detail_parts = []
+                        if price_change:
+                            detail_parts.append(f"price:{price_change}")
+                        if buybox_change:
+                            detail_parts.append(f"buybox:{buybox_change}")
+                        if stock_qty_change:
+                            detail_parts.append(f"stock_qty:{stock_qty_change}")
+                        if stock_status_change:
+                            detail_parts.append(f"stock_status:{stock_status_change}")
 
-                    prev_vals = f"price={existing_dict.get('current_price')}, buybox={existing_dict.get('buybox_price')}, stock={existing_dict.get('stock_count')}, status={existing_dict.get('stock_status')}"
-                    new_vals = f"price={data.get('current_price')}, buybox={data.get('buybox_price')}, stock={data.get('stock_count')}, status={data.get('stock_status')}"
+                        prev_vals = f"price={existing_dict.get('current_price')}, buybox={existing_dict.get('buybox_price')}, stock={existing_dict.get('stock_count')}, status={existing_dict.get('stock_status')}"
+                        new_vals = f"price={data.get('current_price')}, buybox={data.get('buybox_price')}, stock={data.get('stock_count')}, status={data.get('stock_status')}"
 
-                    changes.append(("price_stock", ", ".join(detail_parts), prev_vals, new_vals))
+                        changes.append(("price_stock", ", ".join(detail_parts), prev_vals, new_vals))
 
-                # 2. 标题/五点描述变动检测
-                old_tb_hash = existing_dict.get("title_bullets_hash", "")
-                new_tb_hash = data.get("title_bullets_hash", "")
-                if old_tb_hash and new_tb_hash and old_tb_hash != new_tb_hash:
-                    prev_title = (existing_dict.get("title") or "")[:100]
-                    new_title = (data.get("title") or "")[:100]
-                    changes.append(("title_bullets", "title_or_bullets_changed",
-                                    f"title={prev_title}", f"title={new_title}"))
+                    # 2. 标题/五点描述变动检测
+                    old_tb_hash = existing_dict.get("title_bullets_hash", "")
+                    new_tb_hash = data.get("title_bullets_hash", "")
+                    if old_tb_hash and new_tb_hash and old_tb_hash != new_tb_hash:
+                        prev_title = (existing_dict.get("title") or "")[:100]
+                        new_title = (data.get("title") or "")[:100]
+                        changes.append(("title_bullets", "title_or_bullets_changed",
+                                        f"title={prev_title}", f"title={new_title}"))
 
-                # 写入变动记录
-                for change_type, detail, prev_val, new_val in changes:
+                    # 写入变动记录
+                    for change_type, detail, prev_val, new_val in changes:
+                        await self._db.execute(
+                            "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail, prev_value, new_value) VALUES (?, ?, ?, ?, ?, ?)",
+                            (asin, batch_id, change_type, detail, prev_val, new_val)
+                        )
+
+                    # 更新主表
+                    update_fields = []
+                    update_values = []
+                    for f in ASIN_DATA_FIELDS:
+                        if f == "asin":
+                            continue
+                        val = data.get(f)
+                        if val is not None:
+                            update_fields.append(f"{f} = ?")
+                            update_values.append(val)
+
+                    update_fields.append("updated_at = ?")
+                    update_values.append(now)
+                    update_values.append(asin)
+
                     await self._db.execute(
-                        "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail, prev_value, new_value) VALUES (?, ?, ?, ?, ?, ?)",
-                        (asin, batch_id, change_type, detail, prev_val, new_val)
+                        f"UPDATE asin_data SET {', '.join(update_fields)} WHERE asin = ?",
+                        update_values
+                    )
+                else:
+                    # 新 ASIN，插入
+                    insert_fields = ["asin"]
+                    insert_values = [asin]
+                    for f in ASIN_DATA_FIELDS:
+                        if f == "asin":
+                            continue
+                        val = data.get(f)
+                        if val is not None:
+                            insert_fields.append(f)
+                            insert_values.append(val)
+
+                    insert_fields.extend(["created_at", "updated_at"])
+                    insert_values.extend([now, now])
+
+                    placeholders = ",".join("?" * len(insert_values))
+                    await self._db.execute(
+                        f"INSERT INTO asin_data ({', '.join(insert_fields)}) VALUES ({placeholders})",
+                        insert_values
                     )
 
-                # 更新主表
-                update_fields = []
-                update_values = []
-                for f in ASIN_DATA_FIELDS:
-                    if f == "asin":
-                        continue
-                    val = data.get(f)
-                    if val is not None:
-                        update_fields.append(f"{f} = ?")
-                        update_values.append(val)
+                    # 记录新增变动
+                    if batch_id:
+                        await self._db.execute(
+                            "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail) VALUES (?, ?, 'new', 'first_seen')",
+                            (asin, batch_id)
+                        )
 
-                update_fields.append("updated_at = ?")
-                update_values.append(now)
-                update_values.append(asin)
-
-                await self._db.execute(
-                    f"UPDATE asin_data SET {', '.join(update_fields)} WHERE asin = ?",
-                    update_values
-                )
-            else:
-                # 新 ASIN，插入
-                insert_fields = ["asin"]
-                insert_values = [asin]
-                for f in ASIN_DATA_FIELDS:
-                    if f == "asin":
-                        continue
-                    val = data.get(f)
-                    if val is not None:
-                        insert_fields.append(f)
-                        insert_values.append(val)
-
-                insert_fields.extend(["created_at", "updated_at"])
-                insert_values.extend([now, now])
-
-                placeholders = ",".join("?" * len(insert_values))
-                await self._db.execute(
-                    f"INSERT INTO asin_data ({', '.join(insert_fields)}) VALUES ({placeholders})",
-                    insert_values
-                )
-
-                # 记录新增变动
-                if batch_id:
-                    await self._db.execute(
-                        "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail) VALUES (?, ?, 'new', 'first_seen')",
-                        (asin, batch_id)
-                    )
-
-            await self._db.commit()
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         return True
 
     async def save_results_batch(self, results: List[dict], batch_id: int = None) -> int:
@@ -791,6 +808,7 @@ class Database:
                                        file_path: str = None, error: str = None):
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         async with self._write_lock:
+            await self._db.execute("BEGIN")
             if status == "done" and file_path:
                 await self._db.execute(
                     "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=?",
@@ -806,7 +824,6 @@ class Database:
                        error_detail=?, updated_at=? WHERE asin=? AND batch_id=? AND retry_count < 3""",
                     (error, now, asin, batch_id)
                 )
-                # 超过 3 次标记为永久失败
                 await self._db.execute(
                     "UPDATE screenshots SET status='failed', updated_at=? WHERE asin=? AND batch_id=? AND retry_count >= 3",
                     (now, asin, batch_id)
@@ -816,7 +833,7 @@ class Database:
                     "UPDATE screenshots SET status=?, updated_at=? WHERE asin=? AND batch_id=?",
                     (status, now, asin, batch_id)
                 )
-            await self._db.commit()
+            await self._db.execute("COMMIT")
 
     async def get_screenshot_progress(self, batch_id: int) -> Dict:
         sql = "SELECT status, COUNT(*) as cnt FROM screenshots WHERE batch_id = ? GROUP BY status"

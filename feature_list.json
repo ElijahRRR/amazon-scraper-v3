@@ -144,7 +144,7 @@
     "category": "verification",
     "description": "性能验证 - 分页速度、批次筛选速度、变动筛选速度，模拟百万数据",
     "steps": ["创建测试数据", "测试分页查询性能", "测试筛选查询性能"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 22,

@@ -11,7 +11,7 @@
     "category": "infrastructure",
     "description": "数据库Schema设计 - asin_data/asin_history/asin_changes/batches/batch_asins/tasks/screenshots表，含百万级优化索引",
     "steps": ["确认所有表可创建", "确认索引存在", "确认外键约束正确"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 3,

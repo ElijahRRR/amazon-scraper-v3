@@ -1162,7 +1162,12 @@ class Worker:
                 # 价格 N/A + 库存 999 = 页面部分解析但价格区块缺失，重试
                 _price_na = result_data.get("current_price") in _na and result_data.get("buybox_price") in _na
                 _stock_999 = str(result_data.get("stock_count", "")).strip() == "999"
-                _is_incomplete = _price_na and _stock_999 and not _is_nfo and not _is_unavail
+                # v3: 有有效标题+品牌的页面不算降级（可能是变体选择页）
+                _title = result_data.get("title", "")
+                _brand = result_data.get("brand", "")
+                _has_valid_info = (_title and _title not in _na and not _title.startswith("[")
+                                   and _brand and _brand not in _na)
+                _is_incomplete = _price_na and _stock_999 and not _is_nfo and not _is_unavail and not _has_valid_info
 
                 if _is_degraded or _is_incomplete:
                     self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)

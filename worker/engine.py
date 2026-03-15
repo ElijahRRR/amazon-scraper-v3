@@ -1376,11 +1376,14 @@ class Worker:
         if self._screenshot_process and self._screenshot_process.returncode is None:
             return  # 已在运行
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot.py")
+        # 传递代理地址给截图子进程
+        proxy_url = config.PROXY_URL or ""
         self._screenshot_process = await asyncio.create_subprocess_exec(
             sys.executable, script,
             self.server_url,
             str(self._browsers_count),
             str(self._pages_per_browser),
+            proxy_url,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

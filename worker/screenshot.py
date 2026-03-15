@@ -27,7 +27,8 @@ logger = logging.getLogger("screenshot_worker")
 
 class ScreenshotWorker:
     def __init__(self, server_url: str, base_dir: str = None,
-                 browsers_count: int = 1, pages_per_browser: int = 3):
+                 browsers_count: int = 1, pages_per_browser: int = 3,
+                 proxy_url: str = None):
         self.server_url = server_url
         self.base_dir = base_dir or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
@@ -35,6 +36,19 @@ class ScreenshotWorker:
         self.html_dir = os.path.join(self.base_dir, "html")
         self._browsers_count = browsers_count
         self._pages_per_browser = pages_per_browser
+        self._proxy_url = proxy_url
+
+    @staticmethod
+    def _parse_proxy(proxy_url: str) -> dict:
+        """解析 http://user:pwd@host:port 为 Playwright proxy dict"""
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy_url)
+        result = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            result["username"] = parsed.username
+        if parsed.password:
+            result["password"] = parsed.password
+        return result
         self._concurrency = browsers_count * pages_per_browser
         self._browser_slots = []
         self._browser_lock = asyncio.Lock()
@@ -147,35 +161,59 @@ class ScreenshotWorker:
                 pass
 
     async def _screenshot_live_page(self, asin: str) -> Optional[bytes]:
-        """直接用 Playwright 访问 Amazon 产品页截图（确保所有资源加载）"""
+        """直接用 Playwright 访问 Amazon 产品页截图（通过代理，确保所有资源加载）"""
         try:
-            browser = await self._get_browser()
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("playwright 未安装")
+            return None
+
+        page = None
+        try:
+            # 懒初始化浏览器池（和 _render_screenshot 共用）
+            if not self._browser_slots:
+                async with self._browser_lock:
+                    if not self._browser_slots:
+                        for i in range(self._browsers_count):
+                            pw = await async_playwright().__aenter__()
+                            launch_opts = {
+                                "headless": True,
+                                "args": ["--disable-gpu", "--disable-dev-shm-usage",
+                                         "--no-sandbox", "--disable-extensions"],
+                            }
+                            if self._proxy_url:
+                                launch_opts["proxy"] = self._parse_proxy(self._proxy_url)
+                            browser = await pw.chromium.launch(**launch_opts)
+                            self._browser_slots.append({"playwright": pw, "browser": browser})
+                        proxy_info = f" (proxy: ***@{self._proxy_url.split('@')[-1]})" if self._proxy_url else " (无代理)"
+                        logger.info(f"浏览器池启动（{self._browsers_count} 实例）{proxy_info}")
+
+            idx = self._browser_counter % len(self._browser_slots)
+            self._browser_counter += 1
+            browser = self._browser_slots[idx]["browser"]
+
             page = await browser.new_page(
                 viewport={"width": 1280, "height": 1300},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             )
 
+            url = f"https://www.amazon.com/dp/{asin}?th=1&psc=1"
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+            # 等待主要内容加载
             try:
-                url = f"https://www.amazon.com/dp/{asin}?th=1&psc=1"
-                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await page.wait_for_selector("#productTitle", timeout=8000)
+            except Exception:
+                pass
 
-                # 等待主要内容加载
-                try:
-                    await page.wait_for_selector("#productTitle", timeout=8000)
-                except Exception:
-                    pass
+            # 额外等待图片和样式渲染
+            await page.wait_for_timeout(2000)
 
-                # 额外等待图片和样式渲染
-                await page.wait_for_timeout(2000)
-
-                screenshot = await page.screenshot(
-                    type="png",
-                    clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
-                )
-                return screenshot
-
-            finally:
-                await page.close()
+            screenshot = await page.screenshot(
+                type="png",
+                clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
+            )
+            return screenshot
 
         except Exception as e:
             err_msg = str(e)
@@ -185,6 +223,12 @@ class ScreenshotWorker:
             else:
                 logger.warning(f"截图失败 {asin}: {e}")
             return None
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes) -> bool:
         """上传单张截图到服务器"""
@@ -254,11 +298,14 @@ class ScreenshotWorker:
                     if not self._browser_slots:
                         for i in range(self._browsers_count):
                             pw = await async_playwright().__aenter__()
-                            browser = await pw.chromium.launch(
-                                headless=True,
-                                args=["--disable-gpu", "--disable-dev-shm-usage",
-                                      "--no-sandbox", "--disable-extensions"]
-                            )
+                            launch_opts = {
+                                "headless": True,
+                                "args": ["--disable-gpu", "--disable-dev-shm-usage",
+                                         "--no-sandbox", "--disable-extensions"],
+                            }
+                            if self._proxy_url:
+                                launch_opts["proxy"] = {"server": self._proxy_url}
+                            browser = await pw.chromium.launch(**launch_opts)
                             self._browser_slots.append({"playwright": pw, "browser": browser})
                         logger.info(f"浏览器池启动（{self._browsers_count} 实例）")
 
@@ -393,11 +440,13 @@ def main():
     server_url = sys.argv[1].rstrip("/")
     browsers_count = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     pages_per_browser = int(sys.argv[3]) if len(sys.argv) > 3 else 3
+    proxy_url = sys.argv[4] if len(sys.argv) > 4 else None
 
     worker = ScreenshotWorker(
         server_url=server_url,
         browsers_count=browsers_count,
         pages_per_browser=pages_per_browser,
+        proxy_url=proxy_url,
     )
     asyncio.run(worker.start())
 

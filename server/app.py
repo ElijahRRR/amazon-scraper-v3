@@ -68,7 +68,7 @@ def _default_settings() -> dict:
         "cooldown_after_block": 15,
         "proxy_bandwidth_mbps": config.PROXY_BANDWIDTH_MBPS,
         "screenshot_browsers": 1,
-        "screenshot_pages_per_browser": 1,
+        "screenshot_pages_per_browser": 2,
         "auto_scrape_schedules": [],
     }
 
@@ -599,10 +599,21 @@ async def api_workers():
     now = time.time()
     workers = []
     for wid, w in _worker_registry.items():
+        coord = _global_coordinator.get(wid, {})
+        metrics = coord.get("metrics", {})
+        quota = coord.get("quota", {})
+        uptime = now - w.get("first_seen", now)
         workers.append({
             **w,
             "online": (now - w["last_seen"]) < 60,
             "last_seen_ago": int(now - w["last_seen"]),
+            "uptime": int(uptime),
+            "success_rate": metrics.get("success_rate"),
+            "block_rate": metrics.get("block_rate"),
+            "latency_p50": metrics.get("latency_p50"),
+            "inflight": metrics.get("inflight"),
+            "quota_concurrency": quota.get("max_concurrency"),
+            "quota_qps": quota.get("max_qps"),
         })
     return {"workers": workers}
 

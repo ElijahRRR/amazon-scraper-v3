@@ -301,7 +301,8 @@ class AmazonSession:
             logger.warning(f"⚠️ Session 未就绪，跳过 ASIN={asin}")
             return None
 
-        url = f"{self.AMAZON_BASE}/dp/{asin}"
+        # v3: 加 ?th=1&psc=1 获取具体变体价格（而非价格区间）
+        url = f"{self.AMAZON_BASE}/dp/{asin}?th=1&psc=1"
         referer = self._last_url or f"{self.AMAZON_BASE}/"
         headers = self._build_headers(referer=referer)
 

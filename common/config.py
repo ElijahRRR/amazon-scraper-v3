@@ -78,34 +78,14 @@ TASK_PREFETCH_THRESHOLD = 0.5
 # ============================================================
 # 代理配置
 # ============================================================
-PROXY_MODE = os.environ.get("PROXY_MODE", "tps")
+# 代理模式: "tunnel" = 隧道代理（推荐）
+PROXY_MODE = os.environ.get("PROXY_MODE", "tunnel")
 
-_KDL_SECRET_ID = os.environ.get("KDL_SECRET_ID", "")
-_KDL_SIGNATURE = os.environ.get("KDL_SIGNATURE", "")
-
-PROXY_API_URL = (
-    f"https://tps.kdlapi.com/api/gettps/"
-    f"?secret_id={_KDL_SECRET_ID}"
-    f"&signature={_KDL_SIGNATURE}"
-    f"&num=1&format=json&sep=1"
-)
-PROXY_API_URL_AUTH = (
-    f"https://tps.kdlapi.com/api/gettps/"
-    f"?secret_id={_KDL_SECRET_ID}"
-    f"&signature={_KDL_SIGNATURE}"
-    f"&num=1&format=json&sep=1&generateType=1"
-)
-PROXY_REFRESH_INTERVAL = 30
-
+# 隧道代理地址（帐密模式）: http://user:pwd@host:port
+TUNNEL_PROXY_URL = os.environ.get("TUNNEL_PROXY_URL", "")
 TUNNEL_CHANNELS = int(os.environ.get("TUNNEL_CHANNELS", "8"))
 TUNNEL_ROTATE_INTERVAL = 60
-TUNNEL_PROXY_URL = os.environ.get("TUNNEL_PROXY_URL", "")
-
-TUNNEL_CHANGE_IP_URL = (
-    f"https://tps.kdlapi.com/api/changetpsip/"
-    f"?secret_id={_KDL_SECRET_ID}"
-    f"&signature={_KDL_SIGNATURE}"
-)
+PROXY_REFRESH_INTERVAL = 30
 
 # ============================================================
 # 浏览器指纹

@@ -521,11 +521,11 @@ class Worker:
                 await self._session_pool.resize(config.TUNNEL_CHANNELS)
                 changes.append("tunnel_runtime_reconfig")
 
-        # --- 代理 API 地址 ---
-        new_proxy_url = s.get("proxy_api_url")
-        if new_proxy_url and new_proxy_url != config.PROXY_API_URL_AUTH:
-            config.PROXY_API_URL_AUTH = new_proxy_url  # noqa
-            changes.append(f"proxy_url=***{new_proxy_url[-20:]}")
+        # --- 隧道代理地址 ---
+        new_tunnel_url = s.get("tunnel_proxy_url")
+        if new_tunnel_url and new_tunnel_url != config.TUNNEL_PROXY_URL:
+            config.TUNNEL_PROXY_URL = new_tunnel_url
+            changes.append(f"tunnel_proxy=***{new_tunnel_url[-20:]}")
 
         # --- 邮编（仅初始同步）---
         if is_initial:
@@ -1492,7 +1492,7 @@ class Worker:
         IP 轮换监控协程（仅隧道模式）。
 
         双策略：
-        1. 被封换 IP：当 ≥50% channel 被封时，主动调用 ChangeTpsIp 换 IP
+        1. 被封换 IP：当 ≥50% channel 被封时，主动调用 换 IP
            + 换 IP 后重建被封 channel 的 Session
         2. 定时安全轮换：到达轮换周期时自动重置封锁状态
         """

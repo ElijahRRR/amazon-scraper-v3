@@ -52,7 +52,7 @@ def _default_settings() -> dict:
         "max_retries": config.MAX_RETRIES,
         "request_timeout": config.REQUEST_TIMEOUT,
         "session_rotate_every": config.SESSION_ROTATE_EVERY,
-        "proxy_api_url": config.PROXY_API_URL_AUTH,
+        "tunnel_proxy_url": config.TUNNEL_PROXY_URL,
         "proxy_mode": config.PROXY_MODE,
         "token_bucket_rate": config.TOKEN_BUCKET_RATE,
         "per_channel_qps": config.PER_CHANNEL_QPS,

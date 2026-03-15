@@ -141,14 +141,14 @@
 
     // ---- coordinator update ----
     function updateCoordinator(data) {
-        const concPct = pct(data.allocated_concurrency, data.global_max_concurrency);
+        const concPct = pct(data.allocated_concurrency, data.max_concurrency);
         document.getElementById('coord-concurrency').textContent =
-            data.allocated_concurrency + ' / ' + data.global_max_concurrency;
+            data.allocated_concurrency + ' / ' + data.max_concurrency;
         document.getElementById('coord-concurrency-bar').style.width = concPct + '%';
 
-        const qpsPct = pct(data.allocated_qps, data.global_max_qps);
+        const qpsPct = pct(data.allocated_qps, data.max_qps);
         document.getElementById('coord-qps').textContent =
-            (data.allocated_qps || 0).toFixed(1) + ' / ' + (data.global_max_qps || 0).toFixed(1);
+            (data.allocated_qps || 0).toFixed(1) + ' / ' + (data.max_qps || 0).toFixed(1);
         document.getElementById('coord-qps-bar').style.width = qpsPct + '%';
 
         document.getElementById('coord-active').textContent = data.active_workers;

@@ -74,9 +74,16 @@ TASK_PREFETCH_THRESHOLD = 0.5
 # ============================================================
 # 代理配置
 # ============================================================
+# v3: 统一 TPS 模式（每次请求自动换 IP）
+PROXY_MODE = "tps"
 # 代理地址（帐密模式）: http://user:pwd@host:port
-# 每次请求自动换 IP（TPS 模式），无需多通道
 PROXY_URL = os.environ.get("PROXY_URL", os.environ.get("TUNNEL_PROXY_URL", ""))
+# 兼容 v2 引用
+TUNNEL_PROXY_URL = PROXY_URL
+TUNNEL_CHANNELS = 1
+TUNNEL_ROTATE_INTERVAL = 60
+TUNNEL_MAX_CONCURRENCY = MAX_CONCURRENCY
+TUNNEL_INITIAL_CONCURRENCY = INITIAL_CONCURRENCY
 PROXY_REFRESH_INTERVAL = 30
 
 # ============================================================

@@ -37,6 +37,12 @@ class ScreenshotWorker:
         self._browsers_count = browsers_count
         self._pages_per_browser = pages_per_browser
         self._proxy_url = proxy_url
+        self._concurrency = browsers_count * pages_per_browser
+        self._browser_slots = []
+        self._browser_lock = asyncio.Lock()
+        self._browser_counter = 0
+        self._render_count = 0
+        self._restart_every = 200
 
     @staticmethod
     def _parse_proxy(proxy_url: str) -> dict:
@@ -49,12 +55,6 @@ class ScreenshotWorker:
         if parsed.password:
             result["password"] = parsed.password
         return result
-        self._concurrency = browsers_count * pages_per_browser
-        self._browser_slots = []
-        self._browser_lock = asyncio.Lock()
-        self._browser_counter = 0
-        self._render_count = 0          # 累计渲染计数
-        self._restart_every = 200       # 每渲染 200 张重启浏览器回收内存
         self._running = True
         self._http_client: Optional[httpx.AsyncClient] = None
 

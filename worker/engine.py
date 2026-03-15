@@ -1215,13 +1215,13 @@ class Worker:
                 # 截图存证：写 HTML 到磁盘，由独立截图子进程渲染
                 if task.get("needs_screenshot") and self._enable_screenshot:
                     batch = task.get("batch_name", "")
-                    safe_batch = re.sub(r'[^a-zA-Z0-9_\-]', '_', batch).strip('_') or "default"
-                    html_dir = os.path.join(self._screenshot_html_dir, safe_batch)
+                    # 直接用 batch_name 作为目录名（与 server 端 batch 名一致）
+                    html_dir = os.path.join(self._screenshot_html_dir, batch)
                     os.makedirs(html_dir, exist_ok=True)
                     html_path = os.path.join(html_dir, f"{asin}.html")
                     async with aiofiles.open(html_path, "w", encoding="utf-8") as f:
                         await f.write(resp.text)
-                    self._screenshot_pending_batches.add(safe_batch)
+                    self._screenshot_pending_batches.add(batch)
                     # 确保截图子进程已启动
                     await self._ensure_screenshot_process()
 

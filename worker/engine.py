@@ -474,56 +474,13 @@ class Worker:
             config.PROXY_URL = new_tunnel_url
             changes.append(f"proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
 
-        # --- 隧道通道数和轮换周期 ---
-        tunnel_channels = None  # channels removed in v3
-        tunnel_changed = False
-            tunnel_changed = True
-            changes.append(f"# channels removed: {tunnel_channels}")
-        tunnel_rotate = s.get("tunnel_rotate_interval")
-        rotate_changed = False
-        if tunnel_rotate and tunnel_rotate != config.TUNNEL_ROTATE_INTERVAL:
-            config.TUNNEL_ROTATE_INTERVAL = tunnel_rotate
-            rotate_changed = True
-            changes.append(f"tunnel_rotate={tunnel_rotate}")
+        # --- v3: TPS 模式无需通道/模式切换 ---
 
-        # --- 代理模式（热切换：TPS ↔ 隧道）---
-        mode_changed = False
-        new_mode = s.get("proxy_mode")
-        if new_mode and new_mode in ("tps", "tunnel") and new_mode != self._proxy_mode:
-            mode_changed = True
-            self._proxy_mode = new_mode
-            config.PROXY_MODE = new_mode  # noqa
-            self.proxy_manager.switch_mode(new_mode)
-            await self._sync_controller_mode_profile(new_mode)
-            changes.append(f"proxy_mode={new_mode}")
-            # 热切换时同步会话容器（运行时才需要）
-            if not is_initial:
-                if new_mode == "tunnel":
-                    if self._session:
-                        await self._session.close()
-                        self._session = None
-                    await self._init_session_tunnel()
-                else:
-                    if self._session_pool:
-                        await self._session_pool.close_all()
-                        self._session_pool = None
-                    await self._init_session_tps()
-
-        # --- 同模式下参数变化：重配隧道运行时结构 ---
-        if self._proxy_mode == "tunnel" and (tunnel_changed or rotate_changed) and not mode_changed:
-            self.proxy_manager.reconfigure_tunnel(
-                channels=1,
-                rotate_interval=config.TUNNEL_ROTATE_INTERVAL,
-            )
-            if not is_initial and self._session_pool:
-                await self._session_pool.resize(1)
-                changes.append("tunnel_runtime_reconfig")
-
-        # --- 隧道代理地址 ---
-        new_tunnel_url = s.get("proxy_url")
-        if new_tunnel_url and new_tunnel_url != config.PROXY_URL:
-            config.PROXY_URL = new_tunnel_url
-            changes.append(f"proxy=***{new_tunnel_url[-20:]}")
+        # --- 代理地址 ---
+        new_proxy_url = s.get("proxy_url")
+        if new_proxy_url and new_proxy_url != config.PROXY_URL:
+            config.PROXY_URL = new_proxy_url
+            changes.append(f"proxy=***{new_proxy_url[-20:]}")
 
         # --- 邮编（仅初始同步）---
         if is_initial:

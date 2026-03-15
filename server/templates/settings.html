@@ -1,0 +1,579 @@
+{% extends "base.html" %}
+{% set active_page = "settings" %}
+{% block title %}系统设置 - Amazon Scraper v2{% endblock %}
+
+{% block content %}
+<h2 class="page-title">系统设置</h2>
+<p class="page-subtitle">配置采集参数（保存后 Worker 自动同步生效）</p>
+
+<div class="row">
+    <div class="col-lg-8">
+        <!-- 基础设置 -->
+        <div class="card mb-3">
+            <div class="card-header"><i class="bi bi-sliders"></i> 基础设置</div>
+            <div class="card-body">
+                <form id="settingsForm">
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label">配送邮编</label>
+                            <input type="text" class="form-control" name="zip_code"
+                                   value="{{ settings.zip_code }}" placeholder="10001">
+                            <small class="text-secondary">任务上传页的默认邮编（上传时可逐批覆盖）</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">最大重试次数</label>
+                            <input type="number" class="form-control" name="max_retries"
+                                   value="{{ settings.max_retries }}" min="1" max="10">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">请求超时 (秒)</label>
+                            <input type="number" class="form-control" name="request_timeout"
+                                   value="{{ settings.request_timeout }}" min="5" max="60">
+                            <small class="text-secondary">隧道模式建议 25s，TPS 模式 15s</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Session 轮换频率</label>
+                            <input type="number" class="form-control" name="session_rotate_every"
+                                   value="{{ settings.session_rotate_every }}" min="50" max="10000">
+                            <small class="text-secondary">每 N 次成功请求后轮换 Session</small>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">截图浏览器数</label>
+                            <input type="number" class="form-control" name="screenshot_browsers"
+                                   value="{{ settings.screenshot_browsers }}" min="1" max="10">
+                            <small class="text-secondary">Chromium 实例数</small>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">单浏览器并发</label>
+                            <input type="number" class="form-control" name="screenshot_pages_per_browser"
+                                   value="{{ settings.screenshot_pages_per_browser }}" min="1" max="10">
+                            <small class="text-secondary">每个浏览器并发 Page 数</small>
+                        </div>
+                    </div>
+
+                    <hr class="my-4" style="border-color:var(--border);">
+
+                    <!-- 代理设置 -->
+                    <h6 class="mb-3" style="color:var(--accent-light);"><i class="bi bi-shield-lock"></i> 代理设置</h6>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label">代理模式</label>
+                            <select class="form-select" name="proxy_mode" id="proxyModeSelect"
+                                    onchange="toggleTunnelConfig()">
+                                <option value="tps" {{ 'selected' if settings.proxy_mode == 'tps' }}>TPS（每次换IP）</option>
+                                <option value="tunnel" {{ 'selected' if settings.proxy_mode == 'tunnel' }}>隧道（定时换IP）</option>
+                            </select>
+                            <small class="text-secondary">切换模式将联动调整 QPS/并发/带宽等参数</small>
+                        </div>
+                        <div class="col-8">
+                            <label class="form-label">代理地址</label>
+                            <input type="text" class="form-control" name="tunnel_proxy_url"
+                                   value="{{ settings.tunnel_proxy_url or settings.proxy_api_url }}"
+                                   placeholder="支持：ip:port@user:pwd / user:pwd@host:port / http://user:pwd@host:port">
+                            <small class="text-secondary">填入代理地址保存后自动转换格式，支持快代理 API 地址或帐密隧道代理</small>
+                        </div>
+                    </div>
+                    <div id="tunnelConfig" class="row g-3 mt-1" style="{{ '' if settings.proxy_mode == 'tunnel' else 'display:none' }}">
+                        <div class="col-md-4">
+                            <label class="form-label">通道数</label>
+                            <input type="number" class="form-control" name="tunnel_channels"
+                                   value="{{ settings.tunnel_channels }}" min="1" max="32">
+                            <small class="text-secondary">同时获取的代理数量</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">IP 轮换周期</label>
+                            <input type="number" class="form-control" name="tunnel_rotate_interval"
+                                   value="{{ settings.tunnel_rotate_interval }}" min="10" max="300">
+                            <small class="text-secondary">秒，到期后重新获取代理</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">DPS 最大并发</label>
+                            <input type="number" class="form-control" name="tunnel_max_concurrency"
+                                   value="{{ settings.tunnel_max_concurrency }}" min="8" max="200">
+                            <small class="text-secondary">隧道模式并发上限（所有通道合计）</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">DPS 初始并发</label>
+                            <input type="number" class="form-control" name="tunnel_initial_concurrency"
+                                   value="{{ settings.tunnel_initial_concurrency }}" min="2" max="100">
+                            <small class="text-secondary">隧道模式冷启动并发数</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Per-Channel QPS</label>
+                            <input type="number" class="form-control" name="per_channel_qps"
+                                   value="{{ settings.per_channel_qps }}" step="0.5" min="0.5" max="20">
+                            <small class="text-secondary">每通道独立限流速率</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Per-Channel 最大并发</label>
+                            <input type="number" class="form-control" name="per_channel_max_concurrency"
+                                   value="{{ settings.per_channel_max_concurrency }}" min="1" max="30">
+                            <small class="text-secondary">每通道 AIMD 并发上限</small>
+                        </div>
+                    </div>
+
+                    <hr class="my-4" style="border-color:var(--border);">
+
+                    <!-- 速率与并发 -->
+                    <h6 class="mb-3" style="color:var(--accent-light);"><i class="bi bi-speedometer2"></i> 速率与并发</h6>
+                    <!-- TPS 专属字段 -->
+                    <div id="tpsConfig" class="row g-3" style="{{ '' if settings.proxy_mode == 'tps' else 'display:none' }}">
+                        <div class="col-md-3">
+                            <label class="form-label">全局总并发上限</label>
+                            <input type="number" class="form-control" name="global_max_concurrency"
+                                   value="{{ settings.global_max_concurrency }}" min="2" max="500">
+                            <small class="text-secondary">所有 Worker 总并发预算</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">全局总 QPS 上限</label>
+                            <input type="number" class="form-control" name="global_max_qps"
+                                   value="{{ settings.global_max_qps }}" step="0.5" min="0.5" max="100">
+                            <small class="text-secondary">所有 Worker 总 QPS 预算</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">单 Worker QPS</label>
+                            <input type="number" class="form-control" name="token_bucket_rate"
+                                   value="{{ settings.token_bucket_rate }}" step="0.5" min="0.5" max="50">
+                            <small class="text-secondary">令牌桶速率（无协调时生效）</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">初始并发</label>
+                            <input type="number" class="form-control" name="initial_concurrency"
+                                   value="{{ settings.initial_concurrency }}" min="1" max="50">
+                            <small class="text-secondary">Worker 冷启动并发数</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">最大并发</label>
+                            <input type="number" class="form-control" name="max_concurrency"
+                                   value="{{ settings.max_concurrency }}" min="2" max="100">
+                            <small class="text-secondary">单 Worker AIMD 上限</small>
+                        </div>
+                    </div>
+                    <!-- 通用字段 -->
+                    <div class="row g-3 mt-1">
+                        <div class="col-md-3">
+                            <label class="form-label">最小并发</label>
+                            <input type="number" class="form-control" name="min_concurrency"
+                                   value="{{ settings.min_concurrency }}" min="1" max="20">
+                            <small class="text-secondary">AIMD 下限</small>
+                        </div>
+                    </div>
+
+                    <hr class="my-4" style="border-color:var(--border);">
+
+                    <!-- AIMD 调控参数 -->
+                    <h6 class="mb-3" style="color:var(--accent-light);">
+                        <i class="bi bi-graph-up"></i> AIMD 自适应调控
+                        <small class="text-secondary ms-2" style="font-weight:normal;">（高级，谨慎修改）</small>
+                    </h6>
+                    <div class="row g-3">
+                        <div class="col-md-3">
+                            <label class="form-label">评估间隔</label>
+                            <input type="number" class="form-control" name="adjust_interval"
+                                   value="{{ settings.adjust_interval }}" min="3" max="60">
+                            <small class="text-secondary">秒</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">目标延迟</label>
+                            <input type="number" class="form-control" name="target_latency"
+                                   value="{{ settings.target_latency }}" step="0.5" min="1" max="30">
+                            <small class="text-secondary">p50 低于此值才加速</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">延迟上限</label>
+                            <input type="number" class="form-control" name="max_latency"
+                                   value="{{ settings.max_latency }}" step="0.5" min="2" max="60">
+                            <small class="text-secondary">超过此值则减速</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">封锁冷却</label>
+                            <input type="number" class="form-control" name="cooldown_after_block"
+                                   value="{{ settings.cooldown_after_block }}" min="5" max="120">
+                            <small class="text-secondary">秒，被封后暂停加速</small>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">带宽上限 (Mbps)</label>
+                            <input type="number" class="form-control" name="proxy_bandwidth_mbps"
+                                   value="{{ settings.proxy_bandwidth_mbps }}" min="0" max="100">
+                            <small class="text-secondary">0=不限，用于 AIMD 带宽感知</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">目标成功率</label>
+                            <input type="number" class="form-control" name="target_success_rate"
+                                   value="{{ settings.target_success_rate }}" step="0.01" min="0.5" max="1">
+                            <small class="text-secondary">高于此值才递增并发</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">成功率下限</label>
+                            <input type="number" class="form-control" name="min_success_rate"
+                                   value="{{ settings.min_success_rate }}" step="0.01" min="0.3" max="1">
+                            <small class="text-secondary">低于此值触发减半</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">封锁率阈值</label>
+                            <input type="number" class="form-control" name="block_rate_threshold"
+                                   value="{{ settings.block_rate_threshold }}" step="0.01" min="0.01" max="0.5">
+                            <small class="text-secondary">超过此值紧急减半</small>
+                        </div>
+                    </div>
+
+                    <div class="mt-4 d-flex gap-2">
+                        <button type="submit" class="btn btn-accent">
+                            <i class="bi bi-check-lg"></i> 保存设置
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary" onclick="resetDefaults()">
+                            <i class="bi bi-arrow-counterclockwise"></i> 恢复默认
+                        </button>
+                    </div>
+                </form>
+                <div id="saveResult" class="mt-3" style="display:none;"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-info-circle"></i> 系统信息</div>
+            <div class="card-body">
+                <ul class="list-unstyled mb-0">
+                    <li class="mb-2">
+                        <small class="text-secondary">服务端口</small><br>
+                        <strong>{{ config.port }}</strong>
+                    </li>
+                    <li class="mb-2">
+                        <small class="text-secondary">数据库路径</small><br>
+                        <strong style="word-break:break-all;">scraper.db</strong>
+                    </li>
+                    <li class="mb-2">
+                        <small class="text-secondary">TLS 指纹</small><br>
+                        <strong>多指纹轮换</strong>
+                    </li>
+                    <li class="mb-2">
+                        <small class="text-secondary">请求超时</small><br>
+                        <strong>{{ config.timeout }}s</strong>
+                    </li>
+                    <li>
+                        <small class="text-secondary">版本</small><br>
+                        <strong>v2.0.0</strong>
+                    </li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="card mt-3">
+            <div class="card-header"><i class="bi bi-terminal"></i> Worker 部署</div>
+            <div class="card-body">
+                <a href="/api/worker/download" class="btn btn-accent w-100 mb-3">
+                    <i class="bi bi-download"></i> 下载 Worker 安装包
+                </a>
+                <small class="text-secondary d-block">
+                    下载后解压，双击 <code>start.sh</code>（macOS/Linux）或 <code>start.bat</code>（Windows）即可启动。
+                    首次启动自动创建虚拟环境和安装依赖。
+                </small>
+            </div>
+        </div>
+
+        <div class="card mt-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-clock-history"></i> 定时自动采集</span>
+                <button class="btn btn-sm btn-accent" onclick="addSchedule()">
+                    <i class="bi bi-plus-lg"></i> 新增
+                </button>
+            </div>
+            <div class="card-body">
+                <small class="text-secondary d-block mb-3">
+                    设置每天定时对主库所有 ASIN 发起重新采集，支持多个时间点。
+                </small>
+                <div id="scheduleList"></div>
+                <div id="scheduleEmpty" class="text-secondary text-center py-3" style="display:none;">
+                    暂无定时任务，点击"新增"添加
+                </div>
+                <div id="scheduleNewRow" class="row g-2 align-items-end mt-2" style="display:none;">
+                    <div class="col-auto">
+                        <label class="form-label">时</label>
+                        <select id="newScheduleHour" class="form-select" style="width:80px;">
+                            {% for h in range(24) %}
+                            <option value="{{ '%02d'|format(h) }}" {{ 'selected' if h == 8 }}>{{ '%02d'|format(h) }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-auto d-flex align-items-center" style="padding-bottom:6px; font-size:1.2rem; font-weight:700;">:</div>
+                    <div class="col-auto">
+                        <label class="form-label">分</label>
+                        <select id="newScheduleMinute" class="form-select" style="width:80px;">
+                            {% for m in range(60) %}
+                            <option value="{{ '%02d'|format(m) }}">{{ '%02d'|format(m) }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-auto d-flex gap-1" style="padding-bottom:1px;">
+                        <button class="btn btn-accent" onclick="confirmAddSchedule()">
+                            <i class="bi bi-check-lg"></i> 确认
+                        </button>
+                        <button class="btn btn-outline-secondary" onclick="cancelAddSchedule()">
+                            取消
+                        </button>
+                    </div>
+                </div>
+                <div id="scheduleResult" class="mt-2" style="display:none;"></div>
+            </div>
+        </div>
+
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById('settingsForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    const data = Object.fromEntries(formData);
+    // 数值类型转换
+    const intFields = ['max_retries', 'request_timeout', 'session_rotate_every', 'initial_concurrency',
+                       'min_concurrency', 'max_concurrency', 'adjust_interval', 'cooldown_after_block',
+                       'proxy_bandwidth_mbps', 'screenshot_browsers', 'screenshot_pages_per_browser', 'global_max_concurrency',
+                       'tunnel_channels', 'tunnel_rotate_interval',
+                       'tunnel_max_concurrency', 'tunnel_initial_concurrency',
+                       'per_channel_max_concurrency'];
+    const floatFields = ['token_bucket_rate', 'target_latency', 'max_latency',
+                         'target_success_rate', 'min_success_rate', 'block_rate_threshold',
+                         'global_max_qps', 'per_channel_qps'];
+    intFields.forEach(f => { if (data[f] !== undefined) data[f] = parseInt(data[f]); });
+    floatFields.forEach(f => { if (data[f] !== undefined) data[f] = parseFloat(data[f]); });
+
+    const resultDiv = document.getElementById('saveResult');
+    try {
+        const resp = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data),
+        });
+        const result = await resp.json();
+        if (resp.ok) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = `<div class="alert alert-success">设置已保存，Worker 将在 30 秒内自动同步</div>`;
+            // 保存成功后更新初始模式基线 & 移除高亮
+            _initialMode = document.getElementById('proxyModeSelect').value;
+            for (const k of Object.keys(_modePresets.tps)) {
+                const el = document.querySelector(`[name="${k}"]`);
+                if (el) el.style.border = '';
+            }
+            // 用服务器返回的最新值刷新表单
+            const s = result.settings;
+            if (s) {
+                for (const [k,v] of Object.entries(s)) {
+                    const el = document.querySelector(`[name="${k}"]`);
+                    if (el) el.value = v;
+                }
+                // 代理地址框：优先显示 tunnel_proxy_url，为空则显示 proxy_api_url
+                const proxyEl = document.querySelector('[name="tunnel_proxy_url"]');
+                if (proxyEl) {
+                    proxyEl.value = s.tunnel_proxy_url || s.proxy_api_url || '';
+                }
+            }
+        } else {
+            resultDiv.style.display = 'block';
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-danger';
+            alertDiv.append('保存失败：');
+            const errs = Array.isArray(result.errors) && result.errors.length > 0
+                ? result.errors
+                : ['未知错误'];
+            errs.forEach((msg, idx) => {
+                if (idx > 0) alertDiv.appendChild(document.createElement('br'));
+                alertDiv.append(document.createTextNode(String(msg)));
+            });
+            resultDiv.innerHTML = '';
+            resultDiv.appendChild(alertDiv);
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = `网络错误: ${err.message}`;
+        resultDiv.innerHTML = '';
+        resultDiv.appendChild(alertDiv);
+    }
+    setTimeout(() => { resultDiv.style.display = 'none'; }, 3000);
+});
+
+const _modePresets = {
+    tps:    { token_bucket_rate: 5, initial_concurrency: 8, min_concurrency: 4,
+              cooldown_after_block: 15, proxy_bandwidth_mbps: 0, global_max_qps: 5,
+              request_timeout: 15 },
+    tunnel: { token_bucket_rate: 15, initial_concurrency: 28, min_concurrency: 12,
+              max_concurrency: 80, cooldown_after_block: 60, proxy_bandwidth_mbps: 0,
+              global_max_qps: 15, request_timeout: 45, target_latency: 25,
+              max_latency: 35, min_success_rate: 0.75 }
+};
+let _initialMode = '{{ settings.proxy_mode }}';
+
+function toggleTunnelConfig() {
+    const mode = document.getElementById('proxyModeSelect').value;
+    document.getElementById('tunnelConfig').style.display = mode === 'tunnel' ? '' : 'none';
+    document.getElementById('tpsConfig').style.display = mode === 'tps' ? '' : 'none';
+    // 模式切换时自动填充预设值并高亮
+    if (mode !== _initialMode) {
+        const preset = _modePresets[mode] || {};
+        for (const [k, v] of Object.entries(preset)) {
+            const el = document.querySelector(`[name="${k}"]`);
+            if (el) { el.value = v; el.style.border = '2px solid #f59e0b'; }
+        }
+    } else {
+        // 切回原模式，移除高亮
+        for (const k of Object.keys(_modePresets.tps).concat(Object.keys(_modePresets.tunnel))) {
+            const el = document.querySelector(`[name="${k}"]`);
+            if (el) el.style.border = '';
+        }
+    }
+}
+
+async function resetDefaults() {
+    if (!confirm('确定要恢复所有设置为默认值吗？')) return;
+    const resultDiv = document.getElementById('saveResult');
+    try {
+        const resp = await fetch('/api/settings/reset', { method: 'POST' });
+        const result = await resp.json();
+        if (resp.ok) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-success">已恢复默认设置，页面即将刷新...</div>';
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="alert alert-danger">恢复失败</div>';
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = `网络错误: ${err.message}`;
+        resultDiv.innerHTML = '';
+        resultDiv.appendChild(alertDiv);
+    }
+}
+
+// 定时采集 — 多任务管理
+let _schedules = [];
+
+async function loadSchedules() {
+    try {
+        const resp = await fetch('/api/auto-scrape/schedules');
+        const data = await resp.json();
+        _schedules = data.schedules || [];
+        renderSchedules();
+    } catch(e) {
+        console.error('加载定时任务失败:', e);
+    }
+}
+
+function renderSchedules() {
+    const list = document.getElementById('scheduleList');
+    const empty = document.getElementById('scheduleEmpty');
+    if (!_schedules.length) {
+        list.innerHTML = '';
+        empty.style.display = '';
+        return;
+    }
+    empty.style.display = 'none';
+    list.innerHTML = _schedules.map((s, i) => {
+        const statusText = s.last_run_date
+            ? `上次运行: ${s.last_run_date}`
+            : '尚未运行';
+        const enabledClass = s.enabled ? 'text-success' : 'text-secondary';
+        const enabledIcon = s.enabled ? 'bi-check-circle-fill' : 'bi-pause-circle';
+        const enabledTitle = s.enabled ? '点击禁用' : '点击启用';
+        return `<div class="d-flex align-items-center gap-2 mb-2 p-2 rounded" style="background:var(--card-bg); border:1px solid var(--border);">
+            <button class="btn btn-sm ${enabledClass}" onclick="toggleSchedule(${i})" title="${enabledTitle}" style="border:none; background:none;">
+                <i class="bi ${enabledIcon}" style="font-size:1.1rem;"></i>
+            </button>
+            <strong style="min-width:50px;">${s.time}</strong>
+            <small class="text-secondary" style="flex:1;">${statusText}</small>
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteSchedule(${i})" title="删除">
+                <i class="bi bi-trash3"></i>
+            </button>
+        </div>`;
+    }).join('');
+}
+
+function addSchedule() {
+    document.getElementById('scheduleNewRow').style.display = '';
+    document.getElementById('newScheduleHour').focus();
+}
+
+function cancelAddSchedule() {
+    document.getElementById('scheduleNewRow').style.display = 'none';
+}
+
+async function confirmAddSchedule() {
+    const h = document.getElementById('newScheduleHour').value;
+    const m = document.getElementById('newScheduleMinute').value;
+    const timeStr = `${h}:${m}`;
+    try {
+        const resp = await fetch('/api/auto-scrape/schedules', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ time: timeStr }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            _schedules = data.schedules;
+            renderSchedules();
+            document.getElementById('scheduleNewRow').style.display = 'none';
+            document.getElementById('newScheduleHour').value = '08';
+            document.getElementById('newScheduleMinute').value = '00';
+            showScheduleMsg('success', '已添加');
+        } else {
+            showScheduleMsg('danger', data.detail || '添加失败');
+        }
+    } catch(e) {
+        showScheduleMsg('danger', '网络错误: ' + e.message);
+    }
+}
+
+async function toggleSchedule(index) {
+    const current = _schedules[index];
+    try {
+        const resp = await fetch(`/api/auto-scrape/schedules/${index}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: !current.enabled }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            _schedules = data.schedules;
+            renderSchedules();
+        }
+    } catch(e) {
+        console.error('切换失败:', e);
+    }
+}
+
+async function deleteSchedule(index) {
+    if (!confirm(`确定删除 ${_schedules[index].time} 的定时任务？`)) return;
+    try {
+        const resp = await fetch(`/api/auto-scrape/schedules/${index}`, { method: 'DELETE' });
+        const data = await resp.json();
+        if (resp.ok) {
+            _schedules = data.schedules;
+            renderSchedules();
+            showScheduleMsg('success', '已删除');
+        }
+    } catch(e) {
+        showScheduleMsg('danger', '删除失败: ' + e.message);
+    }
+}
+
+function showScheduleMsg(type, msg) {
+    const div = document.getElementById('scheduleResult');
+    div.style.display = 'block';
+    div.innerHTML = `<div class="alert alert-${type} py-1">${msg}</div>`;
+    setTimeout(() => { div.style.display = 'none'; }, 2000);
+}
+
+// 页面加载时获取定时任务列表
+document.addEventListener('DOMContentLoaded', () => {
+    loadSchedules();
+});
+</script>
+{% endblock %}

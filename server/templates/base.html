@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Amazon Scraper v3{% endblock %}</title>
+    <!-- Bootstrap 5 -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Bootstrap Icons -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- 自定义样式 -->
+    <link href="/static/css/style.css?v=20260226" rel="stylesheet">
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    <!-- 侧边栏 -->
+    <div class="sidebar d-none d-md-block">
+        <div class="brand">
+            <h5><i class="bi bi-box-seam"></i> Amazon Scraper</h5>
+            <small>v2.0 中央控制台</small>
+        </div>
+        <nav class="nav flex-column">
+            <a class="nav-link {% if active_page == 'dashboard' %}active{% endif %}" href="/">
+                <i class="bi bi-speedometer2"></i> 仪表盘
+            </a>
+            <a class="nav-link {% if active_page == 'tasks' %}active{% endif %}" href="/tasks">
+                <i class="bi bi-list-task"></i> 任务管理
+            </a>
+            <a class="nav-link {% if active_page == 'results' %}active{% endif %}" href="/results">
+                <i class="bi bi-table"></i> 采集结果
+            </a>
+            <a class="nav-link {% if active_page == 'workers' %}active{% endif %}" href="/workers">
+                <i class="bi bi-pc-display-horizontal"></i> Worker 监控
+            </a>
+            <a class="nav-link {% if active_page == 'settings' %}active{% endif %}" href="/settings">
+                <i class="bi bi-gear"></i> 系统设置
+            </a>
+        </nav>
+    </div>
+
+    <!-- 移动端顶部导航 -->
+    <nav class="navbar navbar-light d-md-none" style="background:var(--bg-secondary); border-bottom:1px solid var(--border);">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/" style="color:var(--accent)"><i class="bi bi-box-seam"></i> Amazon Scraper</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mobileNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="mobileNav">
+                <ul class="navbar-nav">
+                    <li><a class="nav-link" href="/">仪表盘</a></li>
+                    <li><a class="nav-link" href="/tasks">任务管理</a></li>
+                    <li><a class="nav-link" href="/results">采集结果</a></li>
+                    <li><a class="nav-link" href="/workers">Worker 监控</a></li>
+                    <li><a class="nav-link" href="/settings">系统设置</a></li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <!-- 主内容区 -->
+    <div class="main-content">
+        {% block content %}{% endblock %}
+    </div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    {% block extra_js %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+{% set active_page = "dashboard" %}
+{% block title %}仪表盘 - Amazon Scraper v2{% endblock %}
+
+{% block content %}
+<h2 class="page-title">仪表盘</h2>
+<p class="page-subtitle">实时采集概览</p>
+
+<!-- 统计卡片 -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-3">
+        <div class="stat-card accent">
+            <div class="stat-label">总任务</div>
+            <div class="stat-number" id="stat-total">{{ progress.total }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card success">
+            <div class="stat-label">已完成</div>
+            <div class="stat-number" id="stat-done">{{ progress.done }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card warning">
+            <div class="stat-label">进行中</div>
+            <div class="stat-number" id="stat-processing">{{ progress.processing }}</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card danger">
+            <div class="stat-label">失败</div>
+            <div class="stat-number" id="stat-failed">{{ progress.failed }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- 采集速度 -->
+<div class="card mb-4">
+    <div class="card-body d-flex align-items-center justify-content-between">
+        <div>
+            <span class="text-secondary" style="font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px;">
+                <i class="bi bi-lightning-charge"></i> 采集速度
+            </span>
+        </div>
+        <div class="d-flex align-items-baseline gap-2">
+            <span id="stat-speed" style="font-size:2rem;font-weight:700;color:var(--accent);">--</span>
+            <span class="text-secondary" style="font-size:0.9rem;">条/分钟</span>
+        </div>
+    </div>
+</div>
+
+<!-- 整体进度条 -->
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="d-flex justify-content-between mb-2">
+            <span>整体进度</span>
+            <span id="progress-pct">{{ progress.completion_rate }}%</span>
+        </div>
+        <div class="progress" style="height: 12px;">
+            <div class="progress-bar bg-success" id="progress-bar-done"
+                 style="width: {{ (progress.done / progress.total * 100) if progress.total > 0 else 0 }}%"></div>
+            <div class="progress-bar bg-danger" id="progress-bar-failed"
+                 style="width: {{ (progress.failed / progress.total * 100) if progress.total > 0 else 0 }}%"></div>
+        </div>
+        <div class="d-flex justify-content-between mt-2">
+            <small class="text-secondary">
+                <i class="bi bi-pc-display-horizontal"></i> 在线 Worker: <strong id="stat-workers">{{ active_workers }}</strong>
+            </small>
+            <small class="text-secondary">
+                成功率: <strong id="stat-success-rate">{{ progress.success_rate }}%</strong>
+            </small>
+        </div>
+    </div>
+</div>
+
+<!-- 最近批次 -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-clock-history"></i> 最近批次</span>
+        <a href="/tasks" class="btn btn-sm btn-outline-accent">查看全部</a>
+    </div>
+    <div class="card-body p-0">
+        <table class="table table-hover mb-0" id="batchTable">
+            <thead>
+                <tr>
+                    <th>批次名称</th>
+                    <th>总数</th>
+                    <th>完成</th>
+                    <th>失败</th>
+                    <th>进度</th>
+                    <th>创建时间</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for b in batches %}
+                <tr>
+                    <td><a href="/results?batch_name={{ b.batch_name }}" class="text-decoration-none" style="color:var(--accent)">{{ b.batch_name }}</a></td>
+                    <td>{{ b.total }}</td>
+                    <td><span class="text-success">{{ b.done }}</span></td>
+                    <td><span class="text-danger">{{ b.failed }}</span></td>
+                    <td>
+                        <div class="progress" style="width:120px; height:6px;">
+                            <div class="progress-bar bg-success" style="width:{{ b.progress }}%"></div>
+                        </div>
+                        <small class="text-secondary">{{ b.progress }}%</small>
+                    </td>
+                    <td><small class="text-secondary">{{ b.created_at }}</small></td>
+                </tr>
+                {% endfor %}
+                {% if not batches %}
+                <tr><td colspan="6" class="text-center text-secondary py-4">暂无批次</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// HTML 转义
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// 速度计算：EWMA 平滑
+let prevDone = {{ progress.done }};
+let prevTime = Date.now();
+let ewmaSpeed = null;
+const EWMA_ALPHA = 0.3;
+
+// 每 3 秒刷新全部数据
+setInterval(async () => {
+    try {
+        // 并行拉取 progress, batches, workers
+        const [progResp, batchResp, workerResp] = await Promise.all([
+            fetch('/api/progress'),
+            fetch('/api/batches'),
+            fetch('/api/workers'),
+        ]);
+        const data = await progResp.json();
+        const batchData = await batchResp.json();
+        const batches = batchData.batches || [];
+        const workerData = await workerResp.json();
+        const workers = workerData.workers || [];
+
+        // 更新统计卡片
+        document.getElementById('stat-total').textContent = data.total;
+        document.getElementById('stat-done').textContent = data.done;
+        document.getElementById('stat-processing').textContent = data.processing;
+        document.getElementById('stat-failed').textContent = data.failed;
+
+        // 进度条用 completion_rate，成功率单独显示
+        document.getElementById('progress-pct').textContent = data.completion_rate + '%';
+        document.getElementById('stat-success-rate').textContent = data.success_rate + '%';
+
+        if (data.total > 0) {
+            document.getElementById('progress-bar-done').style.width = (data.done / data.total * 100) + '%';
+            document.getElementById('progress-bar-failed').style.width = (data.failed / data.total * 100) + '%';
+        }
+
+        // Worker 数（API 返回 status: "online"/"offline"）
+        const activeCount = workers.filter(w => w.status === 'online').length;
+        document.getElementById('stat-workers').textContent = activeCount;
+
+        // EWMA 速度计算
+        const now = Date.now();
+        const deltaDone = data.done - prevDone;
+        const deltaSec = (now - prevTime) / 1000;
+
+        if (deltaSec > 0 && deltaDone >= 0) {
+            const instantSpeed = deltaDone / deltaSec * 60;
+            const el = document.getElementById('stat-speed');
+
+            if (deltaDone === 0 && data.processing === 0) {
+                ewmaSpeed = 0;
+                el.textContent = '0';
+                el.style.color = 'var(--text-secondary)';
+            } else if (deltaDone === 0) {
+                // 有任务在处理但还没出结果，EWMA 衰减
+                if (ewmaSpeed !== null) {
+                    ewmaSpeed = ewmaSpeed * (1 - EWMA_ALPHA);
+                    el.textContent = ewmaSpeed.toFixed(1);
+                }
+            } else {
+                ewmaSpeed = ewmaSpeed === null
+                    ? instantSpeed
+                    : EWMA_ALPHA * instantSpeed + (1 - EWMA_ALPHA) * ewmaSpeed;
+                el.textContent = ewmaSpeed.toFixed(1);
+                el.style.color = 'var(--accent)';
+            }
+        }
+
+        prevDone = data.done;
+        prevTime = now;
+
+        // 刷新批次表格
+        const tbody = document.querySelector('#batchTable tbody');
+        if (tbody) {
+            if (!batches || batches.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-4">暂无批次</td></tr>';
+            } else {
+                tbody.innerHTML = batches.map(b => `<tr>
+                    <td><a href="/results?batch_name=${encodeURIComponent(b.batch_name)}" class="text-decoration-none" style="color:var(--accent)">${esc(b.batch_name)}</a></td>
+                    <td>${b.total}</td>
+                    <td><span class="text-success">${b.done}</span></td>
+                    <td><span class="text-danger">${b.failed}</span></td>
+                    <td>
+                        <div class="progress" style="width:120px; height:6px;">
+                            <div class="progress-bar bg-success" style="width:${b.progress}%"></div>
+                        </div>
+                        <small class="text-secondary">${b.progress}% <span class="text-success">(${b.success_rate}%)</span></small>
+                    </td>
+                    <td><small class="text-secondary">${esc(b.created_at)}</small></td>
+                </tr>`).join('');
+            }
+        }
+    } catch(e) {}
+}, 3000);
+</script>
+{% endblock %}

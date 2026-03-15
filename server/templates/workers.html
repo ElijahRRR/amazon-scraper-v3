@@ -1,0 +1,251 @@
+{% extends "base.html" %}
+{% set active_page = "workers" %}
+{% block title %}Worker 监控看板 - Amazon Scraper v2{% endblock %}
+
+{% block content %}
+<h2 class="page-title">Worker 监控看板</h2>
+<p class="page-subtitle">实时监控所有 Worker 状态、配额与性能指标</p>
+
+<!-- 第一行：全局协调器总览 -->
+<div class="row g-3 mb-4" id="coordinator-overview">
+    <div class="col-md-3 col-sm-6">
+        <div class="stat-card accent">
+            <div class="stat-label">总并发预算</div>
+            <div class="stat-number" id="coord-concurrency">- / -</div>
+            <div class="progress mt-2" style="height:6px">
+                <div class="progress-bar" id="coord-concurrency-bar" style="width:0%"></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="stat-card info">
+            <div class="stat-label">总 QPS 预算</div>
+            <div class="stat-number" id="coord-qps">- / -</div>
+            <div class="progress mt-2" style="height:6px">
+                <div class="progress-bar" id="coord-qps-bar" style="width:0%"></div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="stat-card success">
+            <div class="stat-label">活跃 Worker</div>
+            <div class="stat-number" id="coord-active">0</div>
+        </div>
+    </div>
+    <div class="col-md-3 col-sm-6">
+        <div class="stat-card" id="coord-block-card">
+            <div class="stat-label">全局封锁状态</div>
+            <div class="stat-number" id="coord-block-status" style="font-size:1.2rem">-</div>
+            <div class="text-secondary mt-1" style="font-size:0.8rem" id="coord-block-count"></div>
+        </div>
+    </div>
+</div>
+
+<!-- 第二行：Worker 卡片网格 -->
+<div class="row g-3 mb-4" id="worker-grid">
+    <!-- JS 动态填充 -->
+</div>
+
+<!-- 空状态 -->
+<div id="worker-empty" class="card d-none">
+    <div class="card-body text-center text-secondary py-5">
+        <i class="bi bi-pc-display-horizontal" style="font-size:2rem;opacity:0.5"></i>
+        <p class="mt-2 mb-1">暂无 Worker 连接</p>
+        <small>运行 <code>python worker.py --server http://&lt;IP&gt;:8899</code> 启动</small>
+    </div>
+</div>
+
+<!-- 底部操作栏 -->
+<div class="d-flex gap-2 mt-2">
+    <div class="btn-group">
+        <button type="button" class="btn btn-outline-accent btn-sm dropdown-toggle" data-bs-toggle="dropdown">
+            <i class="bi bi-download"></i> 下载 Worker
+        </button>
+        <ul class="dropdown-menu">
+            <li><a class="dropdown-item" href="/api/worker/download?mode=full">
+                <i class="bi bi-box-seam"></i> 完整安装包 <small class="text-secondary">— 首次安装</small>
+            </a></li>
+            <li><a class="dropdown-item" href="/api/worker/download?mode=update">
+                <i class="bi bi-arrow-repeat"></i> 代码更新包 <small class="text-secondary">— 仅 .py 文件</small>
+            </a></li>
+        </ul>
+    </div>
+    <button class="btn btn-outline-danger btn-sm" onclick="clearOffline()">
+        <i class="bi bi-trash"></i> 清理所有离线 Worker
+    </button>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+    // ---- helpers ----
+    function fmtDuration(seconds) {
+        if (seconds == null) return '-';
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        if (h > 0) return h + 'h ' + m + 'm';
+        return m + 'm';
+    }
+
+    function successRateClass(rate) {
+        if (rate == null) return '';
+        if (rate >= 95) return 'text-metric-good';
+        if (rate >= 85) return 'text-metric-warn';
+        return 'text-metric-bad';
+    }
+
+    function blockRateClass(rate) {
+        if (rate == null) return '';
+        if (rate === 0) return 'text-metric-good';
+        if (rate < 5) return 'text-metric-warn';
+        return 'text-metric-bad';
+    }
+
+    function pct(a, b) {
+        if (!b) return 0;
+        return Math.min(100, (a / b) * 100);
+    }
+
+    function val(v, suffix, decimals) {
+        if (v == null) return '-';
+        var n = Number(v);
+        if (isNaN(n)) return '-';
+        if (decimals != null) return n.toFixed(decimals) + (suffix || '');
+        return n.toLocaleString() + (suffix || '');
+    }
+
+    // ---- coordinator update ----
+    function updateCoordinator(data) {
+        const concPct = pct(data.allocated_concurrency, data.global_max_concurrency);
+        document.getElementById('coord-concurrency').textContent =
+            data.allocated_concurrency + ' / ' + data.global_max_concurrency;
+        document.getElementById('coord-concurrency-bar').style.width = concPct + '%';
+
+        const qpsPct = pct(data.allocated_qps, data.global_max_qps);
+        document.getElementById('coord-qps').textContent =
+            (data.allocated_qps || 0).toFixed(1) + ' / ' + (data.global_max_qps || 0).toFixed(1);
+        document.getElementById('coord-qps-bar').style.width = qpsPct + '%';
+
+        document.getElementById('coord-active').textContent = data.active_workers;
+
+        const gb = data.global_block || {};
+        const blockCard = document.getElementById('coord-block-card');
+        const blockStatus = document.getElementById('coord-block-status');
+        const blockCount = document.getElementById('coord-block-count');
+
+        if (gb.active) {
+            blockCard.className = 'stat-card danger';
+            blockStatus.innerHTML = '<span class="badge-status badge-offline"><i class="bi bi-shield-exclamation"></i> 冷却中</span> <span style="font-size:0.9rem">剩余 ' + gb.remaining_s + 's</span>';
+        } else {
+            blockCard.className = 'stat-card success';
+            blockStatus.innerHTML = '<span class="badge-status badge-online"><i class="bi bi-shield-check"></i> 正常</span>';
+        }
+        blockCount.textContent = '累计封锁: ' + (gb.block_count || 0) + ' 次';
+    }
+
+    // ---- XSS 防护 ----
+    function escapeHtml(s) {
+        if (typeof s !== 'string') return '';
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
+    // ---- worker grid update ----
+    function renderWorkerCard(w) {
+        const safeId = escapeHtml(w.worker_id);
+        const isOnline = w.status === 'online';
+        const offlineClass = isOnline ? '' : ' worker-card-offline';
+        const badge = isOnline
+            ? '<span class="badge-status badge-online"><i class="bi bi-circle-fill"></i> 在线</span>'
+            : '<span class="badge-status badge-offline"><i class="bi bi-circle-fill"></i> 离线</span>';
+        const deleteBtn = isOnline ? '' :
+            '<button class="btn btn-outline-danger btn-sm ms-auto" onclick="removeWorker(\'' + safeId + '\')" title="移除"><i class="bi bi-x-lg"></i></button>';
+
+        const screenshotBadge = w.enable_screenshot
+            ? '<span class="badge bg-success bg-opacity-25 text-success" style="font-size:0.7rem"><i class="bi bi-camera-fill"></i> 截图</span>'
+            : '<span class="badge bg-secondary bg-opacity-25 text-secondary" style="font-size:0.7rem"><i class="bi bi-camera-video-off"></i> 无截图</span>';
+        const ipText = w.ip ? escapeHtml(w.ip) : '-';
+
+        return '<div class="col-md-6 col-xl-4" data-worker="' + safeId + '">' +
+            '<div class="card worker-card' + offlineClass + '">' +
+                '<div class="card-header d-flex align-items-center gap-2 py-2">' +
+                    '<i class="bi bi-pc-display" style="color:var(--accent)"></i>' +
+                    '<strong style="font-size:0.9rem" class="text-truncate">' + safeId + '</strong>' +
+                    screenshotBadge + badge + deleteBtn +
+                '</div>' +
+                '<div class="card-body py-2 px-3">' +
+                    '<div class="worker-metrics">' +
+                        '<div class="wm-item"><span class="wm-label">IP 地址</span><span class="wm-value" style="font-family:monospace;font-size:0.75rem">' + ipText + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">配额并发</span><span class="wm-value">' + val(w.quota_concurrency) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">配额 QPS</span><span class="wm-value">' + val(w.quota_qps, '', 1) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">成功率</span><span class="wm-value ' + successRateClass(w.success_rate) + '">' + val(w.success_rate, '%', 1) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">封锁率</span><span class="wm-value ' + blockRateClass(w.block_rate) + '">' + val(w.block_rate, '%', 1) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">延迟 p50</span><span class="wm-value">' + val(w.latency_p50, 's', 1) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">在飞请求</span><span class="wm-value">' + val(w.inflight) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">已拉取</span><span class="wm-value">' + val(w.tasks_pulled) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">已提交</span><span class="wm-value">' + val(w.results_submitted) + '</span></div>' +
+                    '</div>' +
+                    '<div class="worker-footer">' +
+                        '<span><i class="bi bi-clock"></i> ' + fmtDuration(w.uptime) + '</span>' +
+                        '<span><i class="bi bi-activity"></i> ' + escapeHtml(w.last_seen || '-') + '</span>' +
+                    '</div>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+    }
+
+    function updateWorkers(workers) {
+        const grid = document.getElementById('worker-grid');
+        const empty = document.getElementById('worker-empty');
+
+        if (!workers || workers.length === 0) {
+            grid.innerHTML = '';
+            empty.classList.remove('d-none');
+            return;
+        }
+        empty.classList.add('d-none');
+
+        // Sort: online first, then by worker_id
+        workers.sort((a, b) => {
+            if (a.status !== b.status) return a.status === 'online' ? -1 : 1;
+            return a.worker_id.localeCompare(b.worker_id);
+        });
+
+        grid.innerHTML = workers.map(renderWorkerCard).join('');
+    }
+
+    // ---- fetch & refresh ----
+    async function refresh() {
+        try {
+            const [coordResp, workersResp] = await Promise.all([
+                fetch('/api/coordinator'),
+                fetch('/api/workers')
+            ]);
+            const coordData = await coordResp.json();
+            const workersData = await workersResp.json();
+
+            updateCoordinator(coordData);
+            updateWorkers(workersData.workers || []);
+        } catch (e) {
+            console.error('Dashboard refresh failed:', e);
+        }
+    }
+
+    // Initial load + 5s interval
+    refresh();
+    setInterval(refresh, 5000);
+
+    // Expose global actions
+    window.removeWorker = async function(workerId) {
+        await fetch('/api/workers/' + encodeURIComponent(workerId), { method: 'DELETE' });
+        refresh();
+    };
+
+    window.clearOffline = async function() {
+        const resp = await fetch('/api/workers', { method: 'DELETE' });
+        const data = await resp.json();
+        refresh();
+    };
+})();
+</script>
+{% endblock %}

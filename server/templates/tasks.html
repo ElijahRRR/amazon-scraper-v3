@@ -1,0 +1,259 @@
+{% extends "base.html" %}
+{% set active_page = "tasks" %}
+{% block title %}任务管理 - Amazon Scraper v2{% endblock %}
+
+{% block content %}
+<h2 class="page-title">任务管理</h2>
+<p class="page-subtitle">上传 ASIN 列表，管理采集批次</p>
+
+<!-- 上传区域 -->
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-cloud-upload"></i> 上传 ASIN 文件</div>
+    <div class="card-body">
+        <form id="uploadForm" enctype="multipart/form-data">
+            <div class="row g-3 mb-3">
+                <div class="col-md-4">
+                    <label class="form-label">批次名称（可选）</label>
+                    <input type="text" class="form-control" name="batch_name" placeholder="自动生成">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">配送邮编</label>
+                    <input type="text" class="form-control" name="zip_code"
+                           value="{{ default_zip_code }}" placeholder="10001">
+                    <small class="text-secondary">可在系统设置中修改默认值</small>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">ASIN 文件</label>
+                    <input type="file" class="form-control" name="file" accept=".xlsx,.xls,.csv,.txt" required>
+                </div>
+            </div>
+            <div class="d-flex justify-content-between align-items-center">
+                <div class="d-flex align-items-center gap-3">
+                    <small class="text-secondary">支持 Excel (.xlsx)、CSV (.csv)、纯文本 (.txt) 格式</small>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" name="needs_screenshot" id="screenshotSwitch">
+                        <label class="form-check-label small" for="screenshotSwitch">
+                            <i class="bi bi-camera"></i> 开启网页截图取证
+                        </label>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-accent" id="uploadBtn">
+                    <i class="bi bi-upload"></i> 上传
+                </button>
+            </div>
+        </form>
+        <div id="uploadResult" class="mt-3" style="display:none;"></div>
+    </div>
+</div>
+
+<!-- 批次列表 -->
+<div class="card">
+    <div class="card-header"><i class="bi bi-collection"></i> 历史批次</div>
+    <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>批次名称</th>
+                    <th>总数</th>
+                    <th>待处理</th>
+                    <th>处理中</th>
+                    <th>完成</th>
+                    <th>失败</th>
+                    <th>进度</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for b in batches %}
+                <tr>
+                    <td>{{ b.batch_name }}</td>
+                    <td>{{ b.total }}</td>
+                    <td><span class="badge-status badge-pending">{{ b.pending }}</span></td>
+                    <td><span class="badge-status badge-processing">{{ b.processing }}</span></td>
+                    <td><span class="badge-status badge-done">{{ b.done }}</span></td>
+                    <td>
+                        <span class="badge-status badge-failed">{{ b.failed }}</span>
+                        {% if b.failed > 0 %}
+                        <button class="btn btn-sm btn-link p-0 ms-1" onclick="showErrors('{{ b.batch_name }}')" title="查看错误详情" style="color:var(--danger);">
+                            <i class="bi bi-exclamation-circle"></i>
+                        </button>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div class="progress" style="width:100px; height:6px;">
+                            <div class="progress-bar bg-success" style="width:{{ b.progress }}%"></div>
+                        </div>
+                        <small>{{ b.progress }}%</small>
+                    </td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <a href="/results?batch_name={{ b.batch_name|urlencode }}" class="btn btn-outline-accent" title="查看结果">
+                                <i class="bi bi-eye"></i>
+                            </a>
+                            <a href="/api/export/{{ b.batch_name|urlencode }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
+                                <i class="bi bi-download"></i>
+                            </a>
+                            <a href="/api/export/{{ b.batch_name|urlencode }}/screenshots" class="btn btn-outline-accent" title="下载截图 ZIP">
+                                <i class="bi bi-images"></i>
+                            </a>
+                            <button class="btn btn-outline-danger" onclick="prioritizeBatch('{{ b.batch_name }}')" title="优先采集">
+                                <i class="bi bi-lightning-charge"></i>
+                            </button>
+                            <button class="btn btn-outline-accent" onclick="retryBatch('{{ b.batch_name }}')" title="重试失败">
+                                <i class="bi bi-arrow-clockwise"></i>
+                            </button>
+                            <button class="btn btn-outline-danger" onclick="deleteBatch('{{ b.batch_name }}')" title="删除">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not batches %}
+                <tr><td colspan="8" class="text-center text-secondary py-4">暂无批次，请上传 ASIN 文件</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- 错误详情弹窗 -->
+<div class="modal fade" id="errorModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content" style="background:var(--card-bg); border:1px solid var(--border);">
+            <div class="modal-header" style="border-color:var(--border);">
+                <h5 class="modal-title" id="errorModalTitle">错误详情</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="errorModalBody">
+                <div class="text-center py-3"><span class="spinner-border spinner-border-sm"></span> 加载中...</div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('uploadBtn');
+    const resultDiv = document.getElementById('uploadResult');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 上传中...';
+
+    const formData = new FormData(e.target);
+    // checkbox 选中时值为 "on"，需要转换为 "true"/"false" 给后端
+    const screenshotChecked = document.getElementById('screenshotSwitch').checked;
+    formData.set('needs_screenshot', screenshotChecked ? 'true' : 'false');
+    try {
+        const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+        const data = await resp.json();
+        if (resp.ok) {
+            resultDiv.style.display = 'block';
+            const batchSpan = document.createElement('strong');
+            batchSpan.textContent = data.batch_name;
+            resultDiv.innerHTML = '';
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-success';
+            alertDiv.append('✅ 上传成功！批次: ', batchSpan,
+                `，共 ${parseInt(data.total_asins)} 个 ASIN，插入 ${parseInt(data.inserted)} 个任务`);
+            resultDiv.appendChild(alertDiv);
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            resultDiv.style.display = 'block';
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-danger';
+            alertDiv.textContent = '❌ ' + (data.detail || '上传失败');
+            resultDiv.innerHTML = '';
+            resultDiv.appendChild(alertDiv);
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = '❌ 网络错误: ' + err.message;
+        resultDiv.innerHTML = '';
+        resultDiv.appendChild(alertDiv);
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-upload"></i> 上传';
+});
+
+async function retryBatch(name) {
+    if (!confirm(`确定重试批次 "${name}" 中所有失败的任务？`)) return;
+    await fetch(`/api/batches/${encodeURIComponent(name)}/retry`, { method: 'POST' });
+    location.reload();
+}
+
+async function prioritizeBatch(name) {
+    if (!confirm(`确定将批次 "${name}" 设为优先采集？Worker 将立即切换到该批次。`)) return;
+    const resp = await fetch(`/api/batches/${encodeURIComponent(name)}/prioritize`, { method: 'POST' });
+    const data = await resp.json();
+    if (resp.ok) {
+        alert(`已将 ${data.updated} 个待处理任务设为优先采集`);
+    } else {
+        alert('操作失败');
+    }
+}
+
+async function deleteBatch(name) {
+    if (!confirm(`确定删除批次 "${name}"？此操作不可恢复！`)) return;
+    await fetch(`/api/batches/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    location.reload();
+}
+
+const ERROR_LABELS = {
+    blocked: '被封锁', captcha: '验证码', timeout: '超时',
+    parse_error: '解析失败', network: '网络异常', unknown: '未知'
+};
+
+async function showErrors(batchName) {
+    const body = document.getElementById('errorModalBody');
+    document.getElementById('errorModalTitle').textContent = `错误详情 — ${batchName}`;
+    body.innerHTML = '<div class="text-center py-3"><span class="spinner-border spinner-border-sm"></span> 加载中...</div>';
+    new bootstrap.Modal(document.getElementById('errorModal')).show();
+
+    try {
+        const resp = await fetch(`/api/batches/${encodeURIComponent(batchName)}/errors`);
+        const data = await resp.json();
+
+        let html = '<h6 style="color:var(--accent-light);">错误类型分布</h6>';
+        html += '<div class="row g-2 mb-3">';
+        for (const [etype, count] of Object.entries(data.summary || {})) {
+            const label = ERROR_LABELS[etype] || etype;
+            html += `<div class="col-auto"><span class="badge bg-danger bg-opacity-75 px-3 py-2">${esc(label)} <strong>${count}</strong></span></div>`;
+        }
+        html += '</div>';
+
+        if (data.tasks && data.tasks.length > 0) {
+            html += '<h6 style="color:var(--accent-light);">失败任务列表</h6>';
+            html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0"><thead><tr>';
+            html += '<th>ASIN</th><th>错误类型</th><th>详情</th><th>重试</th><th>时间</th></tr></thead><tbody>';
+            for (const t of data.tasks) {
+                const label = ERROR_LABELS[t.error_type] || t.error_type || '未知';
+                html += `<tr>
+                    <td><a href="https://www.amazon.com/dp/${encodeURIComponent(t.asin)}" target="_blank"
+                           style="color:var(--info)">${esc(t.asin)}</a></td>
+                    <td><span class="badge bg-secondary">${esc(label)}</span></td>
+                    <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                        title="${esc(t.error_detail || '')}">${esc(t.error_detail || '-')}</td>
+                    <td>${t.retry_count || 0}</td>
+                    <td><small class="text-secondary">${esc(t.updated_at || '')}</small></td>
+                </tr>`;
+            }
+            html += '</tbody></table></div>';
+        }
+
+        body.innerHTML = html;
+    } catch(e) {
+        body.innerHTML = `<div class="alert alert-danger">加载失败: ${esc(e.message)}</div>`;
+    }
+}
+
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+</script>
+{% endblock %}

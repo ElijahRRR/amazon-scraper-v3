@@ -81,56 +81,56 @@
     "category": "frontend",
     "description": "Dashboard页面 - 总览统计、批次列表、进度展示",
     "steps": ["确认dashboard模板存在", "确认统计数据API存在"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 13,
     "category": "frontend",
     "description": "Tasks页面 - 批次管理、ASIN文件上传、任务状态",
     "steps": ["确认tasks模板存在", "确认上传功能可用"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 14,
     "category": "frontend",
     "description": "Results页面 - 高性能分页列表、批次筛选、4类变动筛选、搜索",
     "steps": ["确认results模板存在", "确认分页导航", "确认4类变动筛选UI"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 15,
     "category": "frontend",
     "description": "Workers页面 - worker在线状态、指标监控",
     "steps": ["确认workers模板存在", "确认worker状态API"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 16,
     "category": "frontend",
     "description": "Settings页面 - 运行时参数配置、自动采集计划",
     "steps": ["确认settings模板存在", "确认设置读写API"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 17,
     "category": "feature",
     "description": "数据导出 - Excel/CSV/SQLite/截图ZIP导出，流式处理大数据集",
     "steps": ["确认导出API端点存在", "确认流式导出实现"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 18,
     "category": "feature",
     "description": "自动采集调度 - 定时任务触发、批次自动创建",
     "steps": ["确认自动调度循环存在", "确认时间触发逻辑正确"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 19,
     "category": "feature",
     "description": "全局并发协调 - 多worker配额分配、全局封锁冷却",
     "steps": ["确认全局协调器存在", "确认配额分配逻辑", "确认封锁冷却机制"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 20,

@@ -1,0 +1,320 @@
+{% extends "base.html" %}
+{% set active_page = "results" %}
+{% block title %}采集结果 - Amazon Scraper v3{% endblock %}
+
+{% block content %}
+<h2 class="page-title">采集结果</h2>
+<p class="page-subtitle">浏览和搜索采集数据</p>
+
+<!-- 统计卡片 -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-3">
+        <div class="stat-card accent">
+            <div class="stat-label">ASIN 总数</div>
+            <div class="stat-number" id="stat-total">-</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card success">
+            <div class="stat-label">价格/库存变动</div>
+            <div class="stat-number" id="stat-price-stock">-</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card warning">
+            <div class="stat-label">标题/描述变动</div>
+            <div class="stat-number" id="stat-title-bullets">-</div>
+        </div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="stat-card danger">
+            <div class="stat-label">新增 ASIN</div>
+            <div class="stat-number" id="stat-new">-</div>
+        </div>
+    </div>
+</div>
+
+<!-- 筛选栏 -->
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="row g-2 align-items-end">
+            <div class="col-md-3">
+                <label class="form-label">批次筛选</label>
+                <select id="batchFilter" class="form-select">
+                    <option value="">全部批次</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">变动筛选</label>
+                <select id="changeFilter" class="form-select">
+                    <option value="all">全部 ASIN</option>
+                    <option value="price_stock">价格/库存变动</option>
+                    <option value="title_bullets">标题/五点描述变动</option>
+                    <option value="new">新增 ASIN</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">搜索</label>
+                <input type="text" id="searchInput" class="form-control" placeholder="ASIN 或标题...">
+            </div>
+            <div class="col-md-1">
+                <label class="form-label">&nbsp;</label>
+                <button class="btn btn-accent w-100" onclick="loadResults()"><i class="bi bi-search"></i></button>
+            </div>
+            <div class="col-md-3 text-end">
+                <label class="form-label">&nbsp;</label>
+                <div class="d-flex justify-content-end gap-1">
+                    <button class="btn btn-outline-accent btn-sm" onclick="exportResults()">
+                        <i class="bi bi-download"></i> 导出
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- 结果列表 -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between">
+        <span><i class="bi bi-table"></i> 共 <span id="resultTotal">-</span> 条结果</span>
+        <span class="text-secondary" id="pageInfo"></span>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr>
+                        <th>ASIN</th>
+                        <th>标题</th>
+                        <th>当前价格</th>
+                        <th>BuyBox</th>
+                        <th>品牌</th>
+                        <th>库存</th>
+                        <th>FBA</th>
+                        <th>配送</th>
+                        <th>采集时间</th>
+                        <th>截图</th>
+                    </tr>
+                </thead>
+                <tbody id="resultBody">
+                    <tr><td colspan="10" class="text-center text-secondary p-4">加载中...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div class="card-footer d-flex justify-content-between align-items-center">
+        <button class="btn btn-outline-secondary btn-sm" id="prevBtn" onclick="loadPrev()" disabled>
+            <i class="bi bi-chevron-left"></i> 上一页
+        </button>
+        <span id="pageCounter" class="text-secondary"></span>
+        <button class="btn btn-outline-secondary btn-sm" id="nextBtn" onclick="loadNext()" disabled>
+            下一页 <i class="bi bi-chevron-right"></i>
+        </button>
+    </div>
+</div>
+
+<!-- 截图预览 Modal -->
+<div class="modal fade" id="screenshotModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">截图预览</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body text-center">
+                <img id="screenshotImg" src="" style="max-width:100%; border:1px solid var(--border);">
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const esc = s => {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+};
+
+// 状态
+let state = {
+    batchId: null,
+    search: '',
+    changeFilter: 'all',
+    nextCursor: null,
+    prevCursor: null,
+    cursorStack: [],  // 用于向前翻页
+};
+
+// 初始化
+document.addEventListener('DOMContentLoaded', () => {
+    loadBatches();
+    loadResults();
+    loadChangeStats();
+
+    document.getElementById('batchFilter').addEventListener('change', () => {
+        state.batchId = document.getElementById('batchFilter').value || null;
+        state.nextCursor = null;
+        state.prevCursor = null;
+        state.cursorStack = [];
+        loadResults();
+        loadChangeStats();
+    });
+
+    document.getElementById('changeFilter').addEventListener('change', () => {
+        state.changeFilter = document.getElementById('changeFilter').value;
+        state.nextCursor = null;
+        state.prevCursor = null;
+        state.cursorStack = [];
+        loadResults();
+    });
+
+    document.getElementById('searchInput').addEventListener('keyup', e => {
+        if (e.key === 'Enter') {
+            state.search = e.target.value;
+            state.nextCursor = null;
+            state.prevCursor = null;
+            state.cursorStack = [];
+            loadResults();
+        }
+    });
+});
+
+async function loadBatches() {
+    try {
+        const resp = await fetch('/api/batches');
+        const data = await resp.json();
+        const sel = document.getElementById('batchFilter');
+        const current = sel.value;
+        sel.innerHTML = '<option value="">全部批次</option>';
+        for (const b of data.batches) {
+            sel.innerHTML += `<option value="${b.id}" ${current == b.id ? 'selected' : ''}>${esc(b.name)} (${b.completed||0}/${b.total_tasks||0})</option>`;
+        }
+    } catch(e) {}
+}
+
+async function loadChangeStats() {
+    try {
+        let url = '/api/changes/stats';
+        if (state.batchId) url += `?batch_id=${state.batchId}`;
+        const resp = await fetch(url);
+        const stats = await resp.json();
+        document.getElementById('stat-price-stock').textContent = stats.price_stock || 0;
+        document.getElementById('stat-title-bullets').textContent = stats.title_bullets || 0;
+        document.getElementById('stat-new').textContent = stats.new || 0;
+    } catch(e) {}
+}
+
+async function loadResults(cursor = null, direction = 'next') {
+    state.search = document.getElementById('searchInput').value;
+    state.changeFilter = document.getElementById('changeFilter').value;
+
+    let url = `/api/results?limit=50&change_filter=${state.changeFilter}&direction=${direction}`;
+    if (state.batchId) url += `&batch_id=${state.batchId}`;
+    if (state.search) url += `&search=${encodeURIComponent(state.search)}`;
+    if (cursor) url += `&cursor=${cursor}`;
+
+    try {
+        const resp = await fetch(url);
+        const data = await resp.json();
+
+        document.getElementById('resultTotal').textContent = data.total;
+        document.getElementById('stat-total').textContent = data.total;
+
+        state.nextCursor = data.next_cursor;
+        state.prevCursor = data.prev_cursor;
+
+        document.getElementById('nextBtn').disabled = !data.has_more;
+        document.getElementById('prevBtn').disabled = state.cursorStack.length === 0;
+
+        renderResults(data.items);
+    } catch(e) {
+        document.getElementById('resultBody').innerHTML = `<tr><td colspan="10" class="text-center text-danger p-4">加载失败: ${esc(e.message)}</td></tr>`;
+    }
+}
+
+function loadNext() {
+    if (state.nextCursor) {
+        state.cursorStack.push(state.prevCursor);
+        loadResults(state.nextCursor, 'next');
+    }
+}
+
+function loadPrev() {
+    if (state.cursorStack.length > 0) {
+        const prevCursor = state.cursorStack.pop();
+        if (prevCursor) {
+            loadResults(prevCursor, 'prev');
+        } else {
+            loadResults(null, 'next');
+        }
+    }
+}
+
+function renderResults(items) {
+    const tbody = document.getElementById('resultBody');
+    if (!items || items.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10" class="text-center text-secondary p-4">暂无数据</td></tr>';
+        return;
+    }
+
+    let html = '';
+    for (const r of items) {
+        const asin = esc(r.asin);
+        const title = esc((r.title || '').substring(0, 60));
+        const price = esc(r.current_price || 'N/A');
+        const buybox = esc(r.buybox_price || 'N/A');
+        const brand = esc(r.brand || 'N/A');
+        const stock = esc(r.stock_count || '0');
+        const stockStatus = esc(r.stock_status || '');
+        const fba = esc(r.is_fba || 'N/A');
+        const delivery = esc(r.delivery_date || 'N/A');
+        const crawlTime = esc(r.crawl_time || '');
+        const hasScreenshot = r.screenshot_path && r.screenshot_path.startsWith('/static/');
+
+        const fbaClass = fba === 'FBA' ? 'badge bg-success' : (fba === 'FBM' ? 'badge bg-warning text-dark' : '');
+        const stockDot = stockStatus.toLowerCase().includes('in stock') ? '🟢' :
+                         stockStatus.toLowerCase().includes('unavailable') ? '🔴' :
+                         stockStatus.toLowerCase().includes('out') ? '🔴' : '🟡';
+
+        html += `<tr>
+            <td><a href="https://www.amazon.com/dp/${asin}" target="_blank" class="text-accent">${asin}</a></td>
+            <td title="${esc(r.title || '')}">${title}</td>
+            <td>${price}</td>
+            <td>${buybox}</td>
+            <td>${brand}</td>
+            <td>${stockDot} ${stock}</td>
+            <td>${fbaClass ? `<span class="${fbaClass}">${fba}</span>` : fba}</td>
+            <td>${delivery}</td>
+            <td style="font-size:0.8rem">${crawlTime}</td>
+            <td>${hasScreenshot ? `<button class="btn btn-outline-secondary btn-sm" onclick="showScreenshot('${esc(r.screenshot_path)}')"><i class="bi bi-image"></i></button>` : '-'}</td>
+        </tr>`;
+    }
+    tbody.innerHTML = html;
+}
+
+function showScreenshot(path) {
+    document.getElementById('screenshotImg').src = path;
+    new bootstrap.Modal(document.getElementById('screenshotModal')).show();
+}
+
+async function exportResults() {
+    const batchId = state.batchId;
+    let url;
+    if (batchId) {
+        // 需要先获取 batch name
+        const resp = await fetch('/api/batches');
+        const data = await resp.json();
+        const batch = data.batches.find(b => b.id == batchId);
+        if (batch) {
+            url = `/api/export/${encodeURIComponent(batch.name)}`;
+        } else {
+            url = '/api/export/all';
+        }
+    } else {
+        url = '/api/export/all';
+    }
+    window.open(url, '_blank');
+}
+</script>
+{% endblock %}

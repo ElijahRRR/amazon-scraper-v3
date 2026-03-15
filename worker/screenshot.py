@@ -115,46 +115,76 @@ class ScreenshotWorker:
             self._render_count = 0
 
     async def _render_upload_cleanup(self, batch_name: str, asin: str, html_path: str):
-        """单张截图完整流程：渲染 → 上传 → 删除 HTML"""
-        # 1. 读取 HTML
-        try:
-            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-                html_content = f.read()
-        except FileNotFoundError:
-            return
+        """单张截图完整流程：直接访问 Amazon URL 截图 → 上传 → 删除 HTML 标记"""
+        # v3: 不再渲染离线 HTML，改为 Playwright 直接访问 Amazon URL
+        # 这样所有 CSS/JS/图片资源都能正常加载，确保截图质量
+        png_bytes = await self._screenshot_live_page(asin)
 
-        # 2. 渲染截图
-        png_bytes = await self._render_screenshot(html_content, asin)
-
-        # 3. 上传到服务器（仅有效截图）
-        if png_bytes and len(png_bytes) > 0:
+        if png_bytes and len(png_bytes) > 5000:
             upload_ok = await self._upload_screenshot(batch_name, asin, png_bytes)
             if upload_ok:
                 logger.info(f"截图完成并上传: {asin} ({len(png_bytes)} bytes)")
-                # 上传成功才删除 HTML
                 try:
                     os.remove(html_path)
                 except OSError:
                     pass
             else:
-                logger.warning(f"截图上传失败，保留 HTML 待重试: {asin}")
+                logger.warning(f"截图上传失败: {asin}")
         else:
-            logger.warning(f"截图渲染失败: {asin}")
-            # 通知 server 标记为 failed（触发重试机制，3次后永久失败）
+            logger.warning(f"截图失败: {asin} ({len(png_bytes) if png_bytes else 0} bytes)")
             try:
                 await self._http_client.post(
                     f"{self.server_url}/api/tasks/screenshot/fail",
                     json={"asin": asin, "batch_name": batch_name,
-                          "error": "render_blank_or_failed"},
+                          "error": "live_render_failed"},
                     timeout=5,
                 )
             except Exception:
                 pass
-            # 渲染失败删除 HTML（避免无限重试空白页面）
             try:
                 os.remove(html_path)
             except OSError:
                 pass
+
+    async def _screenshot_live_page(self, asin: str) -> Optional[bytes]:
+        """直接用 Playwright 访问 Amazon 产品页截图（确保所有资源加载）"""
+        try:
+            browser = await self._get_browser()
+            page = await browser.new_page(
+                viewport={"width": 1280, "height": 1300},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
+
+            try:
+                url = f"https://www.amazon.com/dp/{asin}?th=1&psc=1"
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+                # 等待主要内容加载
+                try:
+                    await page.wait_for_selector("#productTitle", timeout=8000)
+                except Exception:
+                    pass
+
+                # 额外等待图片和样式渲染
+                await page.wait_for_timeout(2000)
+
+                screenshot = await page.screenshot(
+                    type="png",
+                    clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
+                )
+                return screenshot
+
+            finally:
+                await page.close()
+
+        except Exception as e:
+            err_msg = str(e)
+            if "browser has been closed" in err_msg or "Target closed" in err_msg:
+                logger.error(f"浏览器崩溃，将重启: {asin}")
+                await self._close_browsers()
+            else:
+                logger.warning(f"截图失败 {asin}: {e}")
+            return None
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes) -> bool:
         """上传单张截图到服务器"""

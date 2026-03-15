@@ -217,11 +217,17 @@ def _allocate_quotas():
         scores[wid] = max(0.1, sr * (1 - br * 5))
 
     total_score = sum(scores.values())
+    per_worker_max_conc = _runtime_settings.get("max_concurrency", config.MAX_CONCURRENCY)
+    per_worker_max_qps = _runtime_settings.get("token_bucket_rate", config.TOKEN_BUCKET_RATE)
+
     for wid in active:
         weight = scores[wid] / total_score if total_score > 0 else 1.0 / len(active)
+        allocated_conc = max(config.MIN_CONCURRENCY, int(max_conc * weight))
+        allocated_qps = max(1.0, max_qps * weight)
         active[wid]["quota"] = {
-            "max_concurrency": max(config.MIN_CONCURRENCY, int(max_conc * weight)),
-            "max_qps": max(1.0, max_qps * weight),
+            # 取 global 分配值和单 worker 上限的较小值
+            "max_concurrency": min(allocated_conc, per_worker_max_conc),
+            "max_qps": min(allocated_qps, per_worker_max_qps),
         }
 
 

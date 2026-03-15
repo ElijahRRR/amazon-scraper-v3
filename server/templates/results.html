@@ -143,7 +143,8 @@ let state = {
     changeFilter: 'all',
     nextCursor: null,
     prevCursor: null,
-    cursorStack: [],  // 用于向前翻页
+    cursorStack: [],
+    currentStartCursor: null,
 };
 
 // 初始化
@@ -235,17 +236,21 @@ async function loadResults(cursor = null, direction = 'next') {
 
 function loadNext() {
     if (state.nextCursor) {
-        state.cursorStack.push(state.prevCursor);
+        // 记录当前页的起始 cursor，用于回退
+        state.cursorStack.push(state.currentStartCursor);
+        state.currentStartCursor = state.nextCursor;
         loadResults(state.nextCursor, 'next');
     }
 }
 
 function loadPrev() {
     if (state.cursorStack.length > 0) {
-        const prevCursor = state.cursorStack.pop();
-        if (prevCursor) {
-            loadResults(prevCursor, 'prev');
+        const prevStart = state.cursorStack.pop();
+        state.currentStartCursor = prevStart;
+        if (prevStart) {
+            loadResults(prevStart, 'next');
         } else {
+            // 回到第一页
             loadResults(null, 'next');
         }
     }

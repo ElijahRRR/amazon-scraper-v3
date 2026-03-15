@@ -129,8 +129,7 @@ class ScreenshotWorker:
             self._render_count = 0
 
     async def _render_upload_cleanup(self, batch_name: str, asin: str, html_path: str):
-        """混合方案：离线渲染优先（快），失败则在线兜底（准）"""
-        # 第 1 步：离线渲染（读取保存的 HTML，本地渲染，速度快）
+        """离线渲染截图 → 上传 → 清理"""
         png_bytes = None
         try:
             with open(html_path, "r", encoding="utf-8", errors="replace") as f:
@@ -139,17 +138,8 @@ class ScreenshotWorker:
         except FileNotFoundError:
             pass
         except Exception as e:
-            logger.debug(f"离线渲染异常 {asin}: {e}")
+            logger.debug(f"渲染异常 {asin}: {e}")
 
-        # 第 2 步：如果离线渲染失败或截图太小，在线兜底
-        if not png_bytes or len(png_bytes) < 15000:
-            if png_bytes:
-                logger.info(f"离线截图太小({len(png_bytes)}B)，在线兜底: {asin}")
-            else:
-                logger.info(f"离线渲染失败，在线兜底: {asin}")
-            png_bytes = await self._screenshot_live_page(asin)
-
-        # 第 3 步：上传
         if png_bytes and len(png_bytes) > 5000:
             upload_ok = await self._upload_screenshot(batch_name, asin, png_bytes)
             if upload_ok:
@@ -161,11 +151,11 @@ class ScreenshotWorker:
             else:
                 logger.warning(f"截图上传失败: {asin}")
         else:
-            logger.warning(f"截图最终失败: {asin}")
+            logger.warning(f"截图渲染失败: {asin} ({len(png_bytes) if png_bytes else 0}B)")
             try:
                 await self._http_client.post(
                     f"{self.server_url}/api/tasks/screenshot/fail",
-                    json={"asin": asin, "batch_name": batch_name, "error": "both_failed"},
+                    json={"asin": asin, "batch_name": batch_name, "error": "render_failed"},
                     timeout=5,
                 )
             except Exception:
@@ -174,62 +164,6 @@ class ScreenshotWorker:
                 os.remove(html_path)
             except OSError:
                 pass
-
-    async def _screenshot_live_page(self, asin: str) -> Optional[bytes]:
-        """在线兜底：临时启动带代理的浏览器访问 Amazon 截图"""
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            return None
-
-        pw = None
-        browser = None
-        page = None
-        try:
-            pw = await async_playwright().__aenter__()
-            launch_opts = {
-                "headless": True,
-                "args": ["--disable-gpu", "--disable-dev-shm-usage",
-                         "--no-sandbox", "--disable-extensions"],
-            }
-            if self._proxy_url:
-                launch_opts["proxy"] = self._parse_proxy(self._proxy_url)
-
-            browser = await pw.chromium.launch(**launch_opts)
-            page = await browser.new_page(
-                viewport={"width": 1280, "height": 1300},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            )
-
-            url = f"https://www.amazon.com/dp/{asin}?th=1&psc=1"
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-
-            try:
-                await page.wait_for_selector("#productTitle", timeout=8000)
-            except Exception:
-                pass
-
-            await page.wait_for_timeout(2000)
-
-            screenshot = await page.screenshot(
-                type="png",
-                clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
-            )
-            return screenshot
-
-        except Exception as e:
-            logger.warning(f"在线截图失败 {asin}: {e}")
-            return None
-        finally:
-            if page:
-                try: await page.close()
-                except: pass
-            if browser:
-                try: await browser.close()
-                except: pass
-            if pw:
-                try: await pw.__aexit__(None, None, None)
-                except: pass
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes) -> bool:
         """上传单张截图到服务器"""

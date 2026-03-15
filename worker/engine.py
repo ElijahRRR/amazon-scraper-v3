@@ -1371,21 +1371,26 @@ class Worker:
     # ═══════════════════════════════════════════════
 
     async def _ensure_screenshot_process(self):
-        """确保截图子进程已启动，未启动则启动"""
+        """确保截图子进程已启动，未启动则启动（加锁防止重复创建）"""
         if self._screenshot_process and self._screenshot_process.returncode is None:
             return  # 已在运行
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot.py")
-        # 传递代理地址给截图子进程
-        proxy_url = config.PROXY_URL or ""
-        self._screenshot_process = await asyncio.create_subprocess_exec(
-            sys.executable, script,
-            self.server_url,
-            str(self._browsers_count),
-            str(self._pages_per_browser),
-            proxy_url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        if not hasattr(self, '_screenshot_lock'):
+            self._screenshot_lock = asyncio.Lock()
+        async with self._screenshot_lock:
+            # 双重检查
+            if self._screenshot_process and self._screenshot_process.returncode is None:
+                return
+            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot.py")
+            proxy_url = config.PROXY_URL or ""
+            self._screenshot_process = await asyncio.create_subprocess_exec(
+                sys.executable, script,
+                self.server_url,
+                str(self._browsers_count),
+                str(self._pages_per_browser),
+                proxy_url,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
         # 异步转发子进程日志
         asyncio.create_task(self._forward_screenshot_logs())
         logger.info(f"📸 截图子进程已启动 (PID: {self._screenshot_process.pid})")

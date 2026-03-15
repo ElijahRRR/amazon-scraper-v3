@@ -235,8 +235,17 @@ class ScreenshotWorker:
                             pw = await async_playwright().__aenter__()
                             launch_opts = {
                                 "headless": True,
-                                "args": ["--disable-gpu", "--disable-dev-shm-usage",
-                                         "--no-sandbox", "--disable-extensions"],
+                                "args": [
+                                    "--disable-gpu",
+                                    "--disable-dev-shm-usage",
+                                    "--no-sandbox",
+                                    "--disable-extensions",
+                                    "--disable-software-rasterizer",
+                                    "--disable-background-networking",
+                                    "--disable-sync",
+                                    "--disable-translate",
+                                    "--js-flags=--max-old-space-size=128",
+                                ],
                             }
                             # 离线渲染池不注入代理（本地渲染不需要网络）
                             browser = await pw.chromium.launch(**launch_opts)

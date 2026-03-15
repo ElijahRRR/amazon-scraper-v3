@@ -32,7 +32,7 @@
     "category": "core",
     "description": "Amazon页面解析器 - 多策略fallback解析，优化非标准页面兼容性，JSON-LD/CSS/正则多层解析",
     "steps": ["确认parser模块可导入", "确认parse_product函数存在", "确认多种fallback路径实现"],
-    "passes": false
+    "passes": true
   },
   {
     "id": 6,

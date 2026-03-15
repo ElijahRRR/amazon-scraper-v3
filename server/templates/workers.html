@@ -153,7 +153,7 @@
     // ---- worker grid update ----
     function renderWorkerCard(w) {
         const safeId = escapeHtml(w.worker_id);
-        const isOnline = w.status === 'online';
+        const isOnline = w.online;
         const offlineClass = isOnline ? '' : ' worker-card-offline';
         const badge = isOnline
             ? '<span class="badge-status badge-online"><i class="bi bi-circle-fill"></i> 在线</span>'

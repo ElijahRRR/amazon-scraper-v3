@@ -516,6 +516,9 @@ class Database:
             async for row in c:
                 stats[row["status"]] = row["cnt"]
         stats["total"] = sum(stats[k] for k in ["pending", "processing", "done", "failed"])
+        finished = stats["done"] + stats["failed"]
+        stats["completion_rate"] = round(stats["done"] / stats["total"] * 100, 1) if stats["total"] else 0
+        stats["success_rate"] = round(stats["done"] / finished * 100, 1) if finished else 0
         return stats
 
     # ==================== 结果操作（含变动检测）====================

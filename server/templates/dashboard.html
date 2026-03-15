@@ -94,15 +94,15 @@
             <tbody>
                 {% for b in batches %}
                 <tr>
-                    <td><a href="/results?batch_name={{ b.batch_name }}" class="text-decoration-none" style="color:var(--accent)">{{ b.batch_name }}</a></td>
-                    <td>{{ b.total }}</td>
-                    <td><span class="text-success">{{ b.done }}</span></td>
+                    <td><a href="/results?batch_id={{ b.id }}" class="text-decoration-none" style="color:var(--accent)">{{ b.name }}</a></td>
+                    <td>{{ b.total_tasks }}</td>
+                    <td><span class="text-success">{{ b.completed }}</span></td>
                     <td><span class="text-danger">{{ b.failed }}</span></td>
                     <td>
                         <div class="progress" style="width:120px; height:6px;">
-                            <div class="progress-bar bg-success" style="width:{{ b.progress }}%"></div>
+                            <div class="progress-bar bg-success" style="width:{% if b.total_tasks > 0 %}{{ (b.completed * 100 / b.total_tasks)|round|int }}{% else %}0{% endif %}%"></div>
                         </div>
-                        <small class="text-secondary">{{ b.progress }}%</small>
+                        <small class="text-secondary">{% if b.total_tasks > 0 %}{{ (b.completed * 100 / b.total_tasks)|round|int }}{% else %}0{% endif %}%</small>
                     </td>
                     <td><small class="text-secondary">{{ b.created_at }}</small></td>
                 </tr>
@@ -160,8 +160,8 @@ setInterval(async () => {
             document.getElementById('progress-bar-failed').style.width = (data.failed / data.total * 100) + '%';
         }
 
-        // Worker 数（API 返回 status: "online"/"offline"）
-        const activeCount = workers.filter(w => w.status === 'online').length;
+        // Worker 数（v3 API 返回 online: bool）
+        const activeCount = workers.filter(w => w.online).length;
         document.getElementById('stat-workers').textContent = activeCount;
 
         // EWMA 速度计算
@@ -202,15 +202,15 @@ setInterval(async () => {
                 tbody.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-4">暂无批次</td></tr>';
             } else {
                 tbody.innerHTML = batches.map(b => `<tr>
-                    <td><a href="/results?batch_name=${encodeURIComponent(b.batch_name)}" class="text-decoration-none" style="color:var(--accent)">${esc(b.batch_name)}</a></td>
-                    <td>${b.total}</td>
-                    <td><span class="text-success">${b.done}</span></td>
+                    <td><a href="/results?batch_id=${b.id}" class="text-decoration-none" style="color:var(--accent)">${esc(b.name)}</a></td>
+                    <td>${b.total_tasks}</td>
+                    <td><span class="text-success">${b.completed}</span></td>
                     <td><span class="text-danger">${b.failed}</span></td>
                     <td>
                         <div class="progress" style="width:120px; height:6px;">
-                            <div class="progress-bar bg-success" style="width:${b.progress}%"></div>
+                            <div class="progress-bar bg-success" style="width:${(b.total_tasks > 0 ? Math.round(b.completed / b.total_tasks * 100) : 0)}%"></div>
                         </div>
-                        <small class="text-secondary">${b.progress}% <span class="text-success">(${b.success_rate}%)</span></small>
+                        <small class="text-secondary">${(b.total_tasks > 0 ? Math.round(b.completed / b.total_tasks * 100) : 0)}% <span class="text-success">(${(b.completed + b.failed > 0 ? Math.round(b.completed / (b.completed + b.failed) * 100) : 0)}%)</span></small>
                     </td>
                     <td><small class="text-secondary">${esc(b.created_at)}</small></td>
                 </tr>`).join('');

@@ -66,7 +66,7 @@
             <tbody>
                 {% for b in batches %}
                 <tr>
-                    <td>{{ b.batch_name }}</td>
+                    <td>{{ b.name }}</td>
                     <td>{{ b.total }}</td>
                     <td><span class="badge-status badge-pending">{{ b.pending }}</span></td>
                     <td><span class="badge-status badge-processing">{{ b.processing }}</span></td>
@@ -74,7 +74,7 @@
                     <td>
                         <span class="badge-status badge-failed">{{ b.failed }}</span>
                         {% if b.failed > 0 %}
-                        <button class="btn btn-sm btn-link p-0 ms-1" onclick="showErrors('{{ b.batch_name }}')" title="查看错误详情" style="color:var(--danger);">
+                        <button class="btn btn-sm btn-link p-0 ms-1" onclick="showErrors('{{ b.name }}')" title="查看错误详情" style="color:var(--danger);">
                             <i class="bi bi-exclamation-circle"></i>
                         </button>
                         {% endif %}
@@ -87,22 +87,22 @@
                     </td>
                     <td>
                         <div class="btn-group btn-group-sm">
-                            <a href="/results?batch_name={{ b.batch_name|urlencode }}" class="btn btn-outline-accent" title="查看结果">
+                            <a href="/results?batch_name={{ b.name|urlencode }}" class="btn btn-outline-accent" title="查看结果">
                                 <i class="bi bi-eye"></i>
                             </a>
-                            <a href="/api/export/{{ b.batch_name|urlencode }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
+                            <a href="/api/export/{{ b.name|urlencode }}?format=excel" class="btn btn-outline-accent" title="导出 Excel">
                                 <i class="bi bi-download"></i>
                             </a>
-                            <a href="/api/export/{{ b.batch_name|urlencode }}/screenshots" class="btn btn-outline-accent" title="下载截图 ZIP">
+                            <a href="/api/export/{{ b.name|urlencode }}/screenshots" class="btn btn-outline-accent" title="下载截图 ZIP">
                                 <i class="bi bi-images"></i>
                             </a>
-                            <button class="btn btn-outline-danger" onclick="prioritizeBatch('{{ b.batch_name }}')" title="优先采集">
+                            <button class="btn btn-outline-danger" onclick="prioritizeBatch('{{ b.name }}')" title="优先采集">
                                 <i class="bi bi-lightning-charge"></i>
                             </button>
-                            <button class="btn btn-outline-accent" onclick="retryBatch('{{ b.batch_name }}')" title="重试失败">
+                            <button class="btn btn-outline-accent" onclick="retryBatch('{{ b.name }}')" title="重试失败">
                                 <i class="bi bi-arrow-clockwise"></i>
                             </button>
-                            <button class="btn btn-outline-danger" onclick="deleteBatch('{{ b.batch_name }}')" title="删除">
+                            <button class="btn btn-outline-danger" onclick="deleteBatch('{{ b.name }}')" title="删除">
                                 <i class="bi bi-trash"></i>
                             </button>
                         </div>

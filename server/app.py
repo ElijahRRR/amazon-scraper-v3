@@ -51,16 +51,32 @@ def _default_settings() -> dict:
         "zip_code": config.DEFAULT_ZIP_CODE,
         "max_retries": config.MAX_RETRIES,
         "request_timeout": config.REQUEST_TIMEOUT,
+        "session_rotate_every": config.SESSION_ROTATE_EVERY,
         "proxy_api_url": config.PROXY_API_URL_AUTH,
+        "proxy_mode": config.PROXY_MODE,
         "token_bucket_rate": config.TOKEN_BUCKET_RATE,
         "per_channel_qps": config.PER_CHANNEL_QPS,
+        "per_channel_max_concurrency": config.PER_CHANNEL_MAX_CONCURRENCY,
+        "initial_concurrency": config.INITIAL_CONCURRENCY,
         "max_concurrency": config.MAX_CONCURRENCY,
+        "min_concurrency": config.MIN_CONCURRENCY,
         "tunnel_max_concurrency": config.TUNNEL_MAX_CONCURRENCY,
-        "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
-        "global_max_qps": config.GLOBAL_MAX_QPS,
-        "proxy_mode": config.PROXY_MODE,
+        "tunnel_initial_concurrency": config.TUNNEL_INITIAL_CONCURRENCY,
         "tunnel_channels": config.TUNNEL_CHANNELS,
         "tunnel_proxy_url": config.TUNNEL_PROXY_URL,
+        "tunnel_rotate_interval": config.TUNNEL_ROTATE_INTERVAL,
+        "global_max_concurrency": config.GLOBAL_MAX_CONCURRENCY,
+        "global_max_qps": config.GLOBAL_MAX_QPS,
+        "adjust_interval": config.ADJUST_INTERVAL_S,
+        "target_latency": config.TARGET_LATENCY_S,
+        "max_latency": config.MAX_LATENCY_S,
+        "target_success_rate": config.TARGET_SUCCESS_RATE,
+        "min_success_rate": config.MIN_SUCCESS_RATE,
+        "block_rate_threshold": config.BLOCK_RATE_THRESHOLD,
+        "cooldown_after_block": 15,
+        "proxy_bandwidth_mbps": config.PROXY_BANDWIDTH_MBPS,
+        "screenshot_browsers": 1,
+        "screenshot_pages_per_browser": 200,
         "auto_scrape_schedules": [],
     }
 
@@ -221,12 +237,27 @@ def _allocate_quotas():
 
 @app.get("/", response_class=HTMLResponse)
 async def page_dashboard(request: Request):
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    progress = await db.get_progress()
+    total = progress["done"] + progress["failed"]
+    progress["completion_rate"] = round(progress["done"] / progress["total"] * 100, 1) if progress["total"] else 0
+    progress["success_rate"] = round(progress["done"] / total * 100, 1) if total else 0
+    batches = await db.get_batches()
+    return templates.TemplateResponse("dashboard.html", {
+        "request": request,
+        "progress": progress,
+        "batches": batches,
+        "active_workers": len([w for w in _worker_registry.values() if time.time() - w["last_seen"] < 60]),
+    })
 
 
 @app.get("/tasks", response_class=HTMLResponse)
 async def page_tasks(request: Request):
-    return templates.TemplateResponse("tasks.html", {"request": request})
+    batches = await db.get_batches()
+    return templates.TemplateResponse("tasks.html", {
+        "request": request,
+        "batches": batches,
+        "default_zip_code": _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE),
+    })
 
 
 @app.get("/results", response_class=HTMLResponse)
@@ -241,7 +272,15 @@ async def page_workers(request: Request):
 
 @app.get("/settings", response_class=HTMLResponse)
 async def page_settings(request: Request):
-    return templates.TemplateResponse("settings.html", {"request": request})
+    return templates.TemplateResponse("settings.html", {
+        "request": request,
+        "settings": _runtime_settings,
+        "config": {
+            "port": config.SERVER_PORT,
+            "timeout": config.REQUEST_TIMEOUT,
+            "db_path": config.DB_PATH,
+        },
+    })
 
 
 # ==================== API: 批次和任务 ====================
@@ -323,6 +362,102 @@ async def api_progress(batch_id: int = None):
 async def api_prioritize(batch_id: int):
     await db.prioritize_batch(batch_id)
     return {"ok": True}
+
+
+@app.post("/api/batches/{batch_name}/retry")
+async def api_retry_batch(batch_name: str):
+    """重试失败任务"""
+    batch = await db.get_batch_by_name(batch_name)
+    if not batch:
+        raise HTTPException(404, f"批次不存在: {batch_name}")
+    batch_id = batch["id"]
+    async with db._write_lock:
+        await db._db.execute("BEGIN")
+        await db._db.execute(
+            "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL WHERE batch_id=? AND status='failed'",
+            (batch_id,)
+        )
+        await db._db.execute("COMMIT")
+    return {"ok": True}
+
+
+@app.delete("/api/batches/{batch_name}")
+async def api_delete_batch(batch_name: str):
+    """删除批次及其任务"""
+    batch = await db.get_batch_by_name(batch_name)
+    if not batch:
+        raise HTTPException(404, f"批次不存在: {batch_name}")
+    batch_id = batch["id"]
+    async with db._write_lock:
+        await db._db.execute("BEGIN")
+        await db._db.execute("DELETE FROM tasks WHERE batch_id=?", (batch_id,))
+        await db._db.execute("DELETE FROM batch_asins WHERE batch_id=?", (batch_id,))
+        await db._db.execute("DELETE FROM screenshots WHERE batch_id=?", (batch_id,))
+        await db._db.execute("DELETE FROM asin_changes WHERE batch_id=?", (batch_id,))
+        await db._db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
+        await db._db.execute("COMMIT")
+    return {"ok": True}
+
+
+@app.get("/api/batches/{batch_name}/errors")
+async def api_batch_errors(batch_name: str):
+    """获取批次错误详情"""
+    batch = await db.get_batch_by_name(batch_name)
+    if not batch:
+        raise HTTPException(404, f"批次不存在: {batch_name}")
+    batch_id = batch["id"]
+    async with db._db.execute(
+        "SELECT error_type, COUNT(*) as cnt FROM tasks WHERE batch_id=? AND status='failed' GROUP BY error_type",
+        (batch_id,)
+    ) as c:
+        error_summary = [dict(r) for r in await c.fetchall()]
+    async with db._db.execute(
+        "SELECT asin, error_type, error_detail, retry_count, updated_at FROM tasks WHERE batch_id=? AND status='failed' ORDER BY updated_at DESC LIMIT 100",
+        (batch_id,)
+    ) as c:
+        failed_tasks = [dict(r) for r in await c.fetchall()]
+    return {"error_summary": error_summary, "failed_tasks": failed_tasks}
+
+
+@app.get("/api/coordinator")
+async def api_coordinator():
+    """全局并发协调器状态"""
+    max_conc = _runtime_settings.get("global_max_concurrency", config.GLOBAL_MAX_CONCURRENCY)
+    max_qps = _runtime_settings.get("global_max_qps", config.GLOBAL_MAX_QPS)
+    allocated_conc = sum(info.get("quota", {}).get("max_concurrency", 0)
+                        for info in _global_coordinator.values())
+    allocated_qps = sum(info.get("quota", {}).get("max_qps", 0)
+                        for info in _global_coordinator.values())
+    return {
+        "max_concurrency": max_conc,
+        "allocated_concurrency": allocated_conc,
+        "max_qps": max_qps,
+        "allocated_qps": allocated_qps,
+        "active_workers": len(_global_coordinator),
+        "global_block_until": 0,
+        "global_block_count": 0,
+    }
+
+
+@app.delete("/api/workers")
+async def api_delete_all_offline():
+    """清除所有离线 worker"""
+    cutoff = time.time() - 60
+    offline = [wid for wid, w in _worker_registry.items() if w["last_seen"] < cutoff]
+    for wid in offline:
+        del _worker_registry[wid]
+        _global_coordinator.pop(wid, None)
+    return {"ok": True, "removed": len(offline)}
+
+
+@app.post("/api/settings/reset")
+async def api_reset_settings():
+    """恢复默认设置"""
+    global _runtime_settings, _settings_version
+    _runtime_settings = _default_settings()
+    _settings_version += 1
+    _save_settings()
+    return {"ok": True, "settings": _runtime_settings}
 
 
 # ==================== API: Worker 任务拉取和提交 ====================

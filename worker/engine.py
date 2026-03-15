@@ -655,8 +655,10 @@ class Worker:
                     return
                 s = resp.json()
 
-            changes = await self._apply_settings(s, is_initial=True)
-            self._settings_version = s.get("_version", 0)
+            # v3: unwrap settings from response wrapper
+            settings_data = s.get("settings", s)
+            changes = await self._apply_settings(settings_data, is_initial=True)
+            self._settings_version = s.get("version", 0)
 
             if changes:
                 logger.info(f"⚙️ 初始设置已同步: {', '.join(changes)}")
@@ -902,15 +904,17 @@ class Worker:
                     continue
 
                 # === 设置同步（版本守护）===
-                ver = s.get("_version", 0)
+                # v3: unwrap settings from sync response
+                ver = s.get("settings_version", s.get("version", 0))
                 if ver > self._settings_version:
                     self._settings_version = ver
-                    changes = await self._apply_settings(s, is_initial=False)
+                    settings_data = s.get("settings", s)
+                    changes = await self._apply_settings(settings_data, is_initial=False)
                     if changes:
                         logger.info(f"⚙️ 设置已同步 (v{ver}): {', '.join(changes)}")
 
                 # === 配额执行（每次都执行，不受 version 限制）===
-                quota = s.get("_quota")
+                quota = s.get("quota", s.get("_quota"))
                 if quota and self._proxy_mode != "tunnel":
                     new_max_c = quota.get("concurrency")
                     if new_max_c and new_max_c != self._controller._max:
@@ -1098,7 +1102,8 @@ class Worker:
                         await self._rotate_session(reason="被封锁")
                         await self._submit_result(
                             task_id, None, success=False,
-                            error_type=last_error_type, error_detail=last_error_detail
+                            error_type=last_error_type, error_detail=last_error_detail,
+                            batch_id=task.get("batch_id")
                         )
                         self._stats["failed"] += 1
                         self._stats["total"] += 1
@@ -1111,7 +1116,7 @@ class Worker:
                     result_data = self.parser._default_result(asin, zip_code)
                     result_data["title"] = "[商品不存在]"
                     result_data["batch_name"] = task.get("batch_name", "")
-                    await self._submit_result(task_id, result_data, success=True)
+                    await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"))
                     self._stats["success"] += 1
                     self._stats["total"] += 1
                     return (True, False, resp_bytes)
@@ -1214,7 +1219,7 @@ class Worker:
 
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes, channel_id=channel)
-                await self._submit_result(task_id, result_data, success=True)
+                await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"))
                 self._stats["success"] += 1
                 self._stats["total"] += 1
 
@@ -1271,17 +1276,25 @@ class Worker:
     # ═══════════════════════════════════════════════
 
     async def _submit_result(self, task_id: int, result_data: Optional[Dict], success: bool,
-                             error_type: str = None, error_detail: str = None):
-        """将结果放入批量提交队列"""
-        payload = {
-            "task_id": task_id,
-            "worker_id": self.worker_id,
-            "success": success,
-            "result": result_data,
-        }
-        if error_type:
-            payload["error_type"] = error_type
-            payload["error_detail"] = (error_detail or "")[:500]
+                             error_type: str = None, error_detail: str = None,
+                             batch_id: int = None):
+        """将结果放入批量提交队列（v3: 扁平化 payload）"""
+        if success and result_data:
+            # v3: 扁平化结果到顶层，server 直接从 item 读取 asin 等字段
+            payload = dict(result_data)
+            payload["task_id"] = task_id
+            payload["batch_id"] = batch_id
+            payload["worker_id"] = self.worker_id
+        else:
+            payload = {
+                "task_id": task_id,
+                "batch_id": batch_id,
+                "worker_id": self.worker_id,
+                "success": False,
+            }
+            if error_type:
+                payload["error_type"] = error_type
+                payload["error_detail"] = (error_detail or "")[:500]
         await self._result_queue.put(payload)
 
     async def _batch_submitter(self):
@@ -1378,7 +1391,7 @@ class Worker:
         """确保截图子进程已启动，未启动则启动"""
         if self._screenshot_process and self._screenshot_process.returncode is None:
             return  # 已在运行
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot_worker.py")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot.py")
         self._screenshot_process = await asyncio.create_subprocess_exec(
             sys.executable, script,
             self.server_url,

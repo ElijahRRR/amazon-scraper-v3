@@ -975,6 +975,65 @@ class AmazonParser:
 
         return ""
 
+    def parse_offer_listing(self, html_text: str) -> Optional[Dict[str, Any]]:
+        """v3: 解析 /gp/offer-listing/{ASIN} 页面，提取最低价 offer
+        用于 No Featured Offer 产品的价格补充
+        返回 {'price': '$xx.xx', 'shipping': 'FREE', 'seller': 'xxx', 'ships_from': 'xxx', 'delivery': 'xxx'} 或 None
+        """
+        if not html_text or "validateCaptcha" in html_text:
+            return None
+
+        try:
+            tree = SlxParser(html_text) if _USE_SELECTOLAX else None
+            if not tree:
+                return None
+
+            # 方法1: 取第一个 span.a-price（offer-listing 页面中排在最前面的就是最优 offer）
+            best_offer = {}
+
+            for price_node in tree.css('span.a-price'):
+                offscreen = price_node.css_first('span.a-offscreen')
+                if offscreen:
+                    p = offscreen.text(strip=True)
+                    if p and "$" in p:
+                        best_offer['price'] = p
+                        break
+
+                whole = price_node.css_first('span.a-price-whole')
+                frac = price_node.css_first('span.a-price-fraction')
+                if whole and frac:
+                    w = whole.text(strip=True).replace('.', '')
+                    f = frac.text(strip=True)
+                    if w and f:
+                        best_offer['price'] = f"${w}.{f}"
+                        break
+
+            if not best_offer:
+                return None
+
+            # 提取配送信息
+            delivery_node = tree.css_first('#aod-offer-list [data-csa-c-delivery-time]')
+            if delivery_node:
+                best_offer['delivery'] = delivery_node.text(strip=True)[:60]
+
+            # 提取卖家
+            seller_node = tree.css_first('#aod-offer-list #aod-offer-soldBy a')
+            if seller_node:
+                best_offer['seller'] = seller_node.text(strip=True)
+
+            # 提取配送方
+            ships_node = tree.css_first('#aod-offer-list #aod-offer-shipsFrom .a-color-base')
+            if ships_node:
+                ships_text = ships_node.text(strip=True)
+                best_offer['ships_from'] = ships_text
+                best_offer['is_fba'] = 'FBA' if 'amazon' in ships_text.lower() else 'FBM'
+
+            return best_offer
+
+        except Exception as e:
+            logger.debug(f"offer-listing 解析异常: {e}")
+            return None
+
     def _default_result(self, asin: str, zip_code: str) -> Dict[str, Any]:
         """创建默认结果字典"""
         return {

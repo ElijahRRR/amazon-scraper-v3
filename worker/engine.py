@@ -1220,6 +1220,26 @@ class Worker:
                     await asyncio.sleep(2)
                     continue
 
+                # v3: No Featured Offer 产品自动请求 offer-listing 补充价格
+                if result_data.get("current_price") == "No Featured Offer":
+                    try:
+                        olp_url = f"https://www.amazon.com/gp/offer-listing/{asin}"
+                        olp_resp = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: session.fetch_page(olp_url))
+                        if olp_resp and hasattr(olp_resp, 'text') and olp_resp.text:
+                            offer = self.parser.parse_offer_listing(olp_resp.text)
+                            if offer and offer.get('price'):
+                                result_data["current_price"] = offer['price']
+                                result_data["buybox_price"] = offer['price']
+                                if offer.get('is_fba'):
+                                    result_data["is_fba"] = offer['is_fba']
+                                if offer.get('delivery'):
+                                    result_data["delivery_date"] = offer['delivery']
+                                result_data["stock_status"] = "In Stock (via offer-listing)"
+                                logger.info(f"NFO {asin} offer-listing 补充价格: {offer['price']}")
+                    except Exception as e:
+                        logger.debug(f"NFO {asin} offer-listing 请求失败: {e}")
+
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes, channel_id=channel)
                 await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"))

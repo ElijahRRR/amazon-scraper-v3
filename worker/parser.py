@@ -272,6 +272,7 @@ class AmazonParser:
             price_selectors = [
                 '#corePrice_feature_div span.a-offscreen',
                 '#corePriceDisplay_desktop_feature_div span.a-offscreen',
+                '#corePrice_desktop span.a-offscreen',
                 '#price span.a-offscreen',
                 '#priceblock_ourprice',
                 '#priceblock_dealprice',
@@ -289,7 +290,7 @@ class AmazonParser:
                         return f"[非USD]{p}"
             # 方法2: 拆分整数+小数（限定到价格容器）
             for container in ['#corePrice_feature_div', '#corePriceDisplay_desktop_feature_div',
-                              '#price', '#apex_offerDisplay_desktop']:
+                              '#corePrice_desktop', '#price', '#apex_offerDisplay_desktop']:
                 prefix = f'{container} ' if container else ''
                 whole_node = tree.css_first(f'{prefix}span.a-price-whole')
                 frac_node = tree.css_first(f'{prefix}span.a-price-fraction')

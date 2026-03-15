@@ -43,6 +43,8 @@ class ScreenshotWorker:
         self._browser_counter = 0
         self._render_count = 0
         self._restart_every = 200
+        self._running = True
+        self._http_client: Optional[httpx.AsyncClient] = None
 
     @staticmethod
     def _parse_proxy(proxy_url: str) -> dict:
@@ -55,8 +57,6 @@ class ScreenshotWorker:
         if parsed.password:
             result["password"] = parsed.password
         return result
-        self._running = True
-        self._http_client: Optional[httpx.AsyncClient] = None
 
     async def start(self):
         """主循环：扫描 HTML → 渲染 → 立即上传 → 删除 HTML → 检查批次完成"""

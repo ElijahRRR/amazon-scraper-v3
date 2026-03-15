@@ -27,7 +27,7 @@ logger = logging.getLogger("screenshot_worker")
 
 class ScreenshotWorker:
     def __init__(self, server_url: str, base_dir: str = None,
-                 browsers_count: int = 1, pages_per_browser: int = 3,
+                 browsers_count: int = 1, pages_per_browser: int = 1,
                  proxy_url: str = None):
         self.server_url = server_url
         self.base_dir = base_dir or os.path.join(
@@ -129,15 +129,31 @@ class ScreenshotWorker:
             self._render_count = 0
 
     async def _render_upload_cleanup(self, batch_name: str, asin: str, html_path: str):
-        """单张截图完整流程：直接访问 Amazon URL 截图 → 上传 → 删除 HTML 标记"""
-        # v3: 不再渲染离线 HTML，改为 Playwright 直接访问 Amazon URL
-        # 这样所有 CSS/JS/图片资源都能正常加载，确保截图质量
-        png_bytes = await self._screenshot_live_page(asin)
+        """混合方案：离线渲染优先（快），失败则在线兜底（准）"""
+        # 第 1 步：离线渲染（读取保存的 HTML，本地渲染，速度快）
+        png_bytes = None
+        try:
+            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+                html_content = f.read()
+            png_bytes = await self._render_screenshot(html_content, asin)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"离线渲染异常 {asin}: {e}")
 
+        # 第 2 步：如果离线渲染失败或截图太小，在线兜底
+        if not png_bytes or len(png_bytes) < 15000:
+            if png_bytes:
+                logger.info(f"离线截图太小({len(png_bytes)}B)，在线兜底: {asin}")
+            else:
+                logger.info(f"离线渲染失败，在线兜底: {asin}")
+            png_bytes = await self._screenshot_live_page(asin)
+
+        # 第 3 步：上传
         if png_bytes and len(png_bytes) > 5000:
             upload_ok = await self._upload_screenshot(batch_name, asin, png_bytes)
             if upload_ok:
-                logger.info(f"截图完成并上传: {asin} ({len(png_bytes)} bytes)")
+                logger.info(f"截图完成: {asin} ({len(png_bytes)//1024}KB)")
                 try:
                     os.remove(html_path)
                 except OSError:
@@ -145,12 +161,11 @@ class ScreenshotWorker:
             else:
                 logger.warning(f"截图上传失败: {asin}")
         else:
-            logger.warning(f"截图失败: {asin} ({len(png_bytes) if png_bytes else 0} bytes)")
+            logger.warning(f"截图最终失败: {asin}")
             try:
                 await self._http_client.post(
                     f"{self.server_url}/api/tasks/screenshot/fail",
-                    json={"asin": asin, "batch_name": batch_name,
-                          "error": "live_render_failed"},
+                    json={"asin": asin, "batch_name": batch_name, "error": "both_failed"},
                     timeout=5,
                 )
             except Exception:
@@ -161,37 +176,26 @@ class ScreenshotWorker:
                 pass
 
     async def _screenshot_live_page(self, asin: str) -> Optional[bytes]:
-        """直接用 Playwright 访问 Amazon 产品页截图（通过代理，确保所有资源加载）"""
+        """在线兜底：临时启动带代理的浏览器访问 Amazon 截图"""
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            logger.warning("playwright 未安装")
             return None
 
+        pw = None
+        browser = None
         page = None
         try:
-            # 懒初始化浏览器池（和 _render_screenshot 共用）
-            if not self._browser_slots:
-                async with self._browser_lock:
-                    if not self._browser_slots:
-                        for i in range(self._browsers_count):
-                            pw = await async_playwright().__aenter__()
-                            launch_opts = {
-                                "headless": True,
-                                "args": ["--disable-gpu", "--disable-dev-shm-usage",
-                                         "--no-sandbox", "--disable-extensions"],
-                            }
-                            if self._proxy_url:
-                                launch_opts["proxy"] = self._parse_proxy(self._proxy_url)
-                            browser = await pw.chromium.launch(**launch_opts)
-                            self._browser_slots.append({"playwright": pw, "browser": browser})
-                        proxy_info = f" (proxy: ***@{self._proxy_url.split('@')[-1]})" if self._proxy_url else " (无代理)"
-                        logger.info(f"浏览器池启动（{self._browsers_count} 实例）{proxy_info}")
+            pw = await async_playwright().__aenter__()
+            launch_opts = {
+                "headless": True,
+                "args": ["--disable-gpu", "--disable-dev-shm-usage",
+                         "--no-sandbox", "--disable-extensions"],
+            }
+            if self._proxy_url:
+                launch_opts["proxy"] = self._parse_proxy(self._proxy_url)
 
-            idx = self._browser_counter % len(self._browser_slots)
-            self._browser_counter += 1
-            browser = self._browser_slots[idx]["browser"]
-
+            browser = await pw.chromium.launch(**launch_opts)
             page = await browser.new_page(
                 viewport={"width": 1280, "height": 1300},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -200,13 +204,11 @@ class ScreenshotWorker:
             url = f"https://www.amazon.com/dp/{asin}?th=1&psc=1"
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
 
-            # 等待主要内容加载
             try:
                 await page.wait_for_selector("#productTitle", timeout=8000)
             except Exception:
                 pass
 
-            # 额外等待图片和样式渲染
             await page.wait_for_timeout(2000)
 
             screenshot = await page.screenshot(
@@ -216,19 +218,18 @@ class ScreenshotWorker:
             return screenshot
 
         except Exception as e:
-            err_msg = str(e)
-            if "browser has been closed" in err_msg or "Target closed" in err_msg:
-                logger.error(f"浏览器崩溃，将重启: {asin}")
-                await self._close_browsers()
-            else:
-                logger.warning(f"截图失败 {asin}: {e}")
+            logger.warning(f"在线截图失败 {asin}: {e}")
             return None
         finally:
             if page:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                try: await page.close()
+                except: pass
+            if browser:
+                try: await browser.close()
+                except: pass
+            if pw:
+                try: await pw.__aexit__(None, None, None)
+                except: pass
 
     async def _upload_screenshot(self, batch_name: str, asin: str, png_bytes: bytes) -> bool:
         """上传单张截图到服务器"""
@@ -303,11 +304,10 @@ class ScreenshotWorker:
                                 "args": ["--disable-gpu", "--disable-dev-shm-usage",
                                          "--no-sandbox", "--disable-extensions"],
                             }
-                            if self._proxy_url:
-                                launch_opts["proxy"] = {"server": self._proxy_url}
+                            # 离线渲染池不注入代理（本地渲染不需要网络）
                             browser = await pw.chromium.launch(**launch_opts)
                             self._browser_slots.append({"playwright": pw, "browser": browser})
-                        logger.info(f"浏览器池启动（{self._browsers_count} 实例）")
+                        logger.info(f"浏览器池启动（{self._browsers_count} 实例，离线渲染）")
 
             idx = self._browser_counter % len(self._browser_slots)
             self._browser_counter += 1
@@ -345,54 +345,20 @@ class ScreenshotWorker:
             try:
                 await page.set_content(
                     html_content,
-                    wait_until="domcontentloaded",
-                    timeout=5000,
+                    wait_until="load",
+                    timeout=10000,
                 )
             except Exception:
+                # load 超时也继续，domcontentloaded 后内容通常已经可见
                 pass
 
-            # 等待主图加载完成（最多 8 秒）
-            try:
-                await page.evaluate("""() => new Promise((resolve) => {
-                    const selectors = [
-                        '#landingImage',
-                        '#imgBlkFront',
-                        '#main-image',
-                        '#imgTagWrapperId img',
-                        '#imageBlock img[src*="images-amazon"]'
-                    ];
-                    let img = null;
-                    for (const sel of selectors) {
-                        img = document.querySelector(sel);
-                        if (img) break;
-                    }
-                    if (!img) return resolve(false);
-                    if (img.complete && img.naturalWidth > 0) return resolve(true);
-                    img.addEventListener('load', () => resolve(true), {once: true});
-                    img.addEventListener('error', () => resolve(false), {once: true});
-                    setTimeout(() => resolve(false), 7000);
-                })""")
-            except Exception:
-                pass
-
-            # 检查页面可见内容
-            has_content = await page.evaluate("""() => {
-                if (!document.body) return false;
-                const text = document.body.innerText || '';
-                if (text.trim().length > 50) return true;
-                const imgs = document.querySelectorAll('img[src]');
-                if (imgs.length > 0) return true;
-                return false;
-            }""")
+            # 等待主图和样式加载（增加到 3 秒）
+            await page.wait_for_timeout(3000)
 
             screenshot = await page.screenshot(
                 type="png",
                 clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )
-
-            if len(screenshot) < 10240 and not has_content:
-                logger.warning(f"空白截图已丢弃: {asin} ({len(screenshot)} bytes)")
-                return None
 
             return screenshot
         except Exception as e:

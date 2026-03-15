@@ -23,30 +23,30 @@
                         <div class="col-md-4">
                             <label class="form-label">最大重试次数</label>
                             <input type="number" class="form-control" name="max_retries"
-                                   value="{{ settings.max_retries }}" min="1" max="10">
+                                   value="{{ settings.max_retries }}" min="1">
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">请求超时 (秒)</label>
                             <input type="number" class="form-control" name="request_timeout"
-                                   value="{{ settings.request_timeout }}" min="5" max="60">
+                                   value="{{ settings.request_timeout }}" min="5">
                             <small class="text-secondary">隧道模式建议 25s，TPS 模式 15s</small>
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">Session 轮换频率</label>
                             <input type="number" class="form-control" name="session_rotate_every"
-                                   value="{{ settings.session_rotate_every }}" min="50" max="10000">
+                                   value="{{ settings.session_rotate_every }}" min="50">
                             <small class="text-secondary">每 N 次成功请求后轮换 Session</small>
                         </div>
                         <div class="col-md-2">
                             <label class="form-label">截图浏览器数</label>
                             <input type="number" class="form-control" name="screenshot_browsers"
-                                   value="{{ settings.screenshot_browsers }}" min="1" max="10">
+                                   value="{{ settings.screenshot_browsers }}" min="1">
                             <small class="text-secondary">Chromium 实例数</small>
                         </div>
                         <div class="col-md-2">
                             <label class="form-label">单浏览器并发</label>
                             <input type="number" class="form-control" name="screenshot_pages_per_browser"
-                                   value="{{ settings.screenshot_pages_per_browser }}" min="1" max="10">
+                                   value="{{ settings.screenshot_pages_per_browser }}" min="1">
                             <small class="text-secondary">每个浏览器并发 Page 数</small>
                         </div>
                     </div>
@@ -78,31 +78,31 @@
                         <div class="col-md-3">
                             <label class="form-label">全局总并发上限</label>
                             <input type="number" class="form-control" name="global_max_concurrency"
-                                   value="{{ settings.global_max_concurrency }}" min="2" max="500">
+                                   value="{{ settings.global_max_concurrency }}" min="1">
                             <small class="text-secondary">所有 Worker 总并发预算</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">全局总 QPS 上限</label>
                             <input type="number" class="form-control" name="global_max_qps"
-                                   value="{{ settings.global_max_qps }}" step="0.5" min="0.5" max="100">
+                                   value="{{ settings.global_max_qps }}" step="0.5" min="0.5">
                             <small class="text-secondary">所有 Worker 总 QPS 预算</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">单 Worker QPS</label>
                             <input type="number" class="form-control" name="token_bucket_rate"
-                                   value="{{ settings.token_bucket_rate }}" step="0.5" min="0.5" max="50">
+                                   value="{{ settings.token_bucket_rate }}" step="0.5" min="0.5">
                             <small class="text-secondary">令牌桶速率（无协调时生效）</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">初始并发</label>
                             <input type="number" class="form-control" name="initial_concurrency"
-                                   value="{{ settings.initial_concurrency }}" min="1" max="50">
+                                   value="{{ settings.initial_concurrency }}" min="1">
                             <small class="text-secondary">Worker 冷启动并发数</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">最大并发</label>
                             <input type="number" class="form-control" name="max_concurrency"
-                                   value="{{ settings.max_concurrency }}" min="2" max="100">
+                                   value="{{ settings.max_concurrency }}" min="1">
                             <small class="text-secondary">单 Worker AIMD 上限</small>
                         </div>
                     </div>
@@ -111,7 +111,7 @@
                         <div class="col-md-3">
                             <label class="form-label">最小并发</label>
                             <input type="number" class="form-control" name="min_concurrency"
-                                   value="{{ settings.min_concurrency }}" min="1" max="20">
+                                   value="{{ settings.min_concurrency }}" min="1">
                             <small class="text-secondary">AIMD 下限</small>
                         </div>
                     </div>
@@ -127,43 +127,43 @@
                         <div class="col-md-3">
                             <label class="form-label">评估间隔</label>
                             <input type="number" class="form-control" name="adjust_interval"
-                                   value="{{ settings.adjust_interval }}" min="3" max="60">
+                                   value="{{ settings.adjust_interval }}" min="3">
                             <small class="text-secondary">秒</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">目标延迟</label>
                             <input type="number" class="form-control" name="target_latency"
-                                   value="{{ settings.target_latency }}" step="0.5" min="1" max="30">
+                                   value="{{ settings.target_latency }}" step="0.5" min="1">
                             <small class="text-secondary">p50 低于此值才加速</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">延迟上限</label>
                             <input type="number" class="form-control" name="max_latency"
-                                   value="{{ settings.max_latency }}" step="0.5" min="2" max="60">
+                                   value="{{ settings.max_latency }}" step="0.5" min="2">
                             <small class="text-secondary">超过此值则减速</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">封锁冷却</label>
                             <input type="number" class="form-control" name="cooldown_after_block"
-                                   value="{{ settings.cooldown_after_block }}" min="5" max="120">
+                                   value="{{ settings.cooldown_after_block }}" min="5">
                             <small class="text-secondary">秒，被封后暂停加速</small>
                         </div>
                         <div class="col-md-3">
                             <label class="form-label">带宽上限 (Mbps)</label>
                             <input type="number" class="form-control" name="proxy_bandwidth_mbps"
-                                   value="{{ settings.proxy_bandwidth_mbps }}" min="0" max="100">
+                                   value="{{ settings.proxy_bandwidth_mbps }}" min="0">
                             <small class="text-secondary">0=不限，用于 AIMD 带宽感知</small>
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">目标成功率</label>
                             <input type="number" class="form-control" name="target_success_rate"
-                                   value="{{ settings.target_success_rate }}" step="0.01" min="0.5" max="1">
+                                   value="{{ settings.target_success_rate }}" step="0.01" min="0.5">
                             <small class="text-secondary">高于此值才递增并发</small>
                         </div>
                         <div class="col-md-4">
                             <label class="form-label">成功率下限</label>
                             <input type="number" class="form-control" name="min_success_rate"
-                                   value="{{ settings.min_success_rate }}" step="0.01" min="0.3" max="1">
+                                   value="{{ settings.min_success_rate }}" step="0.01" min="0.3">
                             <small class="text-secondary">低于此值触发减半</small>
                         </div>
                         <div class="col-md-4">

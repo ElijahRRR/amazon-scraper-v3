@@ -1,0 +1,25 @@
+{
+  "started_at": "2026-03-16T11:47:55Z",
+  "offsets": {
+    "worker_stage2.log": 6114586,
+    "worker_stage3.log": 6880380,
+    "worker_stage4.log": 6371593
+  },
+  "cumulative_log_counts": {
+    "proxy_429": 6464,
+    "blank_page": 933,
+    "blocked": 290,
+    "request_timeout": 8089,
+    "task_failed": 15938,
+    "session_init_failed": 122,
+    "traceback": 1
+  },
+  "worker_registry_mismatch": false,
+  "snapshot_file": ".agent/monitor/f005_snapshots.jsonl",
+  "state_file": ".agent/monitor/f005_state.json",
+  "log_dir": ".agent/runtime_logs",
+  "last_snapshot_at": "2026-03-16T13:38:11Z",
+  "last_completed": 126322,
+  "last_pending": 134270,
+  "last_processing": 340
+}

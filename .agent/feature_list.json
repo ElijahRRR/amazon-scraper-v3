@@ -78,5 +78,25 @@
     ],
     "notes": "Stage 1 (100 ASIN) and Stage 2 (400 ASIN) both completed with screenshots done=total on the live 8899 server. After restarting the worker onto the patched code, a dedicated 404 batch for B000F6RWW8 and B000LRX9XM also completed with screenshots done=2/2, confirming the missing-product placeholder path now closes cleanly. Residual risk is proxy-side 429s affecting throughput, not screenshot leakage or stuck pending rows.",
     "last_verified_at": "2026-03-16T11:20:28Z"
+  },
+  {
+    "id": "F-005",
+    "priority": "P1",
+    "category": "operations",
+    "description": "Monitor the live 260,932-item batch with 4 workers, sample runtime behavior every minute, and generate a completion-time stability report.",
+    "steps": [
+      "Identify the live batch and current worker topology",
+      "Expand to four workers and enable durable runtime log capture where safe",
+      "Run a minute-level monitor that records API progress, worker/process state, and log anomalies until completion",
+      "Generate a final report summarizing stability, throughput, and suspected bugs"
+    ],
+    "passes": false,
+    "evidence": [
+      ".agent/monitor/batch_runtime_monitor.py",
+      ".agent/runtime_logs/",
+      ".agent/evidence/f005-260k-runtime-report.md"
+    ],
+    "notes": "Target batch is `batch_20260316_193458` (`batch_id=1`, total `260932`). Monitoring is live via `.agent/monitor/batch_runtime_monitor.py`, with snapshots already recorded at `2026-03-16T11:47:55Z` and `2026-03-16T11:48:55Z`. Current topology is 4 online workers; startup evidence shows proxy `429`, blank-page retries, and occasional session/block rotation before the run settled into a steadier throughput pattern.",
+    "last_verified_at": "2026-03-16T11:48:55Z"
   }
 ]

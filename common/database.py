@@ -548,7 +548,10 @@ class Database:
             return False
 
         if _is_parse_failure(data):
-            logger.warning(f"解析失败数据跳过: {asin}")
+            title = data.get("title", "")[:40]
+            brand = data.get("brand", "")[:20]
+            price = data.get("current_price", "")
+            logger.warning(f"解析失败数据跳过: {asin} title='{title}' brand='{brand}' price='{price}'")
             return False
 
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')

@@ -1,14 +1,14 @@
 # Task Definition
 
 - Mode: build
-- Task: Prevent screenshot subprocess browser leaks and CPU spikes during stop/restart
+- Task: Monitor the live 260k-item batch with 4 workers and produce a completion-time stability report
 - Constraints:
-  - Keep screenshot architecture as a subprocess; do not fold Playwright back into the main worker loop.
-  - Fix lifecycle from the stop/restart path first, not by weakening screenshot gating.
+  - Do not interrupt or reset the active large batch unless monitoring is otherwise impossible.
+  - Collect evidence from live server/worker behavior, not just static code inspection.
+  - Persist monitoring state so the report can still be generated after a long run.
 - Acceptance Criteria:
-  - Restarting or stopping the screenshot subprocess also reaps its descendant browser processes.
-  - Screenshot child handles SIGTERM/SIGINT by requesting graceful shutdown instead of immediate `sys.exit()`.
-  - Screenshot workers do not share a global cache directory that allows another subprocess to steal pending HTML files.
-  - Verification includes a focused process-group cleanup repro plus syntax validation.
+  - Identify the active target batch and expand to 4 workers total.
+  - Record minute-level snapshots of batch progress, worker registry state, process health, and live log anomalies until the batch completes.
+  - Generate a report at completion focused on stability, throughput, suspected bugs, and operator-visible issues.
 - Out of Scope:
-  - Redesigning screenshot retry semantics or batch-completion policy in this change.
+  - Product/business decisions about which optimization strategy to apply after the report is delivered.

@@ -237,3 +237,39 @@
   - Proxy-side `CONNECT tunnel failed, response 429` remains an external throughput limiter during batch starts, but it did not prevent the live verification batches from closing.
 - Next action:
   - Keep the patched worker running on `8899` for the next larger ASIN run, or lower proxy pressure if the next batch needs more stable startup throughput.
+
+### Session: 2026-03-16T11:48:55Z
+- Target item id: F-005
+- Objective: Start durable minute-level monitoring for the live 260,932-item batch and expand the runtime to 4 workers
+- Baseline status: `/api/batches` showed one active batch `batch_20260316_193458` (`batch_id=1`, `total=260932`) with only `loadtest-stage1` online; live progress was `done=2605 pending=258219 processing=108 failed=0`
+- Work performed:
+  - Updated `.agent/task.md` and `.agent/feature_list.json` to reflect the new long-running runtime-observation objective.
+  - Created `.agent/runtime_logs/` and launched three additional workers (`loadtest-stage2`, `loadtest-stage3`, `loadtest-stage4`) with `--no-screenshot`, each writing to its own log file.
+  - Added `.agent/monitor/batch_runtime_monitor.py` to sample `/api/progress`, `/api/batches`, `/api/workers`, process state, and new worker log deltas every 60 seconds until batch completion.
+  - Started the monitor against `batch_id=1` and verified it wrote two consecutive snapshots (`11:47:55Z` and `11:48:55Z`) into `.agent/monitor/f005_snapshots.jsonl`.
+  - Sampled live server/session logs and worker log tails; startup instability showed bursts of proxy `429`, blank-page retries, block/session rotation, and then settled to mostly isolated timeouts and title-empty retries.
+- Verification commands:
+  - `python3 - <<'PY' ... GET /api/progress ... GET /api/batches ... GET /api/workers ... PY`
+  - `python3 -m py_compile .agent/monitor/batch_runtime_monitor.py`
+  - `ps -Ao pid,ppid,pgid,%cpu,%mem,etime,command | rg 'batch_runtime_monitor.py|run_worker.py --server http://127.0.0.1:8899 --worker-id loadtest-stage|run_server.py'`
+  - `python3 - <<'PY' ... read .agent/monitor/f005_state.json and count lines in .agent/monitor/f005_snapshots.jsonl ... PY`
+  - `tail -n 20 .agent/runtime_logs/worker_stage2.log`
+  - `tail -n 20 .agent/runtime_logs/worker_stage3.log`
+  - `tail -n 20 .agent/runtime_logs/worker_stage4.log`
+- Verification result:
+  - pass (`py_compile`)
+  - pass (`4` online workers visible in `/api/workers`)
+  - pass (monitor active with `snapshot_count=2`, `last_snapshot_at=2026-03-16T11:48:55Z`)
+  - pass (progress advanced between the first two monitor snapshots: `completed 5676 -> 6616`)
+  - observed startup anomalies, not blockers (`proxy_429=58`, `blank_page=7`, `blocked=4`, `request_timeout=97`, `task_failed=32`, `session_init_failed=5` in cumulative monitor state after the first round)
+- Evidence paths:
+  - `.agent/monitor/f005_state.json`
+  - `.agent/monitor/f005_snapshots.jsonl`
+  - `.agent/runtime_logs/worker_stage2.log`
+  - `.agent/runtime_logs/worker_stage3.log`
+  - `.agent/runtime_logs/worker_stage4.log`
+  - `.agent/evidence/f005-260k-runtime-report.md`
+- Blockers:
+  - The already-running server and `loadtest-stage1` worker were not restarted onto file-log capture to avoid disrupting in-flight work, so continuous server stability evidence is being gathered from API/process snapshots plus sampled session logs rather than a dedicated server log file.
+- Next action:
+  - Let the minute-level monitor run to batch completion, then read `.agent/evidence/f005-260k-runtime-report.md` and summarize the stability findings for the user.

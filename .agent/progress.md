@@ -47,3 +47,193 @@
   - Local `data/scraper.db` does not contain `B00006IF89`, `B0000AVCAW`, or `B00006F71L`, so no direct in-place repair was possible here.
 - Next action:
   - Restart the deployed server process if it is still running older code, then validate the next screenshot-enabled batch in the UI.
+
+### Session: 2026-03-16T10:16:00Z
+- Target item id: R-001
+- Objective: Review screenshot subprocess leak and shutdown fixes
+- Baseline status: review scope narrowed to screenshot subprocess lifecycle, completion gating, and server retry semantics
+- Work performed:
+  - Compared screenshot-related commits from `babb175..HEAD` and read the current `worker/screenshot.py` and `worker/engine.py` lifecycle paths.
+  - Ran lightweight syntax validation with `py_compile` and `ast.parse`.
+  - Reproduced that `update_screenshot_status(..., 'failed')` leaves screenshots in `pending` with `retry_count=1`.
+  - Reproduced that a batch containing only `.failed` files is marked complete and its directory is deleted.
+- Verification commands:
+  - `python3 -m py_compile worker/engine.py worker/screenshot.py test_screenshot.py`
+  - `python3 - <<'PY' ... ast.parse(...) ... PY`
+  - `python3 - <<'PY' ... update_screenshot_status('failed') ... print(dict(row)) ... PY`
+  - `python3 - <<'PY' ... ScreenshotWorker._check_batch_completion() ... print(uploaded_marker, batch_dir_exists) ... PY`
+- Verification result:
+  - pass (`py_compile`, `ast.parse`)
+  - finding reproduced (`{'status': 'pending', 'retry_count': 1}`)
+  - finding reproduced (`uploaded_marker True`, `batch_dir_exists False`)
+- Evidence paths:
+  - `.agent/evidence/review-screenshot-subprocess.md`
+- Files changed:
+  - `.agent/task.md`
+  - `.agent/review_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+  - `.agent/evidence/review-screenshot-subprocess.md`
+- Blockers:
+  - none
+- Next action:
+  - Decide whether failure should remain retriable (`.html` retained / requeued) or terminal (`screenshots.status='failed'` immediately when renaming to `.failed`).
+
+### Session: 2026-03-16T10:20:00Z
+- Target item id: F-002
+- Objective: Prevent screenshot subprocess browser leaks during stop/restart
+- Baseline status: identified likely root cause as orphaned screenshot-child descendants after stop/restart; review evidence suggested gate issues were secondary
+- Work performed:
+  - Updated `worker/engine.py` to launch the screenshot subprocess in its own session/process group.
+  - Added parent-side cleanup that kills the full screenshot process group on restart, stop, and unexpected child exit.
+  - Bound screenshot log forwarding to the specific subprocess instance to avoid cross-process handle confusion.
+  - Updated `worker/screenshot.py` to request graceful shutdown on SIGTERM/SIGINT instead of calling `sys.exit()` directly from signal handlers.
+- Verification commands:
+  - `python3 -m py_compile worker/engine.py worker/screenshot.py`
+  - `python3 - <<'PY' ... synthetic process tree ... await worker._stop_screenshot_process() ... print({'before_count': ..., 'after_count': ...}) ... PY`
+- Verification result:
+  - pass (`py_compile`)
+  - pass (`before_count: 2`, `after_count: 0`)
+- Evidence paths:
+  - `.agent/evidence/f002-screenshot-process-cleanup.md`
+- Files changed:
+  - `worker/engine.py`
+  - `worker/screenshot.py`
+  - `.agent/task.md`
+  - `.agent/feature_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+  - `.agent/evidence/f002-screenshot-process-cleanup.md`
+- Blockers:
+  - none
+- Next action:
+  - Run the worker against a real screenshot-enabled batch and monitor `ps`/logs for repeated screenshot subprocess restarts or residual Chromium processes.
+
+### Session: 2026-03-16T10:27:00Z
+- Target item id: F-002
+- Objective: Validate screenshot leak fix against a real screenshot-enabled worker run
+- Baseline status: isolated temp server + temp DB created to avoid interfering with the primary local server/worker
+- Work performed:
+  - Launched a dedicated server on `127.0.0.1:8898` with an isolated DB and uploaded two screenshot-enabled verification batches.
+  - Fixed a regression introduced during validation (`worker/screenshot.py` was missing `import sys` for `main()` argument parsing).
+  - Ran a monitored worker against batch 2 and sampled task stats, screenshot stats, `pgid`, and process-group membership.
+  - Confirmed the screenshot subprocess reached a stable `pg_members=2` during rendering and dropped to `final_group_counts: {44105: 0}` after stop.
+- Verification commands:
+  - `python3 -m py_compile worker/engine.py worker/screenshot.py`
+  - `python3 -u - <<'PY' ... isolated worker monitor for batch 2 ... PY`
+- Verification result:
+  - pass (`py_compile`)
+  - pass for leak containment (`pg_members` stable at 2 during run; `final_group_counts` zero after stop)
+  - separate functional issue reproduced (`screenshots` rows remained pending while gate released)
+- Evidence paths:
+  - `.agent/evidence/f002-screenshot-process-cleanup.md`
+- Files changed:
+  - `worker/engine.py`
+  - `worker/screenshot.py`
+  - `.agent/evidence/f002-screenshot-process-cleanup.md`
+  - `.agent/feature_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+- Blockers:
+  - Screenshot retry/completion state machine is still inconsistent; tracked separately in `.agent/review_list.json`
+- Next action:
+  - Fix the screenshot completion/retry semantics so the gate cannot release while `screenshots` remains pending.
+
+### Session: 2026-03-16T10:57:20Z
+- Target item id: F-003
+- Objective: Eliminate cross-worker screenshot cache interference after the leak fix
+- Baseline status: reproduced `截图源文件在占用前消失` during isolated validation while orphan `worker/screenshot.py http://127.0.0.1:8899` processes with `ppid=1` were still alive and watching the shared cache directory
+- Work performed:
+  - Added `.processing` state handling and server-side screenshot row-count guards to keep incomplete screenshot work visible and reject silent no-op updates.
+  - Added diagnostic logs around screenshot file claim/upload paths to pinpoint where source HTML disappeared.
+  - Namespaced screenshot cache directories by `server_url + worker_id` in `worker/engine.py` and passed the isolated base dir to the child via `SCREENSHOT_BASE_DIR`.
+  - Verified the isolated child now claims both files from its own cache directory, uploads both screenshots, and only marks the batch complete after `done=2/2`.
+- Verification commands:
+  - `python3 -m py_compile worker/engine.py worker/screenshot.py common/database.py server/app.py test_database_screenshot_path.py test_screenshot_state_machine.py`
+  - `python3 -m unittest test_database_screenshot_path.py test_screenshot_state_machine.py`
+  - `python3 -u - <<'PY' ... isolated temp server on 127.0.0.1:8897 + worker_id=isolated-1773658597 + batch isolated_verify_1773658597 ... PY`
+- Verification result:
+  - pass (`py_compile`)
+  - pass (`Ran 6 tests ... OK`)
+  - pass (`shots.done == 2`, `shot_prog.done == total == 2`, `FINAL ... None 0`)
+- Evidence paths:
+  - `.agent/evidence/f003-screenshot-cache-isolation.md`
+- Files changed:
+  - `worker/engine.py`
+  - `worker/screenshot.py`
+  - `common/database.py`
+  - `server/app.py`
+  - `test_database_screenshot_path.py`
+  - `test_screenshot_state_machine.py`
+  - `.agent/evidence/f003-screenshot-cache-isolation.md`
+  - `.agent/feature_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+  - `.agent/task.md`
+- Blockers:
+  - The workstation still has old orphan `worker/screenshot.py` processes from earlier leak builds; the new code isolates itself from them, but they should be cleaned up before large-scale CPU testing.
+- Next action:
+  - Stop the old orphan screenshot.py processes on `127.0.0.1:8899`, then run a staged large-batch screenshot test using the user-provided Excel file.
+
+### Session: 2026-03-16T11:05:13Z
+- Target item id: F-004
+- Objective: Start staged screenshot load testing from the user-provided Excel file
+- Baseline status: restarted local `8899` server on the current code and confirmed the Excel file contains `500` unique ASINs
+- Work performed:
+  - Restarted `run_server.py` and launched `run_worker.py --server http://127.0.0.1:8899 --worker-id loadtest-stage1`.
+  - Uploaded the first 100 ASINs from `/Users/nextderboy/Desktop/测试文件夹/小测试_副本.xlsx` as batch `stage1_excel100_1773658969`.
+  - Verified stage 1 completed with `100/100` task rows done and `100/100` screenshot rows done.
+  - Uploaded the remaining 400 ASINs as batch `stage2_excel400_1773659068` and kept the worker running.
+  - Sampled live progress, worker metrics, and process state to confirm the screenshot path remains stable under the larger batch.
+- Verification commands:
+  - `python3 - <<'PY' ... extract 100 ASINs from Excel and POST /api/upload ... PY`
+  - `python3 - <<'PY' ... extract remaining 400 ASINs from Excel and POST /api/upload ... PY`
+  - `python3 - <<'PY' ... GET /api/progress?batch_id=1 ... GET /api/batches/stage1_excel100_1773658969/screenshots/progress ... PY`
+  - `python3 - <<'PY' ... GET /api/progress?batch_id=2 ... GET /api/batches/stage2_excel400_1773659068/screenshots/progress ... PY`
+  - `ps -Ao pid,ppid,pgid,%cpu,%mem,command | rg 'run_worker.py --server http://127.0.0.1:8899 --worker-id loadtest-stage1|worker/screenshot.py http://127.0.0.1:8899'`
+- Verification result:
+  - pass for stage 1 (`done=100/100`, screenshots `done=100/100`)
+  - pass for screenshot stability under stage 2 so far (`one screenshot subprocess`, continuing `ok=True` screenshot uploads, no disappearing-HTML race)
+  - stage 2 currently in progress (`done=144/400`, screenshots `done=98/400`)
+- Evidence paths:
+  - `.agent/evidence/f004-staged-excel-load-test.md`
+- Files changed:
+  - `.agent/evidence/f004-staged-excel-load-test.md`
+  - `.agent/feature_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+- Blockers:
+  - Proxy-side `CONNECT tunnel failed, response 429` still appears intermittently at batch start and can reduce effective throughput, though retries are recovering.
+- Next action:
+  - Keep monitoring batch `stage2_excel400_1773659068` to completion, then decide whether to change concurrency or proxy rate limits before any larger follow-up run.
+
+### Session: 2026-03-16T11:20:28Z
+- Target item id: F-004
+- Objective: Close out the staged Excel load test and verify the 404 screenshot path on the restarted worker
+- Baseline status: live `8899` server showed stage 2 had fully finished (`done=400/400`, screenshots `done=400/400`), but the active worker process had been started before the final 404 placeholder fix
+- Work performed:
+  - Queried the live `stage2_excel400_1773659068` batch and confirmed both task and screenshot progress were `400/400 done`.
+  - Gracefully stopped worker session `66510` and observed its screenshot child log `收到停止请求，准备退出当前截图循环`, then restarted `run_worker.py --server http://127.0.0.1:8899 --worker-id loadtest-stage1` as session `99971`.
+  - Uploaded a focused 2-ASIN verification batch `verify_404_screenshot_1773660030` containing the previously problematic missing-product ASINs `B000F6RWW8` and `B000LRX9XM`.
+  - Observed the restarted worker log both `商品不存在 (404)` results and the screenshot child upload both placeholder renders successfully.
+- Verification commands:
+  - `python3 - <<'PY' ... GET /api/progress?batch_id=2 ... GET /api/batches/stage2_excel400_1773659068/screenshots/progress ... PY`
+  - `ps -Ao pid,ppid,pgid,%cpu,%mem,etime,command | rg 'run_worker.py --server http://127.0.0.1:8899 --worker-id loadtest-stage1|worker/screenshot.py http://127.0.0.1:8899'`
+  - `python3 - <<'PY' ... POST verify_404_screenshot_1773660030 ... poll /api/progress?batch_id=3 and /api/batches/verify_404_screenshot_1773660030/screenshots/progress ... PY`
+- Verification result:
+  - pass (`stage2` task progress `done=400 failed=0 total=400`)
+  - pass (`stage2` screenshot progress `done=400 failed=0 total=400`)
+  - pass (`verify_404_screenshot_1773660030` task progress `done=2 failed=0 total=2`)
+  - pass (`verify_404_screenshot_1773660030` screenshot progress `done=2 failed=0 total=2`)
+  - pass (`one worker process`, `one screenshot subprocess`)
+- Evidence paths:
+  - `.agent/evidence/f004-staged-excel-load-test.md`
+- Files changed:
+  - `.agent/evidence/f004-staged-excel-load-test.md`
+  - `.agent/feature_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+- Blockers:
+  - Proxy-side `CONNECT tunnel failed, response 429` remains an external throughput limiter during batch starts, but it did not prevent the live verification batches from closing.
+- Next action:
+  - Keep the patched worker running on `8899` for the next larger ASIN run, or lower proxy pressure if the next batch needs more stable startup throughput.

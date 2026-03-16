@@ -930,35 +930,39 @@ class Database:
             return [dict(r) for r in await c.fetchall()]
 
     async def update_screenshot_status(self, asin: str, batch_id: int, status: str,
-                                       file_path: str = None, error: str = None):
+                                       file_path: str = None, error: str = None) -> bool:
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        updated = False
         async with self._write_lock:
             await self._db.execute("BEGIN")
             if status == "done" and file_path:
-                await self._db.execute(
+                cursor = await self._db.execute(
                     "UPDATE screenshots SET status=?, file_path=?, updated_at=? WHERE asin=? AND batch_id=?",
                     (status, file_path, now, asin, batch_id)
                 )
-                await self._db.execute(
-                    "UPDATE asin_data SET screenshot_path=? WHERE asin=?",
-                    (file_path, asin)
-                )
+                updated = cursor.rowcount > 0
+                if updated:
+                    await self._db.execute(
+                        "UPDATE asin_data SET screenshot_path=? WHERE asin=?",
+                        (file_path, asin)
+                    )
             elif status == "failed":
-                await self._db.execute(
-                    """UPDATE screenshots SET status='pending', retry_count=retry_count+1,
-                       error_detail=?, updated_at=? WHERE asin=? AND batch_id=? AND retry_count < 3""",
+                cursor = await self._db.execute(
+                    """UPDATE screenshots
+                       SET status='failed', retry_count=retry_count+1,
+                           error_detail=?, updated_at=?
+                       WHERE asin=? AND batch_id=?""",
                     (error, now, asin, batch_id)
                 )
-                await self._db.execute(
-                    "UPDATE screenshots SET status='failed', updated_at=? WHERE asin=? AND batch_id=? AND retry_count >= 3",
-                    (now, asin, batch_id)
-                )
+                updated = cursor.rowcount > 0
             else:
-                await self._db.execute(
+                cursor = await self._db.execute(
                     "UPDATE screenshots SET status=?, updated_at=? WHERE asin=? AND batch_id=?",
                     (status, now, asin, batch_id)
                 )
+                updated = cursor.rowcount > 0
             await self._db.execute("COMMIT")
+        return updated
 
     async def get_screenshot_progress(self, batch_id: int) -> Dict:
         sql = "SELECT status, COUNT(*) as cnt FROM screenshots WHERE batch_id = ? GROUP BY status"
@@ -971,22 +975,45 @@ class Database:
 
     # ==================== 导出操作 ====================
 
-    async def iter_results(self, batch_id: int = None, batch_size: int = 500):
-        """流式迭代结果（使用 keyset 分页避免大 OFFSET）"""
+    async def iter_results(self, batch_id: int = None, change_filter: str = "all",
+                           batch_size: int = 500):
+        """流式迭代结果（keyset 分页，支持 batch_id + change_filter）"""
         last_id = 0
         while True:
+            joins = []
+            where = ["d.id > ?"]
+            params: list = [last_id]
+
             if batch_id:
-                sql = """
-                    SELECT d.* FROM asin_data d
-                    JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?
-                    WHERE d.id > ?
-                    ORDER BY d.id ASC
-                    LIMIT ?
-                """
-                params = (batch_id, last_id, batch_size)
-            else:
-                sql = "SELECT * FROM asin_data WHERE id > ? ORDER BY id ASC LIMIT ?"
-                params = (last_id, batch_size)
+                joins.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
+                params.insert(0, batch_id)
+
+            if change_filter == "price_stock":
+                sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='price_stock'"
+                if batch_id:
+                    sub += " AND batch_id=?"
+                    params.append(batch_id)
+                sub += ") ac ON ac.asin = d.asin"
+                joins.append(sub)
+            elif change_filter == "title_bullets":
+                sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='title_bullets'"
+                if batch_id:
+                    sub += " AND batch_id=?"
+                    params.append(batch_id)
+                sub += ") ac ON ac.asin = d.asin"
+                joins.append(sub)
+            elif change_filter == "new":
+                if batch_id:
+                    joins.append("JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1")
+                    params.append(batch_id)
+                else:
+                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='new') ac ON ac.asin = d.asin")
+
+            join_clause = " ".join(joins)
+            where_clause = " AND ".join(where)
+            params.append(batch_size)
+
+            sql = f"SELECT d.* FROM asin_data d {join_clause} WHERE {where_clause} ORDER BY d.id ASC LIMIT ?"
 
             async with self._db.execute(sql, params) as c:
                 rows = await c.fetchall()

@@ -1,13 +1,14 @@
 # Task Definition
 
 - Mode: build
-- Task: Fix screenshot_path overwritten after screenshot upload
+- Task: Prevent screenshot subprocess browser leaks and CPU spikes during stop/restart
 - Constraints:
-  - Keep screenshot uploads authoritative; do not reintroduce result-payload ownership of `screenshot_path`.
-  - Limit changes to the screenshot-path race and user-visible result rendering path.
+  - Keep screenshot architecture as a subprocess; do not fold Playwright back into the main worker loop.
+  - Fix lifecycle from the stop/restart path first, not by weakening screenshot gating.
 - Acceptance Criteria:
-  - `save_result` preserves a completed screenshot path when the screenshot upload arrives before the first `asin_data` insert.
-  - Results APIs return a valid screenshot path when `asin_data.screenshot_path` contains an invalid placeholder such as `"None"` but `screenshots.file_path` is present.
-  - Verification includes an automated regression test and a direct race repro script.
+  - Restarting or stopping the screenshot subprocess also reaps its descendant browser processes.
+  - Screenshot child handles SIGTERM/SIGINT by requesting graceful shutdown instead of immediate `sys.exit()`.
+  - Screenshot workers do not share a global cache directory that allows another subprocess to steal pending HTML files.
+  - Verification includes a focused process-group cleanup repro plus syntax validation.
 - Out of Scope:
-  - One-off repair of production data not present in the local `data/scraper.db`.
+  - Redesigning screenshot retry semantics or batch-completion policy in this change.

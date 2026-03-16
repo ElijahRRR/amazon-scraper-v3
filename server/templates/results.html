@@ -65,7 +65,7 @@
             <div class="col-md-3 text-end">
                 <label class="form-label">&nbsp;</label>
                 <div class="d-flex justify-content-end gap-1">
-                    <button class="btn btn-outline-accent btn-sm" onclick="exportResults()">
+                    <button class="btn btn-outline-accent btn-sm" onclick="openExportModal()">
                         <i class="bi bi-download"></i> 导出
                     </button>
                     <button class="btn btn-outline-danger btn-sm" onclick="clearData()">
@@ -127,6 +127,46 @@
             </div>
             <div class="modal-body text-center">
                 <img id="screenshotImg" src="" style="max-width:100%; border:1px solid var(--border);">
+            </div>
+        </div>
+    </div>
+</div>
+<!-- 导出 Modal -->
+<div class="modal fade" id="exportModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title"><i class="bi bi-download"></i> 导出数据</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="row g-3 mb-3">
+                    <div class="col-md-4">
+                        <label class="form-label">导出格式</label>
+                        <select id="exportFormat" class="form-select" onchange="onExportFormatChange()">
+                            <option value="xlsx">Excel (.xlsx)</option>
+                            <option value="csv">CSV (.csv)</option>
+                        </select>
+                    </div>
+                    <div class="col-md-8">
+                        <label class="form-label">导出范围</label>
+                        <div class="form-control-plaintext" id="exportScope" style="color:var(--text-secondary);">全部数据</div>
+                    </div>
+                </div>
+                <div id="fieldSelectionArea">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <label class="form-label mb-0">选择导出字段</label>
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-accent" onclick="selectAllFields()">全选</button>
+                            <button class="btn btn-outline-secondary" onclick="selectNoFields()">全不选</button>
+                            <button class="btn btn-outline-warning" onclick="selectPriceStockOnly()">仅价格库存</button>
+                        </div>
+                    </div>
+                    <div id="exportFields" style="max-height:300px; overflow-y:auto; columns:3; gap:8px;"></div>
+                </div>
+                <div class="mt-3 text-end">
+                    <button class="btn btn-accent" onclick="doExport()"><i class="bi bi-download"></i> 开始导出</button>
+                </div>
             </div>
         </div>
     </div>
@@ -310,22 +350,82 @@ function showScreenshot(path) {
     new bootstrap.Modal(document.getElementById('screenshotModal')).show();
 }
 
-async function exportResults() {
-    const batchId = state.batchId;
+// ==================== 导出功能 ====================
+let _exportFields = [];
+let _exportHeaders = {};
+
+async function openExportModal() {
+    // 加载字段列表
+    if (!_exportFields.length) {
+        try {
+            const resp = await fetch('/api/export/fields');
+            const data = await resp.json();
+            _exportFields = data.fields;
+            _exportHeaders = data.headers;
+        } catch(e) { return; }
+    }
+
+    // 显示导出范围
+    const batchSel = document.getElementById('batchFilter');
+    const batchText = batchSel.options[batchSel.selectedIndex]?.text || '全部';
+    const filterSel = document.getElementById('changeFilter');
+    const filterText = filterSel.options[filterSel.selectedIndex]?.text || '全部';
+    document.getElementById('exportScope').textContent = `${batchText} / ${filterText}`;
+
+    // 渲染字段复选框
+    const saved = JSON.parse(localStorage.getItem('export_fields') || 'null');
+    const container = document.getElementById('exportFields');
+    container.innerHTML = '';
+    for (const f of _exportFields) {
+        const checked = saved ? saved.includes(f) : true;
+        const label = esc(_exportHeaders[f] || f);
+        container.innerHTML += `<div style="break-inside:avoid; margin-bottom:4px;">
+            <label><input type="checkbox" value="${f}" ${checked ? 'checked' : ''}> ${label}</label>
+        </div>`;
+    }
+
+    new bootstrap.Modal(document.getElementById('exportModal')).show();
+}
+
+function onExportFormatChange() {
+    // db 格式不支持字段选择（v3 暂不实现 .db 导出）
+}
+
+function selectAllFields() {
+    document.querySelectorAll('#exportFields input').forEach(cb => cb.checked = true);
+}
+function selectNoFields() {
+    document.querySelectorAll('#exportFields input').forEach(cb => cb.checked = false);
+}
+function selectPriceStockOnly() {
+    const keep = new Set(['asin','title','current_price','buybox_price','buybox_shipping',
+        'stock_count','stock_status','is_fba','delivery_date','total_price','crawl_time','updated_at']);
+    document.querySelectorAll('#exportFields input').forEach(cb => {
+        cb.checked = keep.has(cb.value);
+    });
+}
+
+async function doExport() {
+    const format = document.getElementById('exportFormat').value;
+    const selected = [...document.querySelectorAll('#exportFields input:checked')].map(cb => cb.value);
+    if (!selected.length) { alert('请至少选择一个字段'); return; }
+
+    // 持久化
+    localStorage.setItem('export_fields', JSON.stringify(selected));
+
+    // 构建 URL
     let url;
-    if (batchId) {
-        // 需要先获取 batch name
+    if (state.batchId) {
         const resp = await fetch('/api/batches');
         const data = await resp.json();
-        const batch = data.batches.find(b => b.id == batchId);
-        if (batch) {
-            url = `/api/export/${encodeURIComponent(batch.name)}`;
-        } else {
-            url = '/api/export/all';
-        }
+        const batch = data.batches.find(b => b.id == state.batchId);
+        url = batch ? `/api/export/${encodeURIComponent(batch.name)}` : '/api/export/all';
     } else {
         url = '/api/export/all';
     }
+
+    url += `?format=${format}&change_filter=${state.changeFilter}&fields=${selected.join(',')}`;
+    bootstrap.Modal.getInstance(document.getElementById('exportModal'))?.hide();
     window.open(url, '_blank');
 }
 

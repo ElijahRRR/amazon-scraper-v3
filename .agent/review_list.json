@@ -1,0 +1,44 @@
+[
+  {
+    "id": "R-001",
+    "priority": "P1",
+    "dimension": "correctness",
+    "check": "Verify screenshot failure path stays consistent with server retry semantics",
+    "status": "finding",
+    "evidence": [
+      ".agent/evidence/review-screenshot-subprocess.md",
+      "common/database.py:946",
+      "worker/screenshot.py:186",
+      "worker/screenshot.py:316"
+    ],
+    "finding": "When a render fails, screenshot.py renames the source HTML to .failed and stops scanning it, but the server writes the screenshot row back to status='pending' for retry_count < 3. That leaves a pending screenshot with no remaining producer to retry it, so screenshot progress can remain stuck indefinitely after the first failure.",
+    "last_checked_at": "2026-03-16T10:16:00Z"
+  },
+  {
+    "id": "R-002",
+    "priority": "P2",
+    "dimension": "diagnosability",
+    "check": "Verify failed HTML is actually preserved for debugging",
+    "status": "finding",
+    "evidence": [
+      ".agent/evidence/review-screenshot-subprocess.md",
+      "worker/screenshot.py:188",
+      "worker/screenshot.py:320"
+    ],
+    "finding": "The new .failed rename no longer blocks batch completion, but _check_batch_completion() immediately removes the whole batch directory once no .html files remain. In practice the .failed artifact is deleted right away, so the promised postmortem HTML is not retained.",
+    "last_checked_at": "2026-03-16T10:16:00Z"
+  },
+  {
+    "id": "R-003",
+    "priority": "P3",
+    "dimension": "baseline",
+    "check": "Run lightweight syntax validation on screenshot worker changes",
+    "status": "passed",
+    "evidence": [
+      "python3 -m py_compile worker/engine.py worker/screenshot.py test_screenshot.py",
+      "python3 - <<'PY' ... ast.parse(...) ... PY"
+    ],
+    "finding": "",
+    "last_checked_at": "2026-03-16T10:16:00Z"
+  }
+]

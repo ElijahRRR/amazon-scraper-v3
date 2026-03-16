@@ -16,5 +16,67 @@
     ],
     "notes": "Local data/scraper.db does not contain the user-reported ASINs, so verification used an isolated temp DB reproduction.",
     "last_verified_at": "2026-03-16T03:58:00Z"
+  },
+  {
+    "id": "F-002",
+    "priority": "P0",
+    "category": "stability",
+    "description": "Enforce screenshot subprocess descendant cleanup so Chromium/browser children do not survive stop/restart and spike CPU.",
+    "steps": [
+      "Launch screenshot subprocesses in their own process group",
+      "Kill the full process group on stop or unexpected exit",
+      "Make screenshot child request graceful shutdown on SIGTERM/SIGINT",
+      "Verify with syntax checks and a synthetic process-tree cleanup repro"
+    ],
+    "passes": true,
+    "evidence": [
+      ".agent/evidence/f002-screenshot-process-cleanup.md",
+      "python3 -m py_compile worker/engine.py worker/screenshot.py"
+    ],
+    "notes": "Real isolated batch validation showed screenshot pgid membership stayed flat (2 processes) and dropped to 0 on stop. Remaining screenshot issues are functional/state-machine problems tracked in review_list.json, not browser-process fan-out.",
+    "last_verified_at": "2026-03-16T10:27:00Z"
+  },
+  {
+    "id": "F-003",
+    "priority": "P0",
+    "category": "stability",
+    "description": "Isolate screenshot cache directories per worker/server so leaked or concurrent screenshot subprocesses cannot steal HTML files from another worker.",
+    "steps": [
+      "Reproduce the disappearing-HTML race with diagnostic logs",
+      "Identify whether another process is consuming the shared screenshot cache",
+      "Namespace screenshot cache directories by server_url and worker_id",
+      "Verify an isolated batch reaches screenshot done=total before gate release"
+    ],
+    "passes": true,
+    "evidence": [
+      ".agent/evidence/f003-screenshot-cache-isolation.md",
+      "python3 -m py_compile worker/engine.py worker/screenshot.py",
+      "python3 -m unittest test_database_screenshot_path.py test_screenshot_state_machine.py"
+    ],
+    "notes": "The root cause of the disappearing HTML race was cross-process interference from orphan screenshot.py processes still watching the shared cache directory. Namespacing the cache by server+worker eliminated the theft in real validation.",
+    "last_verified_at": "2026-03-16T10:57:20Z"
+  },
+  {
+    "id": "F-004",
+    "priority": "P1",
+    "category": "verification",
+    "description": "Run staged screenshot load tests against the user-provided Excel file and confirm screenshot subprocess stability under hundreds of ASINs.",
+    "steps": [
+      "Restart the local 8899 server on the current code",
+      "Run a first-stage 100-ASIN screenshot batch from the Excel source file",
+      "Increase to a larger screenshot batch from the same Excel file and monitor progress, CPU, and screenshot subprocess count"
+    ],
+    "passes": true,
+    "evidence": [
+      ".agent/evidence/f004-staged-excel-load-test.md",
+      "http://127.0.0.1:8899/api/progress?batch_id=1",
+      "http://127.0.0.1:8899/api/batches/stage1_excel100_1773658969/screenshots/progress",
+      "http://127.0.0.1:8899/api/progress?batch_id=2",
+      "http://127.0.0.1:8899/api/batches/stage2_excel400_1773659068/screenshots/progress",
+      "http://127.0.0.1:8899/api/progress?batch_id=3",
+      "http://127.0.0.1:8899/api/batches/verify_404_screenshot_1773660030/screenshots/progress"
+    ],
+    "notes": "Stage 1 (100 ASIN) and Stage 2 (400 ASIN) both completed with screenshots done=total on the live 8899 server. After restarting the worker onto the patched code, a dedicated 404 batch for B000F6RWW8 and B000LRX9XM also completed with screenshots done=2/2, confirming the missing-product placeholder path now closes cleanly. Residual risk is proxy-side 429s affecting throughput, not screenshot leakage or stuck pending rows.",
+    "last_verified_at": "2026-03-16T11:20:28Z"
   }
 ]

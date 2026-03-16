@@ -123,17 +123,22 @@ class Worker:
 
         # Worker 协程管理
         self._worker_tasks: List[asyncio.Task] = []
+        self._active_task_count = 0
 
         # 截图：独立子进程架构（采集与截图完全隔离事件循环）
         self._browsers_count = 1             # 截图浏览器实例数
         self._pages_per_browser = 5          # 每个浏览器并发 page 数
-        self._screenshot_base_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
-        )
+        cache_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot_cache")
+        server_key = re.sub(r"[^A-Za-z0-9_.-]", "_", self.server_url)
+        worker_key = re.sub(r"[^A-Za-z0-9_.-]", "_", self.worker_id)
+        self._screenshot_base_dir = os.path.join(cache_root, f"{server_key}__{worker_key}")
         self._screenshot_html_dir = os.path.join(self._screenshot_base_dir, "html")
         self._screenshot_process: Optional[asyncio.subprocess.Process] = None
+        self._screenshot_pgid: Optional[int] = None
+        self._screenshot_log_task: Optional[asyncio.Task] = None
         self._screenshot_lock = asyncio.Lock()  # 防止并发创建多个截图子进程
         self._screenshot_pending_batches: set = set()
+        self._screenshot_batch_ids: Dict[str, int] = {}
         self._screenshot_gate = asyncio.Event()
         self._screenshot_gate.set()
 
@@ -233,15 +238,35 @@ class Worker:
             try:
                 queue_size = self._task_queue.qsize()
 
-                # 截图门控：队列已空 + 有未完成的截图批次 → 写采集完成标记，等截图上传完成
-                if queue_size == 0 and self._screenshot_pending_batches:
+                # 截图门控：队列已空且没有在途任务 + 有未完成的截图批次
+                # 仅在最后一个任务真正处理完成后再写 _scraping_done，避免过早放行。
+                if queue_size == 0 and self._active_task_count == 0 and self._screenshot_pending_batches:
+                    scrape_complete_batches = set()
                     for batch in self._screenshot_pending_batches:
+                        batch_id = self._screenshot_batch_ids.get(batch)
+                        if batch_id and await self._is_batch_scrape_complete(batch_id):
+                            scrape_complete_batches.add(batch)
+
+                    if not scrape_complete_batches:
+                        await asyncio.sleep(1)
+                        continue
+
+                    for batch in scrape_complete_batches:
                         marker = os.path.join(self._screenshot_html_dir, batch, "_scraping_done")
                         if not os.path.exists(marker):
                             os.makedirs(os.path.dirname(marker), exist_ok=True)
                             with open(marker, "w") as f:
                                 f.write(str(time.time()))
-                    pending = len(self._screenshot_pending_batches)
+
+                    incomplete_batches = self._screenshot_pending_batches - scrape_complete_batches
+                    if incomplete_batches:
+                        logger.info(
+                            f"📸 批次仍在采集，暂不门控: {sorted(incomplete_batches)}"
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                    pending = len(scrape_complete_batches)
                     logger.info(f"⏸️ 等待截图完成后再拉取新任务（{pending} 个批次待处理）")
                     self._screenshot_gate.clear()
 
@@ -249,6 +274,7 @@ class Worker:
                     if self._screenshot_process and self._screenshot_process.returncode is not None:
                         logger.warning(f"📸 截图子进程已退出 (code={self._screenshot_process.returncode})，跳过门控")
                         self._screenshot_pending_batches.clear()
+                        self._screenshot_batch_ids.clear()
                         self._screenshot_gate.set()
                         continue
 
@@ -259,6 +285,7 @@ class Worker:
                     except asyncio.TimeoutError:
                         logger.warning("⚠️ 截图门控超时（5分钟），强制放行继续拉取任务")
                         self._screenshot_pending_batches.clear()
+                        self._screenshot_batch_ids.clear()
                         self._screenshot_gate.set()
                     continue
                 threshold = int(self._queue_size * self._prefetch_threshold)
@@ -407,7 +434,11 @@ class Worker:
                 # 3. 处理任务
                 # 指标（latency, success, blocked）在 _process_task 内部按每次 HTTP 请求记录，
                 # 确保 AIMD 看到的 p50 延迟是真实的 HTTP 往返时间，而非含重试/等待的总任务时间。
-                await self._process_task(task)
+                self._active_task_count += 1
+                try:
+                    await self._process_task(task)
+                finally:
+                    self._active_task_count = max(0, self._active_task_count - 1)
 
             except asyncio.CancelledError:
                 break
@@ -929,6 +960,21 @@ class Worker:
         pipe_bps = int(bw_mbps * 1_000_000 / 8)
         return pipe_bps // max(1, self._metrics.inflight)
 
+    async def _is_batch_scrape_complete(self, batch_id: int) -> bool:
+        """确认服务端该批次的采集任务是否已全部结束。"""
+        url = f"{self.server_url}/api/progress"
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(url, params={"batch_id": batch_id})
+            if resp.status_code != 200:
+                return False
+            progress = resp.json()
+            total = int(progress.get("total", 0))
+            finished = int(progress.get("done", 0)) + int(progress.get("failed", 0))
+            return total > 0 and finished >= total
+        except Exception:
+            return False
+
     async def _apply_jitter(self):
         """微抖动：绑定目标节拍间隔，避免过度随机造成碰撞。"""
         _qps = (self._channel_rate_limiter.per_channel_rate
@@ -1072,6 +1118,13 @@ class Worker:
                     result_data["title"] = "[商品不存在]"
                     result_data["batch_name"] = task.get("batch_name", "")
                     await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"))
+                    if task.get("needs_screenshot") and self._enable_screenshot:
+                        await self._enqueue_screenshot_html(
+                            asin=asin,
+                            batch_name=task.get("batch_name", ""),
+                            batch_id=task.get("batch_id"),
+                            html_content=self._build_missing_product_html(asin),
+                        )
                     self._stats["success"] += 1
                     self._stats["total"] += 1
                     return (True, False, resp_bytes)
@@ -1215,18 +1268,12 @@ class Worker:
 
                 # 截图存证：写 HTML 到磁盘，由独立截图子进程渲染
                 if task.get("needs_screenshot") and self._enable_screenshot:
-                    batch = task.get("batch_name", "")
-                    # 直接用 batch_name 作为目录名（与 server 端 batch 名一致）
-                    html_dir = os.path.join(self._screenshot_html_dir, batch)
-                    os.makedirs(html_dir, exist_ok=True)
-                    html_path = os.path.join(html_dir, f"{asin}.html")
-                    tmp_path = html_path + ".tmp"
-                    async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
-                        await f.write(resp.text)
-                    os.rename(tmp_path, html_path)
-                    self._screenshot_pending_batches.add(batch)
-                    # 确保截图子进程已启动
-                    await self._ensure_screenshot_process()
+                    await self._enqueue_screenshot_html(
+                        asin=asin,
+                        batch_name=task.get("batch_name", ""),
+                        batch_id=task.get("batch_id"),
+                        html_content=resp.text,
+                    )
 
                 # 主动轮换：每 N 次成功请求更换 session 防止被检测（仅 TPS 模式）
                 if not is_tunnel:
@@ -1382,30 +1429,53 @@ class Worker:
             if self._screenshot_process and self._screenshot_process.returncode is None:
                 return
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screenshot.py")
-            proxy_url = config.PROXY_URL or ""
+            await self._reap_screenshot_descendants("截图子进程重启前清理残留浏览器")
+            env = os.environ.copy()
+            env["SCREENSHOT_BASE_DIR"] = self._screenshot_base_dir
             self._screenshot_process = await asyncio.create_subprocess_exec(
                 sys.executable, script,
                 self.server_url,
                 str(self._browsers_count),
                 str(self._pages_per_browser),
-                proxy_url,
+                env=env,
+                start_new_session=True,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
+            self._screenshot_pgid = self._screenshot_process.pid
         # 异步转发子进程日志
-        asyncio.create_task(self._forward_screenshot_logs())
-        logger.info(f"📸 截图子进程已启动 (PID: {self._screenshot_process.pid})")
+        self._screenshot_log_task = asyncio.create_task(
+            self._forward_screenshot_logs(self._screenshot_process)
+        )
+        logger.info(
+            f"📸 截图子进程已启动 (PID: {self._screenshot_process.pid}, dir: {self._screenshot_base_dir})"
+        )
 
-    async def _forward_screenshot_logs(self):
+    async def _forward_screenshot_logs(self, proc: asyncio.subprocess.Process):
         """将截图子进程的 stdout 转发到主进程日志"""
         try:
             while True:
-                line = await self._screenshot_process.stdout.readline()
+                line = await proc.stdout.readline()
                 if not line:
                     break
                 logger.info(f"[SS] {line.decode().rstrip()}")
         except Exception:
             pass
+
+    async def _reap_screenshot_descendants(self, reason: str):
+        """清理截图子进程残留的浏览器后代进程。"""
+        pgid = self._screenshot_pgid
+        if not pgid:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            logger.warning(f"📸 已强制清理截图进程组残留 (pgid={pgid}) | {reason}")
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.warning(f"📸 清理截图进程组失败 (pgid={pgid}): {e}")
+        finally:
+            self._screenshot_pgid = None
 
     async def _screenshot_gate_monitor(self):
         """监控截图子进程的 _uploaded 标记，完成后开门放行"""
@@ -1417,7 +1487,10 @@ class Worker:
             # 子进程已退出 → 立即放行
             if self._screenshot_process and self._screenshot_process.returncode is not None:
                 logger.warning(f"📸 截图子进程已退出 (code={self._screenshot_process.returncode})，清除门控")
+                await self._reap_screenshot_descendants("截图子进程异常退出后清理残留")
+                self._screenshot_process = None
                 self._screenshot_pending_batches.clear()
+                self._screenshot_batch_ids.clear()
                 self._screenshot_gate.set()
                 continue
 
@@ -1435,6 +1508,7 @@ class Worker:
                         os.remove(marker)
                     except OSError:
                         pass
+                    self._screenshot_batch_ids.pop(batch, None)
                 self._screenshot_pending_batches -= completed
                 logger.info(f"📸 截图批次已上传: {completed}")
                 if not self._screenshot_pending_batches:
@@ -1442,13 +1516,39 @@ class Worker:
 
     async def _stop_screenshot_process(self):
         """停止截图子进程"""
-        if self._screenshot_process and self._screenshot_process.returncode is None:
-            self._screenshot_process.terminate()
+        proc = self._screenshot_process
+        pgid = self._screenshot_pgid
+        if proc and proc.returncode is None:
             try:
-                await asyncio.wait_for(self._screenshot_process.wait(), timeout=10)
+                if pgid:
+                    os.killpg(pgid, signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
             except asyncio.TimeoutError:
-                self._screenshot_process.kill()
+                try:
+                    if pgid:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    logger.warning("📸 截图子进程强杀后仍未及时退出")
             logger.info("📸 截图子进程已停止")
+        await self._reap_screenshot_descendants("停止截图子进程后兜底清理")
+        self._screenshot_process = None
+        if self._screenshot_log_task:
+            try:
+                await asyncio.wait_for(self._screenshot_log_task, timeout=1)
+            except Exception:
+                pass
+            self._screenshot_log_task = None
 
     # ═══════════════════════════════════════════════
     # 隧道模式 IP 轮换监控
@@ -1552,6 +1652,95 @@ class Worker:
         # 最终指标快照
         logger.info(self._metrics.format_summary())
         logger.info("=" * 60)
+
+
+    async def _enqueue_screenshot_html(self, asin: str, batch_name: str,
+                                       batch_id: Optional[int], html_content: str):
+        """将截图 HTML 写入隔离缓存目录并确保截图子进程已启动。"""
+        html_dir = os.path.join(self._screenshot_html_dir, batch_name)
+        os.makedirs(html_dir, exist_ok=True)
+        html_path = os.path.join(html_dir, f"{asin}.html")
+        tmp_path = html_path + ".tmp"
+        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+            await f.write(html_content)
+        os.replace(tmp_path, html_path)
+        self._screenshot_pending_batches.add(batch_name)
+        if batch_id:
+            self._screenshot_batch_ids[batch_name] = batch_id
+        await self._ensure_screenshot_process()
+
+    def _build_missing_product_html(self, asin: str) -> str:
+        """为 404/已下架商品生成可截图的占位页，避免截图任务永久 pending。"""
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Amazon Product Not Found - {asin}</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;
+      background: linear-gradient(180deg, #f6f7f9 0%, #e9edf3 100%);
+      color: #111827;
+    }}
+    .wrap {{
+      width: 1280px;
+      height: 1300px;
+      box-sizing: border-box;
+      padding: 72px;
+    }}
+    .card {{
+      background: #fff;
+      border: 1px solid #d5d9d9;
+      border-radius: 20px;
+      padding: 56px;
+      box-shadow: 0 24px 60px rgba(17, 24, 39, 0.08);
+    }}
+    .tag {{
+      display: inline-block;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: #fef3c7;
+      color: #92400e;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      margin-bottom: 24px;
+    }}
+    h1 {{
+      margin: 0 0 16px;
+      font-size: 54px;
+      line-height: 1.1;
+    }}
+    p {{
+      margin: 0 0 18px;
+      font-size: 28px;
+      line-height: 1.55;
+      color: #374151;
+    }}
+    .asin {{
+      margin-top: 36px;
+      padding-top: 28px;
+      border-top: 1px solid #e5e7eb;
+      font-size: 26px;
+      color: #6b7280;
+      letter-spacing: 0.06em;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="tag">404 / Unavailable</div>
+      <h1>Product Not Found</h1>
+      <p>This ASIN returned an Amazon 404 response during collection.</p>
+      <p>The item may have been removed, merged, or is no longer available in the current catalog.</p>
+      <p>This placeholder page is generated so screenshot tracking reaches a terminal state.</p>
+      <div class="asin">ASIN: {asin}</div>
+    </div>
+  </div>
+</body>
+</html>"""
 
 
 def main():

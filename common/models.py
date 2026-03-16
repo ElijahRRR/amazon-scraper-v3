@@ -93,3 +93,7 @@ class Batch:
 CHANGE_TYPE_PRICE_STOCK = "price_stock"
 CHANGE_TYPE_TITLE_BULLETS = "title_bullets"
 CHANGE_TYPE_NEW = "new"
+
+# 导出可选字段（排除内部字段，加虚拟字段 total_price）
+_INTERNAL_FIELDS = {"id", "content_hash", "title_bullets_hash", "created_at", "updated_at", "screenshot_path"}
+EXPORTABLE_FIELDS = [f.name for f in __import__("dataclasses").fields(AsinData) if f.name not in _INTERNAL_FIELDS] + ["total_price"]

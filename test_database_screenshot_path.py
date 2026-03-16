@@ -78,6 +78,18 @@ class ScreenshotPathRegressionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results["items"][0]["screenshot_path"], expected_path)
 
+    async def test_update_screenshot_status_returns_false_when_row_is_missing(self):
+        batch_id = await self.db.create_batch("missing-batch", needs_screenshot=True)
+
+        updated = await self.db.update_screenshot_status(
+            "BTEST000000",
+            batch_id,
+            "done",
+            file_path="/static/screenshots/missing-batch/BTEST000000.png",
+        )
+
+        self.assertFalse(updated)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -166,8 +166,8 @@ class ScreenshotWorker:
             except Exception:
                 pass
 
-            # 等待主图加载（1秒）
-            await page.wait_for_timeout(1000)
+            # 等待主图加载（3秒）
+            await page.wait_for_timeout(3000)
 
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}

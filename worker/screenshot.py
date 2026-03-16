@@ -166,7 +166,13 @@ class ScreenshotWorker:
                 await page.set_content(html, wait_until="domcontentloaded", timeout=8000)
             except Exception:
                 pass
-            await page.wait_for_timeout(3000)
+            # 智能等待：主图加载完立刻截图，最多等 3 秒
+            await page.evaluate("""() => new Promise(r => {
+                const img = document.querySelector('#landingImage, #imgBlkFront, #imgTagWrapperId img');
+                if (!img || (img.complete && img.naturalWidth > 0)) return r();
+                img.onload = img.onerror = () => r();
+                setTimeout(r, 3000);
+            })""")
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )

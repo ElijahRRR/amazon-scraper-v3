@@ -1220,8 +1220,10 @@ class Worker:
                     html_dir = os.path.join(self._screenshot_html_dir, batch)
                     os.makedirs(html_dir, exist_ok=True)
                     html_path = os.path.join(html_dir, f"{asin}.html")
-                    async with aiofiles.open(html_path, "w", encoding="utf-8") as f:
+                    tmp_path = html_path + ".tmp"
+                    async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
                         await f.write(resp.text)
+                    os.rename(tmp_path, html_path)  # 原子操作，截图子进程不会读到半写文件
                     self._screenshot_pending_batches.add(batch)
                     # 确保截图子进程已启动
                     await self._ensure_screenshot_process()

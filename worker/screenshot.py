@@ -226,7 +226,7 @@ class ScreenshotWorker:
             else:
                 logger.warning(f"上传失败: {asin}")
         else:
-            logger.warning(f"截图最终失败: {asin}")
+            logger.warning(f"截图最终失败: {asin}，HTML 保留供排查")
             try:
                 await self._http_client.post(
                     f"{self.server_url}/api/tasks/screenshot/fail",
@@ -235,10 +235,7 @@ class ScreenshotWorker:
                 )
             except Exception:
                 pass
-            try:
-                os.remove(html_path)
-            except OSError:
-                pass
+            # 不删除 HTML，保留供排查
 
     # ==================== 上传 ====================
 

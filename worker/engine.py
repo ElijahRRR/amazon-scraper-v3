@@ -126,7 +126,7 @@ class Worker:
 
         # 截图：独立子进程架构（采集与截图完全隔离事件循环）
         self._browsers_count = 1             # 截图浏览器实例数
-        self._pages_per_browser = 4          # 每个浏览器并发 page 数
+        self._pages_per_browser = 5          # 每个浏览器并发 page 数
         self._screenshot_base_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
         )
@@ -1220,10 +1220,8 @@ class Worker:
                     html_dir = os.path.join(self._screenshot_html_dir, batch)
                     os.makedirs(html_dir, exist_ok=True)
                     html_path = os.path.join(html_dir, f"{asin}.html")
-                    tmp_path = html_path + ".tmp"
-                    async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+                    async with aiofiles.open(html_path, "w", encoding="utf-8") as f:
                         await f.write(resp.text)
-                    os.rename(tmp_path, html_path)  # 原子操作，截图子进程不会读到半写文件
                     self._screenshot_pending_batches.add(batch)
                     # 确保截图子进程已启动
                     await self._ensure_screenshot_process()

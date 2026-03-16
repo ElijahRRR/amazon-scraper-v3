@@ -1,0 +1,49 @@
+### Session: 2026-03-16T03:51:37Z
+- Target item id: INIT
+- Objective: Initialize infinite-run harness artifacts
+- Baseline status: initialized
+- Work performed:
+  - Created required .agent files
+- Verification commands:
+  - ls -la .agent
+- Verification result:
+  - pass
+- Evidence paths:
+  - .agent/evidence/
+- Files changed:
+  - .agent/task.md
+  - .agent/progress.md
+  - .agent/handoff.md
+- Blockers:
+  - none
+- Next action:
+  - Run baseline verification and select highest-priority objective
+
+### Session: 2026-03-16T03:58:00Z
+- Target item id: F-001
+- Objective: Fix screenshot_path race when screenshot upload completes before save_result
+- Baseline status: reproduced failure on isolated temp DB (`save_result` inserted row with `screenshot_path=None` after `update_screenshot_status(..., done)` ran first)
+- Work performed:
+  - Added screenshot-path normalization helper to treat `"None"` / `"null"` / empty values as missing.
+  - Updated `save_result` to hydrate `screenshot_path` from the `screenshots` table for both insert and update flows.
+  - Added result-read fallback so `get_results` and `get_result_by_asin` recover valid paths from `screenshots` when the main table contains an invalid placeholder.
+  - Added `test_database_screenshot_path.py` with regression coverage for both the race and the historical-placeholder fallback.
+- Verification commands:
+  - `python3 - <<'PY' ... update_screenshot_status(...); save_result(...); print(repr(row.get('screenshot_path'))) ... PY`
+  - `python3 -m unittest test_database_screenshot_path.py`
+- Verification result:
+  - pass (`'/static/screenshots/race-test/BTEST123456.png'`)
+  - pass (`Ran 2 tests in 0.927s`, `OK`)
+- Evidence paths:
+  - `.agent/evidence/f001-screenshot-path-regression.md`
+- Files changed:
+  - `common/database.py`
+  - `test_database_screenshot_path.py`
+  - `.agent/task.md`
+  - `.agent/feature_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+- Blockers:
+  - Local `data/scraper.db` does not contain `B00006IF89`, `B0000AVCAW`, or `B00006F71L`, so no direct in-place repair was possible here.
+- Next action:
+  - Restart the deployed server process if it is still running older code, then validate the next screenshot-enabled batch in the UI.

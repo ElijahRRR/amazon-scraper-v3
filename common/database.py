@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 _NA_VALUES = {"", "N/A", "n/a", "None", "none", None}
 
 
+def _normalize_screenshot_path(path: Any) -> Optional[str]:
+    """将无效占位值统一视为缺失截图路径。"""
+    if path is None:
+        return None
+    value = str(path).strip()
+    if not value or value.lower() in {"none", "null"}:
+        return None
+    return value
+
+
 def _is_parse_failure(data: dict) -> bool:
     """检测采集结果是否为解析失败（真正的空壳数据才算失败）
     v3: 如果有有效标题和品牌，即使价格为N/A也不算失败（可能是变体/NFO页面）
@@ -546,6 +556,8 @@ class Database:
         data["title_bullets_hash"] = _compute_title_bullets_hash(data)
 
         async with self._write_lock:
+            resolved_screenshot_path = await self._get_done_screenshot_path(asin, batch_id)
+
             # 查询已有记录
             async with self._db.execute(
                 "SELECT * FROM asin_data WHERE asin = ?", (asin,)
@@ -556,6 +568,9 @@ class Database:
             try:
                 if existing:
                     existing_dict = dict(existing)
+                    existing_screenshot_path = _normalize_screenshot_path(
+                        existing_dict.get("screenshot_path")
+                    )
                     changes = []
 
                     # 1. 价格/库存变动检测
@@ -607,6 +622,10 @@ class Database:
                             update_fields.append(f"{f} = ?")
                             update_values.append(val)
 
+                    if resolved_screenshot_path and resolved_screenshot_path != existing_screenshot_path:
+                        update_fields.append("screenshot_path = ?")
+                        update_values.append(resolved_screenshot_path)
+
                     update_fields.append("updated_at = ?")
                     update_values.append(now)
                     update_values.append(asin)
@@ -626,6 +645,10 @@ class Database:
                         if val is not None:
                             insert_fields.append(f)
                             insert_values.append(val)
+
+                    if resolved_screenshot_path:
+                        insert_fields.append("screenshot_path")
+                        insert_values.append(resolved_screenshot_path)
 
                     insert_fields.extend(["created_at", "updated_at"])
                     insert_values.extend([now, now])
@@ -651,6 +674,82 @@ class Database:
                     pass
                 raise
         return True
+
+    async def _get_done_screenshot_path(self, asin: str, batch_id: int = None) -> Optional[str]:
+        queries = []
+        if batch_id is not None:
+            queries.append((
+                """SELECT file_path FROM screenshots
+                   WHERE asin = ? AND batch_id = ? AND status = 'done'
+                   ORDER BY updated_at DESC, id DESC LIMIT 1""",
+                (asin, batch_id),
+            ))
+        queries.append((
+            """SELECT file_path FROM screenshots
+               WHERE asin = ? AND status = 'done'
+               ORDER BY updated_at DESC, id DESC LIMIT 1""",
+            (asin,),
+        ))
+
+        for sql, params in queries:
+            async with self._db.execute(sql, params) as c:
+                row = await c.fetchone()
+            if row:
+                file_path = _normalize_screenshot_path(row["file_path"])
+                if file_path:
+                    return file_path
+        return None
+
+    async def _get_done_screenshot_paths(self, asins: List[str],
+                                         batch_id: int = None) -> Dict[str, str]:
+        if not asins:
+            return {}
+
+        remaining = list(dict.fromkeys(asins))
+        mapping: Dict[str, str] = {}
+
+        async def load(batch_filter: int = None):
+            nonlocal remaining
+            if not remaining:
+                return
+
+            placeholders = ",".join("?" * len(remaining))
+            sql = (
+                f"SELECT asin, file_path FROM screenshots "
+                f"WHERE status = 'done' AND asin IN ({placeholders})"
+            )
+            params: List[Any] = list(remaining)
+            if batch_filter is not None:
+                sql += " AND batch_id = ?"
+                params.append(batch_filter)
+            sql += " ORDER BY updated_at DESC, id DESC"
+
+            async with self._db.execute(sql, params) as c:
+                rows = await c.fetchall()
+
+            for row in rows:
+                file_path = _normalize_screenshot_path(row["file_path"])
+                if file_path and row["asin"] not in mapping:
+                    mapping[row["asin"]] = file_path
+            remaining = [asin for asin in remaining if asin not in mapping]
+
+        if batch_id is not None:
+            await load(batch_id)
+        await load()
+        return mapping
+
+    async def _hydrate_screenshot_paths(self, items: List[Dict], batch_id: int = None):
+        missing = []
+        for item in items:
+            normalized = _normalize_screenshot_path(item.get("screenshot_path"))
+            item["screenshot_path"] = normalized
+            if normalized is None:
+                missing.append(item["asin"])
+
+        fallback = await self._get_done_screenshot_paths(missing, batch_id) if missing else {}
+        for item in items:
+            if item["screenshot_path"] is None:
+                item["screenshot_path"] = fallback.get(item["asin"])
 
     async def save_results_batch(self, results: List[dict], batch_id: int = None) -> int:
         """批量保存结果"""
@@ -779,6 +878,8 @@ class Database:
         if direction == "prev":
             items.reverse()
 
+        await self._hydrate_screenshot_paths(items, batch_id)
+
         # 查询总数
         count_where = " AND ".join(
             [p for p in (where_parts[:-1] if cursor_id is not None else where_parts)]
@@ -806,7 +907,11 @@ class Database:
     async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
         async with self._db.execute("SELECT * FROM asin_data WHERE asin = ?", (asin,)) as c:
             row = await c.fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            item = dict(row)
+            await self._hydrate_screenshot_paths([item])
+            return item
 
     async def get_asin_changes(self, asin: str) -> List[Dict]:
         """获取 ASIN 的变动历史"""

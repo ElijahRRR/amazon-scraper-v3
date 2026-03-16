@@ -1,0 +1,20 @@
+[
+  {
+    "id": "F-001",
+    "priority": "P0",
+    "category": "functional",
+    "description": "Make screenshot_path resilient to screenshot-before-result races and invalid historical placeholder values.",
+    "steps": [
+      "Reproduce the race where screenshot upload finishes before the first asin_data insert",
+      "Hydrate screenshot_path from screenshots on save_result and on result reads when the stored value is invalid",
+      "Verify with a regression test and a direct repro script"
+    ],
+    "passes": true,
+    "evidence": [
+      ".agent/evidence/f001-screenshot-path-regression.md",
+      "python3 -m unittest test_database_screenshot_path.py"
+    ],
+    "notes": "Local data/scraper.db does not contain the user-reported ASINs, so verification used an isolated temp DB reproduction.",
+    "last_verified_at": "2026-03-16T03:58:00Z"
+  }
+]

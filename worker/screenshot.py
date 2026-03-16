@@ -162,20 +162,66 @@ class ScreenshotWorker:
                     html = html[:close] + '<base href="https://www.amazon.com/">' + html[close:]
 
             page = await self._browser.new_page(viewport={"width": 1280, "height": 1300})
+
+            # 资源拦截：放行 CSS/图片，屏蔽 JS/字体/广告（参照 v2）
+            async def block_resources(route):
+                rt = route.request.resource_type
+                url = route.request.url
+                if rt in ("stylesheet", "image"):
+                    await route.continue_()
+                elif rt in ("script", "font", "media", "websocket", "manifest", "other"):
+                    await route.abort()
+                elif any(x in url for x in ("analytics", "tracking", "beacon",
+                                            "ads", "doubleclick", "facebook")):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            await page.route("**/*", block_resources)
+
             try:
-                await page.set_content(html, wait_until="domcontentloaded", timeout=8000)
+                await page.set_content(html, wait_until="domcontentloaded", timeout=5000)
             except Exception:
                 pass
-            # 智能等待：主图加载完立刻截图，最多等 3 秒
-            await page.evaluate("""() => new Promise(r => {
-                const img = document.querySelector('#landingImage, #imgBlkFront, #imgTagWrapperId img');
-                if (!img || (img.complete && img.naturalWidth > 0)) return r();
-                img.onload = img.onerror = () => r();
-                setTimeout(r, 3000);
-            })""")
+
+            # 智能等待主图加载完（最多 7 秒，参照 v2）
+            try:
+                await page.evaluate("""() => new Promise((resolve) => {
+                    const selectors = [
+                        '#landingImage', '#imgBlkFront', '#main-image',
+                        '#imgTagWrapperId img', '#imageBlock img[src*="images-amazon"]'
+                    ];
+                    let img = null;
+                    for (const sel of selectors) {
+                        img = document.querySelector(sel);
+                        if (img) break;
+                    }
+                    if (!img) return resolve(false);
+                    if (img.complete && img.naturalWidth > 0) return resolve(true);
+                    img.addEventListener('load', () => resolve(true), {once: true});
+                    img.addEventListener('error', () => resolve(false), {once: true});
+                    setTimeout(() => resolve(false), 7000);
+                })""")
+            except Exception:
+                pass
+
+            # 空白检测（参照 v2）
+            has_content = await page.evaluate("""() => {
+                if (!document.body) return false;
+                const text = document.body.innerText || '';
+                if (text.trim().length > 50) return true;
+                const imgs = document.querySelectorAll('img[src]');
+                if (imgs.length > 0) return true;
+                return false;
+            }""")
+
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )
+
+            # 空白截图丢弃
+            if len(png_bytes) < 10240 and not has_content:
+                logger.warning(f"空白截图已丢弃: {asin} ({len(png_bytes)}B)")
+                png_bytes = None
 
         except Exception as e:
             err = str(e)

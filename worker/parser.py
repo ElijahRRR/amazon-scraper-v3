@@ -889,18 +889,17 @@ class AmazonParser:
         return result
 
     def _slx_parse_brand_enhanced(self, tree, jsonld: dict, page_details: dict, sp_data: dict) -> str:
-        """增强品牌解析：JSON-LD → CSS → 表格(短) → meta keywords"""
+        """增强品牌解析：JSON-LD → 表格 → CSS → meta keywords"""
         brand = jsonld.get("brand")
-        if brand and brand != "N/A" and len(brand) <= 80:
-            return brand
-
-        # CSS 优先于表格（表格的 brand 字段可能包含长描述文本）
-        brand = self._slx_parse_brand(tree)
         if brand and brand != "N/A":
             return brand
 
         brand = page_details.get("brand")
-        if brand and brand != "N/A" and len(brand) <= 80:
+        if brand and brand != "N/A":
+            return brand
+
+        brand = self._slx_parse_brand(tree)
+        if brand and brand != "N/A":
             return brand
 
         # v3 fallback: meta keywords

@@ -68,7 +68,7 @@ def _default_settings() -> dict:
         "cooldown_after_block": 15,
         "proxy_bandwidth_mbps": config.PROXY_BANDWIDTH_MBPS,
         "screenshot_browsers": 1,
-        "screenshot_pages_per_browser": 3,
+        "screenshot_pages_per_browser": 5,
         "auto_scrape_schedules": [],
     }
 

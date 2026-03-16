@@ -149,11 +149,31 @@ class ScreenshotWorker:
             with open(html_path, "r", encoding="utf-8", errors="replace") as f:
                 html = f.read()
 
+            # 注入 <base> 让相对路径的 CSS/图片能正确加载
+            base_tag = '<base href="https://www.amazon.com/">'
+            lower = html[:2000].lower()
+            if "<base " not in lower:
+                pos = lower.find("<head")
+                if pos != -1:
+                    close = html.index(">", pos) + 1
+                    html = html[:close] + base_tag + html[close:]
+                else:
+                    html = base_tag + html
+
             page = await self._browser.new_page(viewport={"width": 1280, "height": 1300})
             try:
-                await page.set_content(html, wait_until="domcontentloaded", timeout=5000)
+                await page.set_content(html, wait_until="domcontentloaded", timeout=8000)
             except Exception:
                 pass
+
+            # 等待主图加载
+            try:
+                await page.wait_for_selector("#landingImage, #imgBlkFront, #imgTagWrapperId img",
+                                             state="attached", timeout=3000)
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )

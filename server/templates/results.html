@@ -277,10 +277,11 @@ function renderResults(items) {
         const crawlTime = esc(r.crawl_time || '');
         const hasScreenshot = r.screenshot_path && r.screenshot_path.startsWith('/static/');
 
-        const fbaClass = fba === 'FBA' ? 'badge bg-success' : (fba === 'FBM' ? 'badge bg-warning text-dark' : '');
-        const stockDot = stockStatus.toLowerCase().includes('in stock') ? '🟢' :
-                         stockStatus.toLowerCase().includes('unavailable') ? '🔴' :
-                         stockStatus.toLowerCase().includes('out') ? '🔴' : '🟡';
+        const fbaCell = fba === 'FBA'
+            ? '<span class="badge-status badge-done">FBA</span>'
+            : fba === 'FBM'
+                ? '<span class="badge-status badge-failed">FBM</span>'
+                : esc(fba);
 
         html += `<tr>
             <td><a href="https://www.amazon.com/dp/${asin}" target="_blank" class="text-accent">${asin}</a></td>
@@ -288,8 +289,8 @@ function renderResults(items) {
             <td>${price}</td>
             <td>${buybox}</td>
             <td>${brand}</td>
-            <td>${stockDot} ${stock}</td>
-            <td>${fbaClass ? `<span class="${fbaClass}">${fba}</span>` : fba}</td>
+            <td>${stock}</td>
+            <td>${fbaCell}</td>
             <td>${delivery}</td>
             <td style="font-size:0.8rem">${crawlTime}</td>
             <td>${hasScreenshot ? `<button class="btn btn-outline-secondary btn-sm" onclick="showScreenshot('${esc(r.screenshot_path)}')"><i class="bi bi-image"></i></button>` : '-'}</td>

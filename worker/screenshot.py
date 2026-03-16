@@ -26,7 +26,7 @@ logger = logging.getLogger("screenshot_worker")
 
 class ScreenshotWorker:
     def __init__(self, server_url: str, base_dir: str = None,
-                 browsers_count: int = 1, pages_per_browser: int = 5,
+                 browsers_count: int = 1, pages_per_browser: int = 4,
                  proxy_url: str = None):
         self.server_url = server_url
         self.base_dir = base_dir or os.path.join(

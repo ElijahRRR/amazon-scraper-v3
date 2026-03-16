@@ -132,9 +132,10 @@ class Worker:
         )
         self._screenshot_html_dir = os.path.join(self._screenshot_base_dir, "html")
         self._screenshot_process: Optional[asyncio.subprocess.Process] = None
-        self._screenshot_pending_batches: set = set()  # 有截图任务的批次名集合
-        self._screenshot_gate = asyncio.Event()  # 截图批次门控：set=可拉新任务, clear=等截图完成
-        self._screenshot_gate.set()  # 默认开启
+        self._screenshot_lock = asyncio.Lock()  # 防止并发创建多个截图子进程
+        self._screenshot_pending_batches: set = set()
+        self._screenshot_gate = asyncio.Event()
+        self._screenshot_gate.set()
 
         # 设置同步
         self._settings_version = 0
@@ -1371,11 +1372,9 @@ class Worker:
     # ═══════════════════════════════════════════════
 
     async def _ensure_screenshot_process(self):
-        """确保截图子进程已启动，未启动则启动（加锁防止重复创建）"""
+        """确保截图子进程已启动（加锁防止并发创建多个）"""
         if self._screenshot_process and self._screenshot_process.returncode is None:
-            return  # 已在运行
-        if not hasattr(self, '_screenshot_lock'):
-            self._screenshot_lock = asyncio.Lock()
+            return
         async with self._screenshot_lock:
             # 双重检查
             if self._screenshot_process and self._screenshot_process.returncode is None:

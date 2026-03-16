@@ -36,6 +36,7 @@ class ScreenshotWorker:
         self._concurrency = pages_per_browser
         self._browser = None
         self._pw = None
+        self._browser_lock = asyncio.Lock()
         self._render_count = 0
         self._restart_every = 500
         self._running = True
@@ -44,31 +45,37 @@ class ScreenshotWorker:
     # ==================== 浏览器管理 ====================
 
     async def _ensure_browser(self):
-        """懒初始化：只启动 1 个 Playwright + 1 个 Chromium"""
+        """懒初始化：加锁防止并发创建多个实例"""
         if self._browser:
             return
-        from playwright.async_api import async_playwright
-        self._pw = await async_playwright().__aenter__()
-        self._browser = await self._pw.chromium.launch(
-            headless=True,
-            args=["--disable-gpu", "--no-sandbox", "--disable-software-rasterizer",
-                  "--disable-dev-shm-usage", "--disable-extensions"],
-        )
-        logger.info(f"浏览器启动（并发 {self._concurrency}）")
+        async with self._browser_lock:
+            if self._browser:
+                return  # 双重检查
+            from playwright.async_api import async_playwright
+            self._pw = await async_playwright().__aenter__()
+            self._browser = await self._pw.chromium.launch(
+                headless=True,
+                args=["--disable-gpu", "--no-sandbox", "--disable-software-rasterizer",
+                      "--disable-dev-shm-usage", "--disable-extensions"],
+            )
+            logger.info(f"浏览器启动（并发 {self._concurrency}）")
 
     async def _close_browser(self):
-        if self._browser:
+        async with self._browser_lock:
+            b, self._browser = self._browser, None
+            p, self._pw = self._pw, None
+        if b:
             try:
-                await self._browser.close()
+                await b.close()
             except Exception:
                 pass
-            self._browser = None
-        if self._pw:
+        if p:
             try:
-                await self._pw.stop()
+                await p.stop()
             except Exception:
                 pass
-            self._pw = None
+            # 等待 node 进程退出
+            await asyncio.sleep(0.5)
 
     # ==================== 主循环 ====================
 
@@ -137,6 +144,7 @@ class ScreenshotWorker:
 
     async def _render_upload(self, batch_name: str, asin: str, html_path: str):
         png_bytes = None
+        page = None
         try:
             with open(html_path, "r", encoding="utf-8", errors="replace") as f:
                 html = f.read()
@@ -149,7 +157,6 @@ class ScreenshotWorker:
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )
-            await page.close()
 
         except Exception as e:
             err = str(e)
@@ -158,6 +165,12 @@ class ScreenshotWorker:
                 await self._close_browser()
             else:
                 logger.warning(f"渲染失败 {asin}: {e}")
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
         # 上传
         if png_bytes and len(png_bytes) > 0:

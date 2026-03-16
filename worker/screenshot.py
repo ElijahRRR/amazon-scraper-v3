@@ -50,20 +50,27 @@ class ScreenshotWorker:
             return
         async with self._browser_lock:
             if self._browser:
-                return  # 双重检查
+                return
             from playwright.async_api import async_playwright
-            self._pw = await async_playwright().__aenter__()
+            self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.launch(
                 headless=True,
                 args=["--disable-gpu", "--no-sandbox", "--disable-software-rasterizer",
                       "--disable-dev-shm-usage", "--disable-extensions"],
             )
-            logger.info(f"浏览器启动（并发 {self._concurrency}）")
+            # 记录 chromium PID 用于强制清理
+            try:
+                self._chromium_pid = self._browser._impl_obj._browser_process.pid
+            except Exception:
+                self._chromium_pid = None
+            logger.info(f"浏览器启动（并发 {self._concurrency}, pid={self._chromium_pid}）")
 
     async def _close_browser(self):
         async with self._browser_lock:
             b, self._browser = self._browser, None
             p, self._pw = self._pw, None
+            pid = getattr(self, '_chromium_pid', None)
+            self._chromium_pid = None
         if b:
             try:
                 await b.close()
@@ -74,14 +81,32 @@ class ScreenshotWorker:
                 await p.stop()
             except Exception:
                 pass
-            # 等待 node 进程退出
-            await asyncio.sleep(0.5)
+        # 强制确保 chromium 进程退出
+        if pid:
+            import signal
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     # ==================== 主循环 ====================
 
     async def start(self):
         os.makedirs(self.html_dir, exist_ok=True)
         self._http_client = httpx.AsyncClient(timeout=30)
+
+        # 注册退出清理，防止被 kill 时 chromium/node 进程泄漏
+        import atexit, signal
+        def _cleanup():
+            pid = getattr(self, '_chromium_pid', None)
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        atexit.register(_cleanup)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: (_cleanup(), sys.exit(0)))
         logger.info(f"截图进程启动（并发: {self._concurrency}, 监控: {self.html_dir}）")
 
         try:

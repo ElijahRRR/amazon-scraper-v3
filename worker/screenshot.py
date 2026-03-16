@@ -149,9 +149,21 @@ class ScreenshotWorker:
             with open(html_path, "r", encoding="utf-8", errors="replace") as f:
                 html = f.read()
 
+            if not html or len(html) < 500:
+                logger.warning(f"HTML 为空或过短: {asin} ({len(html)}B)")
+                return
+
+            # 注入 <base> 让 CSS/图片的相对路径能正确加载
+            lower = html[:2000].lower()
+            if "<base " not in lower:
+                pos = lower.find("<head")
+                if pos != -1:
+                    close = html.index(">", pos) + 1
+                    html = html[:close] + '<base href="https://www.amazon.com/">' + html[close:]
+
             page = await self._browser.new_page(viewport={"width": 1280, "height": 1300})
             try:
-                await page.set_content(html, wait_until="domcontentloaded", timeout=5000)
+                await page.set_content(html, wait_until="domcontentloaded", timeout=8000)
             except Exception:
                 pass
             await page.wait_for_timeout(3000)

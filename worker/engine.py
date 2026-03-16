@@ -126,7 +126,7 @@ class Worker:
 
         # 截图：独立子进程架构（采集与截图完全隔离事件循环）
         self._browsers_count = 1             # 截图浏览器实例数
-        self._pages_per_browser = 1          # 每个浏览器并发 page 数（1=低CPU占用）
+        self._pages_per_browser = 3          # 每个浏览器并发 page 数
         self._screenshot_base_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
         )

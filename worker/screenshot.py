@@ -154,6 +154,7 @@ class ScreenshotWorker:
                 await page.set_content(html, wait_until="domcontentloaded", timeout=5000)
             except Exception:
                 pass
+            await page.wait_for_timeout(3000)
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )

@@ -166,13 +166,8 @@ class ScreenshotWorker:
             except Exception:
                 pass
 
-            # 等待主图加载
-            try:
-                await page.wait_for_selector("#landingImage, #imgBlkFront, #imgTagWrapperId img",
-                                             state="attached", timeout=3000)
-                await page.wait_for_timeout(500)
-            except Exception:
-                pass
+            # 等待主图加载（1秒）
+            await page.wait_for_timeout(1000)
 
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}

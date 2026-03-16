@@ -142,21 +142,30 @@ class ScreenshotWorker:
 
     # ==================== 单张截图：渲染 → 上传 → 清理 ====================
 
-    async def _render_upload(self, batch_name: str, asin: str, html_path: str):
-        png_bytes = None
+    async def _render_one(self, html: str, asin: str) -> tuple:
+        """渲染单张截图，返回 (png_bytes, has_content)"""
         page = None
         try:
-            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
-                html = f.read()
-
             page = await self._browser.new_page(viewport={"width": 1280, "height": 1300})
             try:
                 await page.set_content(html, wait_until="domcontentloaded", timeout=5000)
             except Exception:
                 pass
+
+            # 空白检测
+            has_content = await page.evaluate("""() => {
+                if (!document.body) return false;
+                const text = document.body.innerText || '';
+                if (text.trim().length > 50) return true;
+                const imgs = document.querySelectorAll('img[src]');
+                if (imgs.length > 0) return true;
+                return false;
+            }""")
+
             png_bytes = await page.screenshot(
                 type="png", clip={"x": 0, "y": 0, "width": 1280, "height": 1300}
             )
+            return png_bytes, has_content
 
         except Exception as e:
             err = str(e)
@@ -165,12 +174,45 @@ class ScreenshotWorker:
                 await self._close_browser()
             else:
                 logger.warning(f"渲染失败 {asin}: {e}")
+            return None, False
         finally:
             if page:
                 try:
                     await page.close()
                 except Exception:
                     pass
+
+    async def _render_upload(self, batch_name: str, asin: str, html_path: str):
+        # 读取 HTML
+        try:
+            with open(html_path, "r", encoding="utf-8", errors="replace") as f:
+                html = f.read()
+        except FileNotFoundError:
+            logger.warning(f"HTML 不存在: {asin}")
+            return
+
+        if not html or len(html) < 500:
+            logger.warning(f"HTML 为空或过短: {asin} ({len(html)}B)")
+            try:
+                os.remove(html_path)
+            except OSError:
+                pass
+            return
+
+        # 渲染 + 空白检测 + 重试（最多 3 次）
+        png_bytes = None
+        for attempt in range(3):
+            png_bytes, has_content = await self._render_one(html, asin)
+
+            if png_bytes and (len(png_bytes) >= 10240 or has_content):
+                break  # 截图正常
+
+            if png_bytes and len(png_bytes) < 10240 and not has_content:
+                logger.warning(f"空白截图 {asin} ({len(png_bytes)}B) 第{attempt+1}次，重试...")
+                png_bytes = None
+                await asyncio.sleep(1)
+            else:
+                break  # 渲染失败（非空白），不重试
 
         # 上传
         if png_bytes and len(png_bytes) > 0:
@@ -184,7 +226,7 @@ class ScreenshotWorker:
             else:
                 logger.warning(f"上传失败: {asin}")
         else:
-            logger.warning(f"渲染失败: {asin}")
+            logger.warning(f"截图最终失败: {asin}")
             try:
                 await self._http_client.post(
                     f"{self.server_url}/api/tasks/screenshot/fail",

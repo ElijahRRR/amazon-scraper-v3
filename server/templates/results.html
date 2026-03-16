@@ -54,8 +54,9 @@
                 </select>
             </div>
             <div class="col-md-3">
-                <label class="form-label">搜索</label>
-                <input type="text" id="searchInput" class="form-control" placeholder="ASIN 或标题...">
+                <label class="form-label">搜索（支持批量，换行或逗号分隔）</label>
+                <textarea id="searchInput" class="form-control" rows="1" placeholder="ASIN / 标题 / 品牌，多个用换行或逗号分隔"
+                          style="resize:vertical; min-height:38px;"></textarea>
             </div>
             <div class="col-md-1">
                 <label class="form-label">&nbsp;</label>
@@ -66,6 +67,9 @@
                 <div class="d-flex justify-content-end gap-1">
                     <button class="btn btn-outline-accent btn-sm" onclick="exportResults()">
                         <i class="bi bi-download"></i> 导出
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm" onclick="clearData()">
+                        <i class="bi bi-trash3"></i> 清空数据
                     </button>
                 </div>
             </div>
@@ -207,7 +211,9 @@ async function loadChangeStats() {
 }
 
 async function loadResults(cursor = null, direction = 'next') {
-    state.search = document.getElementById('searchInput').value;
+    // 批量搜索：换行/逗号分隔 → 逗号连接
+    const rawSearch = document.getElementById('searchInput').value.trim();
+    state.search = rawSearch.split(/[\n,]+/).map(s => s.trim()).filter(s => s).join(',');
     state.changeFilter = document.getElementById('changeFilter').value;
 
     let url = `/api/results?limit=50&change_filter=${state.changeFilter}&direction=${direction}`;
@@ -280,7 +286,7 @@ function renderResults(items) {
         const fbaCell = fba === 'FBA'
             ? '<span class="badge-status badge-done">FBA</span>'
             : fba === 'FBM'
-                ? '<span class="badge-status badge-failed">FBM</span>'
+                ? '<span class="badge-status badge-pending">FBM</span>'
                 : esc(fba);
 
         html += `<tr>
@@ -321,6 +327,23 @@ async function exportResults() {
         url = '/api/export/all';
     }
     window.open(url, '_blank');
+}
+
+async function clearData() {
+    const choice = confirm('确定清空所有采集数据和截图？此操作不可恢复！');
+    if (!choice) return;
+    try {
+        const resp = await fetch('/api/database', { method: 'DELETE' });
+        const data = await resp.json();
+        if (resp.ok) {
+            alert('数据已清空');
+            location.reload();
+        } else {
+            alert('清空失败: ' + (data.detail || '未知错误'));
+        }
+    } catch(e) {
+        alert('网络错误: ' + e.message);
+    }
 }
 </script>
 {% endblock %}

@@ -683,10 +683,19 @@ class Database:
             count_join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
             params.append(batch_id)
 
-        # 搜索
+        # 搜索（支持逗号分隔的批量搜索）
         if search:
-            where_parts.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
-            params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
+            terms = [t.strip() for t in search.split(",") if t.strip()]
+            if len(terms) == 1:
+                where_parts.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
+                params.extend([f"%{terms[0]}%", f"%{terms[0]}%", f"%{terms[0]}%"])
+            elif terms:
+                # 批量：每个词匹配 asin/title/brand，用 OR 连接
+                or_clauses = []
+                for t in terms:
+                    or_clauses.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
+                    params.extend([f"%{t}%", f"%{t}%", f"%{t}%"])
+                where_parts.append(f"({' OR '.join(or_clauses)})")
 
         # 变动筛选 - 通过 asin_changes JOIN（核心优化）
         if change_filter == "price_stock":

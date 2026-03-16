@@ -814,6 +814,26 @@ async def api_diagnostic():
     }
 
 
+@app.delete("/api/database")
+async def api_clear_database():
+    """清空所有数据 + 截图文件"""
+    import shutil
+    async with db._write_lock:
+        await db._db.execute("BEGIN")
+        for table in ["asin_changes", "asin_data", "batch_asins", "tasks", "screenshots", "batches"]:
+            await db._db.execute(f"DELETE FROM {table}")
+        await db._db.execute("DELETE FROM sqlite_sequence")
+        await db._db.execute("COMMIT")
+
+    # 清理截图文件
+    ss_dir = config.SCREENSHOT_DIR
+    if os.path.isdir(ss_dir):
+        shutil.rmtree(ss_dir)
+        os.makedirs(ss_dir, exist_ok=True)
+
+    return {"ok": True}
+
+
 # ==================== 入口 ====================
 
 def main():

@@ -512,11 +512,17 @@ async def api_pull_tasks(request: Request,
     # enable_screenshot 来自 worker 的 query param，更新 registry
     _register_worker(worker_id, enable_screenshot=enable_screenshot, ip=ip)
 
+    # ns=None: 不限制; ns=False: 只拉不需要截图的任务
+    # enable_screenshot 表示 worker 是否有截图能力：
+    #   True  → 拉所有任务 (ns=None)
+    #   False → 只拉不需要截图的 (ns=False)
     ns = None
     if needs_screenshot is not None:
         ns = needs_screenshot
     elif enable_screenshot is not None:
-        ns = enable_screenshot
+        if not enable_screenshot:
+            ns = False
+        # enable_screenshot=True → ns=None (拉所有任务)
     elif worker_id in _worker_registry:
         if not _worker_registry[worker_id].get("enable_screenshot", True):
             ns = False

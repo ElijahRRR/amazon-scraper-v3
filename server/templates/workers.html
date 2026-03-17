@@ -202,8 +202,8 @@
                         '<div class="wm-item"><span class="wm-label">IP 地址</span><span class="wm-value" style="font-family:monospace;font-size:0.75rem">' + ipText + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">配额并发</span><span class="wm-value">' + val(w.quota_concurrency) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">配额 QPS</span><span class="wm-value">' + val(w.quota_qps, '', 1) + '</span></div>' +
-                        '<div class="wm-item"><span class="wm-label">成功率</span><span class="wm-value ' + successRateClass(w.success_rate) + '">' + val(w.success_rate, '%', 1) + '</span></div>' +
-                        '<div class="wm-item"><span class="wm-label">封锁率</span><span class="wm-value ' + blockRateClass(w.block_rate) + '">' + val(w.block_rate, '%', 1) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">请求成功率</span><span class="wm-value ' + successRateClass(w.success_rate != null ? w.success_rate * 100 : null) + '">' + val(w.success_rate != null ? w.success_rate * 100 : null, '%', 1) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">封锁率</span><span class="wm-value ' + blockRateClass(w.block_rate != null ? w.block_rate * 100 : null) + '">' + val(w.block_rate != null ? w.block_rate * 100 : null, '%', 1) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">延迟 p50</span><span class="wm-value">' + val(w.latency_p50, 's', 1) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">在飞请求</span><span class="wm-value">' + val(w.inflight) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">采集速度</span><span class="wm-value" style="color:var(--accent)">' + calcWorkerSpeed(w) + '</span></div>' +

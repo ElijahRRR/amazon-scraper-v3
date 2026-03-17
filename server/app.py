@@ -475,8 +475,6 @@ async def api_pull_tasks(request: Request,
                          needs_screenshot: Optional[bool] = Query(None)):
     ip = request.client.host if request.client else None
     _register_worker(worker_id, ip=ip)
-    if worker_id in _worker_registry:
-        _worker_registry[worker_id]["tasks_pulled"] += count
 
     ns = None
     if needs_screenshot is not None:
@@ -486,6 +484,8 @@ async def api_pull_tasks(request: Request,
             ns = False
 
     tasks = await db.pull_tasks(worker_id, count, ns)
+    if worker_id in _worker_registry:
+        _worker_registry[worker_id]["tasks_pulled"] += len(tasks)
     return {"tasks": tasks}
 
 

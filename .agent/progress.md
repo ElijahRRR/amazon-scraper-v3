@@ -298,3 +298,28 @@
   - none
 - Next action:
   - Present the report summary to the user and wait for optimization direction.
+
+### Session: 2026-03-17T05:18:26Z
+- Target item id: F-005
+- Objective: Shut down the live `8899` runtime processes on user request
+- Baseline status: the prior turn had been aborted, which already terminated the `run_server.py`, `run_worker.py`, and monitor exec sessions; only one orphan screenshot subprocess remained
+- Work performed:
+  - Recovered the live process state with `ps`.
+  - Confirmed `run_server.py`, all `loadtest-stage*` workers, and the monitor were already gone.
+  - Sent `SIGTERM` to the leftover orphan screenshot child `worker/screenshot.py` (`pid=59185`).
+- Verification commands:
+  - `ps -Ao pid,ppid,pgid,etime,command | rg 'run_server.py|run_worker.py --server http://127.0.0.1:8899 --worker-id loadtest-stage|worker/screenshot.py http://127.0.0.1:8899|batch_runtime_monitor.py'`
+  - `kill -TERM 59185`
+  - `ps -Ao pid,ppid,pgid,etime,command | rg 'run_server.py|run_worker.py --server http://127.0.0.1:8899 --worker-id loadtest-stage|worker/screenshot.py http://127.0.0.1:8899|batch_runtime_monitor.py'`
+- Verification result:
+  - pass (`run_server.py` absent)
+  - pass (all `loadtest-stage*` workers absent)
+  - pass (`worker/screenshot.py http://127.0.0.1:8899` absent after `SIGTERM`)
+  - pass (monitor process absent)
+- Evidence paths:
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+- Blockers:
+  - none
+- Next action:
+  - Wait for the user's next instruction; the runtime is fully stopped.

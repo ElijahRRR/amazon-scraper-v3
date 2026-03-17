@@ -947,6 +947,11 @@ class Worker:
                     self._recovery_jitter = jitter
                     self._controller._recovery_jitter = jitter
 
+                # === 软重启指令 ===
+                if s.get("restart"):
+                    logger.info("🔄 收到软重启指令，重建 session...")
+                    await self._soft_restart()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1513,6 +1518,35 @@ class Worker:
                 logger.info(f"📸 截图批次已上传: {completed}")
                 if not self._screenshot_pending_batches:
                     self._screenshot_gate.set()
+
+    async def _soft_restart(self):
+        """软重启：重建 session（新指纹、新 cookies），不停止采集协程"""
+        try:
+            # 关闭当前 session
+            if self._session:
+                await self._session.close()
+                self._session = None
+            # 关闭备用 session
+            if hasattr(self, '_standby_session') and self._standby_session:
+                await self._standby_session.close()
+                self._standby_session = None
+
+            # 重建 session
+            await self._init_session_tps()
+
+            # 重置 AIMD 控制器
+            self._controller._concurrency = config.INITIAL_CONCURRENCY
+            await self._controller._resize_semaphore(
+                self._controller.current_concurrency, config.INITIAL_CONCURRENCY)
+            self._controller._cooldown_until = 0
+
+            # 重置统计
+            self._stats = {"success": 0, "failed": 0, "total": 0}
+            self._success_since_rotate = 0
+
+            logger.info(f"🔄 软重启完成: 新 session 已就绪, 并发重置为 {config.INITIAL_CONCURRENCY}")
+        except Exception as e:
+            logger.error(f"🔄 软重启失败: {e}")
 
     async def _stop_screenshot_process(self):
         """停止截图子进程"""

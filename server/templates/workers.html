@@ -182,6 +182,9 @@
         const badge = isOnline
             ? '<span class="badge-status badge-online"><i class="bi bi-circle-fill"></i> 在线</span>'
             : '<span class="badge-status badge-offline"><i class="bi bi-circle-fill"></i> 离线</span>';
+        const restartBtn = isOnline
+            ? '<button class="btn btn-outline-warning btn-sm ms-1" onclick="restartWorker(\'' + safeId + '\')" title="软重启"><i class="bi bi-arrow-clockwise"></i></button>'
+            : '';
         const deleteBtn = isOnline ? '' :
             '<button class="btn btn-outline-danger btn-sm ms-auto" onclick="removeWorker(\'' + safeId + '\')" title="移除"><i class="bi bi-x-lg"></i></button>';
 
@@ -195,7 +198,7 @@
                 '<div class="card-header d-flex align-items-center gap-2 py-2">' +
                     '<i class="bi bi-pc-display" style="color:var(--accent)"></i>' +
                     '<strong style="font-size:0.9rem" class="text-truncate">' + safeId + '</strong>' +
-                    screenshotBadge + badge + deleteBtn +
+                    screenshotBadge + badge + restartBtn + deleteBtn +
                 '</div>' +
                 '<div class="card-body py-2 px-3">' +
                     '<div class="worker-metrics">' +
@@ -269,6 +272,14 @@
     window.clearOffline = async function() {
         const resp = await fetch('/api/workers', { method: 'DELETE' });
         const data = await resp.json();
+        refresh();
+    };
+
+    window.restartWorker = async function(workerId) {
+        if (!confirm(`确定软重启 ${workerId}？将重建 session（新指纹、新 cookies），采集不中断。`)) return;
+        const resp = await fetch('/api/workers/' + encodeURIComponent(workerId) + '/restart', { method: 'POST' });
+        const data = await resp.json();
+        alert(data.message || '指令已下发');
         refresh();
     };
 })();

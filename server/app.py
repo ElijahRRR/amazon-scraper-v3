@@ -45,6 +45,9 @@ _SETTINGS_FILE = os.path.join(config.PROJECT_DIR, "runtime_settings.json")
 # 全局并发协调
 _global_coordinator: Dict[str, Dict] = {}
 
+# Worker 重启标记
+_worker_restart_flags: Dict[str, bool] = {}
+
 
 def _default_settings() -> dict:
     return {
@@ -456,6 +459,13 @@ async def api_delete_all_offline():
     return {"ok": True, "removed": len(offline)}
 
 
+@app.post("/api/workers/{worker_id}/restart")
+async def api_restart_worker(worker_id: str):
+    """标记 worker 软重启（下次 sync 时生效）"""
+    _worker_restart_flags[worker_id] = True
+    return {"ok": True, "message": f"重启指令已下发，{worker_id} 将在 30 秒内重启"}
+
+
 @app.post("/api/settings/reset")
 async def api_reset_settings():
     """恢复默认设置"""
@@ -609,10 +619,14 @@ async def api_worker_sync(request: Request):
 
     quota = _global_coordinator.get(worker_id, {}).get("quota", {})
 
+    # 检查重启标记
+    restart = _worker_restart_flags.pop(worker_id, False)
+
     return {
         "settings": _runtime_settings,
         "settings_version": _settings_version,
         "quota": quota,
+        "restart": restart,
     }
 
 

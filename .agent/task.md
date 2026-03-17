@@ -1,14 +1,14 @@
 # Task Definition
 
 - Mode: build
-- Task: Monitor the live 260k-item batch with 4 workers and produce a completion-time stability report
+- Task: Verify the newly added server-triggered worker soft-restart functionality
 - Constraints:
-  - Do not interrupt or reset the active large batch unless monitoring is otherwise impossible.
-  - Collect evidence from live server/worker behavior, not just static code inspection.
-  - Persist monitoring state so the report can still be generated after a long run.
+  - Prefer end-to-end verification over static inspection only.
+  - Keep the verification isolated from any long-running production batch state.
+  - If a defect is found, fix only what is necessary to make the restart path usable and re-verify.
 - Acceptance Criteria:
-  - Identify the active target batch and expand to 4 workers total.
-  - Record minute-level snapshots of batch progress, worker registry state, process health, and live log anomalies until the batch completes.
-  - Generate a report at completion focused on stability, throughput, suspected bugs, and operator-visible issues.
+  - A server-side restart request reaches the target worker through `/api/worker/sync`.
+  - The worker performs `_soft_restart()` successfully, recreates its session, and remains online.
+  - Verification includes concrete server responses and worker log evidence.
 - Out of Scope:
-  - Product/business decisions about which optimization strategy to apply after the report is delivered.
+  - Broader worker-management redesign beyond validating this restart feature.

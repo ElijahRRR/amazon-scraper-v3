@@ -1,17 +1,10 @@
 """
-Amazon 产品采集系统 v2 - Session 管理模块
+Amazon 产品采集系统 v3 - Session 管理模块
 使用 curl_cffi 模拟浏览器 TLS 指纹
 正确实现邮编设置（POST 到 address-change.html）
 Cookie jar 管理
 
-支持两种工作方式：
-- TPS 模式：单个 AmazonSession，全局共享
-- 隧道模式：SessionPool，多 Session 槽位（每个通道独立出口 IP）
-
-隧道模式关键设计：
-- 每个 Session 通过 password:channel_id 指定独立通道 → 独立出口 IP
-- 每个 Session 有独立的 Cookie / 指纹，最大化反爬效果
-- IP 轮换后滚动重建：逐个替换 Session，不中断服务
+TPS 模式：单个 AmazonSession，全局共享，每次请求自动换 IP
 """
 import asyncio
 import random
@@ -46,17 +39,15 @@ class AmazonSession:
     ZIP_CHANGE_URL = "https://www.amazon.com/gp/delivery/ajax/address-change.html"
 
     def __init__(self, proxy_manager: ProxyManager, zip_code: str = None,
-                 proxy_url: str = None, max_clients: int = None):
+                 max_clients: int = None):
         """
         Args:
             proxy_manager: 代理管理器
             zip_code: 配送邮编
-            proxy_url: 直接指定代理 URL（隧道模式由 SessionPool 传入）
             max_clients: 连接池大小（HTTP/1.1 下为最大 TCP 连接数）
         """
         self.proxy_manager = proxy_manager
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
-        self._fixed_proxy_url = proxy_url  # 隧道模式：固定代理 URL
         self._max_clients = max_clients or config.MAX_CLIENTS
         self._session: Optional[AsyncSession] = None
         self._initialized = False
@@ -84,10 +75,6 @@ class AmazonSession:
         3. POST 设置邮编
 
         带锁保护：多个协程同时调用时，只有第一个执行初始化，其余等待并复用结果
-
-        代理获取方式：
-        - TPS 模式: 通过 proxy_manager.get_proxy() 动态获取
-        - 隧道模式: 使用构造时传入的 _fixed_proxy_url（统一隧道地址）
         """
         async with self._init_lock:
             if self._initialized:
@@ -95,11 +82,7 @@ class AmazonSession:
 
             for init_attempt in range(3):
                 try:
-                    if self._fixed_proxy_url:
-                        proxy = self._fixed_proxy_url
-                    else:
-                        proxy_result = await self.proxy_manager.get_proxy()
-                        proxy = proxy_result[0] if isinstance(proxy_result, tuple) else proxy_result
+                    proxy = await self.proxy_manager.get_proxy()
 
                     self._session = AsyncSession(
                         impersonate=self._impersonate,
@@ -139,8 +122,7 @@ class AmazonSession:
                         logger.warning(f"⚠️ 邮编设置 3 次全失败，放弃当前代理 (初始化 {init_attempt+1}/3)")
                         await self._session.close()
                         self._session = None
-                        if not self._fixed_proxy_url:
-                            await self.proxy_manager.report_blocked()
+                        await self.proxy_manager.report_blocked()
                         await asyncio.sleep(2)
                         continue
 
@@ -150,8 +132,7 @@ class AmazonSession:
                         logger.warning(f"⚠️ 邮编验证失败（页面未反映 {self.zip_code}），放弃当前代理 (初始化 {init_attempt+1}/3)")
                         await self._session.close()
                         self._session = None
-                        if not self._fixed_proxy_url:
-                            await self.proxy_manager.report_blocked()
+                        await self.proxy_manager.report_blocked()
                         await asyncio.sleep(2)
                         continue
 
@@ -474,187 +455,3 @@ class AmazonSession:
         }
 
 
-class SessionPool:
-    """
-    隧道模式 Session 池
-
-    每个 Session 通过 password:channel_id 指定独立代理通道，
-    拥有独立出口 IP + 独立 Cookie / 指纹，最大化反爬效果。
-    带宽从单通道 3Mbps 提升至多通道 5Mbps。
-
-    IP 轮换后滚动重建 Session：
-    - 逐个创建新 Session（后台并行，最多 3 个同时初始化）
-    - 新 Session 就绪后原子替换旧的
-    - 旧 Session 在替换后延迟关闭（等待进行中的请求完成）
-    - 整个过程不中断服务
-    """
-
-    def __init__(self, proxy_manager: ProxyManager, zip_code: str = None):
-        self.proxy_manager = proxy_manager
-        self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
-        self._sessions: Dict[int, AmazonSession] = {}
-        self._init_locks: Dict[int, asyncio.Lock] = {}
-
-        for ch_id in range(1, config.TUNNEL_CHANNELS + 1):
-            self._init_locks[ch_id] = asyncio.Lock()
-
-    async def _create_channel_session(self, channel_id: int) -> Optional[AmazonSession]:
-        """创建单个通道 Session：关闭旧 session → 构建 proxy_url → 创建 → 初始化 → 存储。"""
-        if channel_id in self._sessions:
-            await self._sessions[channel_id].close()
-            del self._sessions[channel_id]
-
-        proxy_url = self.proxy_manager.get_channel_proxy_url(channel_id)
-        if not proxy_url:
-            proxy_url = self.proxy_manager.get_tunnel_proxy_url()
-        session = AmazonSession(
-            self.proxy_manager,
-            zip_code=self.zip_code,
-            proxy_url=proxy_url,
-            max_clients=config.PER_CHANNEL_MAX_CONCURRENCY + 2,
-        )
-        ok = await session.initialize()
-        if ok:
-            self._sessions[channel_id] = session
-            return session
-        await session.close()
-        return None
-
-    async def get_session(self, channel_id: int) -> Optional[AmazonSession]:
-        """获取指定槽位的 Session，不存在或未就绪则创建。"""
-        if channel_id in self._sessions and self._sessions[channel_id].is_ready():
-            return self._sessions[channel_id]
-
-        if channel_id not in self._init_locks:
-            self._init_locks[channel_id] = asyncio.Lock()
-
-        async with self._init_locks[channel_id]:
-            if channel_id in self._sessions and self._sessions[channel_id].is_ready():
-                return self._sessions[channel_id]
-            session = await self._create_channel_session(channel_id)
-            if session:
-                logger.info(f"✅ 槽位 {channel_id} Session 就绪")
-            else:
-                logger.warning(f"⚠️ 槽位 {channel_id} Session 初始化失败")
-            return session
-
-    async def rebuild_session(self, channel_id: int) -> bool:
-        """重建指定槽位的 Session（IP 轮换后或被封后调用）。"""
-        if channel_id not in self._init_locks:
-            self._init_locks[channel_id] = asyncio.Lock()
-
-        async with self._init_locks[channel_id]:
-            session = await self._create_channel_session(channel_id)
-            if session:
-                logger.info(f"🔄 槽位 {channel_id} Session 重建成功")
-                return True
-            logger.warning(f"⚠️ 槽位 {channel_id} Session 重建失败")
-            return False
-
-    async def rolling_rebuild(self, batch_size: int = 2,
-                              per_session_timeout: float = 30.0):
-        """
-        分批滚动重建所有 Session（IP 轮换后调用）。
-
-        优化设计：
-        - 每批只重建 batch_size 个 Session（默认 2），不同时重建所有
-        - 旧 Session 在新 Session 就绪后才替换（原子替换 + 延迟关闭）
-        - 每批之间间隔 1s，错开 HTTP 初始化请求，减少代理带宽争抢
-        - 整个过程不中断服务：未重建的 Session 继续正常工作
-        """
-        if not self.proxy_manager.get_tunnel_proxy_url():
-            logger.warning("🔄 隧道代理地址为空，跳过滚动重建")
-            return
-
-        channels = list(range(1, config.TUNNEL_CHANNELS + 1))
-        success_count = 0
-        total = len(channels)
-
-        logger.info(f"🔄 分批滚动重建 {total} 个 Session（每批 {batch_size} 个）...")
-
-        async def _rebuild_one(ch_id: int):
-            try:
-                old_session = self._sessions.get(ch_id)
-                new_session = await asyncio.wait_for(
-                    self._create_channel_session(ch_id),
-                    timeout=per_session_timeout,
-                )
-                if new_session:
-                    if old_session:
-                        await asyncio.sleep(2)
-                        try:
-                            await old_session.close()
-                        except Exception:
-                            pass
-                    return True
-                logger.warning(f"⚠️ 槽位 {ch_id} 重建失败")
-                return False
-            except asyncio.TimeoutError:
-                logger.warning(f"⚠️ 槽位 {ch_id} 重建超时 ({per_session_timeout}s)")
-                return False
-            except Exception as e:
-                logger.error(f"❌ 槽位 {ch_id} 重建异常: {e}")
-                return False
-
-        # 分批执行：每批 batch_size 个，批间间隔 1s
-        for i in range(0, total, batch_size):
-            batch = channels[i:i + batch_size]
-            results = await asyncio.gather(
-                *[_rebuild_one(ch_id) for ch_id in batch],
-                return_exceptions=True,
-            )
-            for r in results:
-                if r is True:
-                    success_count += 1
-            # 批间间隔（最后一批不等）
-            if i + batch_size < total:
-                await asyncio.sleep(1)
-
-        logger.info(f"🔄 滚动重建完成: {success_count}/{total} 个 Session 就绪")
-
-    async def rebuild_all(self, timeout: float = 15.0):
-        """
-        向后兼容：调用 rolling_rebuild。
-        """
-        await self.rolling_rebuild(per_session_timeout=timeout)
-
-    async def close_all(self):
-        """关闭所有 Session"""
-        for session in self._sessions.values():
-            await session.close()
-        self._sessions.clear()
-        logger.info("🔒 所有 Session 已关闭")
-
-    async def resize(self, target_channels: int):
-        """运行时调整 Session 槽位数量（缩容时关闭多余槽位）。"""
-        target = max(1, int(target_channels))
-
-        # 缩容：关闭并删除超出目标编号的会话
-        to_remove = [ch_id for ch_id in self._sessions if ch_id > target]
-        for ch_id in to_remove:
-            try:
-                await self._sessions[ch_id].close()
-            finally:
-                self._sessions.pop(ch_id, None)
-
-        # 同步 lock 集合
-        self._init_locks = {ch_id: lock for ch_id, lock in self._init_locks.items() if ch_id <= target}
-        for ch_id in range(1, target + 1):
-            self._init_locks.setdefault(ch_id, asyncio.Lock())
-
-    @property
-    def ready_count(self) -> int:
-        """就绪的槽位数"""
-        return sum(1 for s in self._sessions.values() if s.is_ready())
-
-    @property
-    def stats(self) -> Dict:
-        """获取所有槽位的统计信息"""
-        return {
-            "total_channels": config.TUNNEL_CHANNELS,
-            "ready": self.ready_count,
-            "channels": {
-                ch_id: session.stats
-                for ch_id, session in self._sessions.items()
-            },
-        }

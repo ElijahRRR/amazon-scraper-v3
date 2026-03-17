@@ -53,8 +53,6 @@ TOKEN_BUCKET_RATE = 64.0
 INITIAL_CONCURRENCY = 16
 MIN_CONCURRENCY = 16
 MAX_CONCURRENCY = 32
-TUNNEL_MAX_CONCURRENCY = MAX_CONCURRENCY
-TUNNEL_INITIAL_CONCURRENCY = INITIAL_CONCURRENCY
 
 PROXY_BANDWIDTH_MBPS = 0
 ADJUST_INTERVAL_S = 3
@@ -73,17 +71,8 @@ TASK_PREFETCH_THRESHOLD = 0.5
 # ============================================================
 # 代理配置
 # ============================================================
-# v3: 统一 TPS 模式（每次请求自动换 IP）
-PROXY_MODE = "tps"
-# 代理地址（帐密模式）: http://user:pwd@host:port
-PROXY_URL = os.environ.get("PROXY_URL", os.environ.get("TUNNEL_PROXY_URL", ""))
-# 兼容 v2 引用
-TUNNEL_PROXY_URL = PROXY_URL
-TUNNEL_CHANNELS = 1
-TUNNEL_ROTATE_INTERVAL = 60
-TUNNEL_MAX_CONCURRENCY = MAX_CONCURRENCY
-TUNNEL_INITIAL_CONCURRENCY = INITIAL_CONCURRENCY
-PROXY_REFRESH_INTERVAL = 30
+# TPS 模式（每次请求自动换 IP）
+PROXY_URL = os.environ.get("PROXY_URL", "")
 
 # ============================================================
 # 浏览器指纹
@@ -214,5 +203,4 @@ EXPORT_COLUMN_ORDER = [
 # 启动校验
 # ============================================================
 assert MIN_CONCURRENCY <= INITIAL_CONCURRENCY <= MAX_CONCURRENCY
-assert MIN_CONCURRENCY <= TUNNEL_INITIAL_CONCURRENCY <= TUNNEL_MAX_CONCURRENCY
 assert TARGET_LATENCY_S < MAX_LATENCY_S

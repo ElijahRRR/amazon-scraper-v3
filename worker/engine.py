@@ -26,10 +26,10 @@ import httpx
 
 from common import config
 from worker.proxy import get_proxy_manager
-from worker.session import AmazonSession, SessionPool
+from worker.session import AmazonSession
 from worker.parser import AmazonParser as _ParserClass
 from worker.metrics import MetricsCollector
-from worker.adaptive import AdaptiveController, TokenBucket, ChannelRateLimiter
+from worker.adaptive import AdaptiveController, TokenBucket
 
 # 日志配置
 logging.basicConfig(
@@ -50,31 +50,16 @@ class Worker:
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
         self._enable_screenshot = enable_screenshot
 
-        # 代理模式
-        self._proxy_mode = config.PROXY_MODE
-
         # 组件
         self.proxy_manager = get_proxy_manager()
         self.parser = _ParserClass()
-        self._session: Optional[AmazonSession] = None       # TPS 模式
-        self._session_pool: Optional[SessionPool] = None    # 隧道模式
+        self._session: Optional[AmazonSession] = None
+        self._rate_limiter = TokenBucket()
 
-        # 速率控制：TPS 用全局令牌桶，DPS 用 per-channel 独立令牌桶
-        if self._proxy_mode == "tunnel":
-            self._rate_limiter = None  # tunnel 模式不使用全局限流
-            self._channel_rate_limiter = ChannelRateLimiter()
-        else:
-            self._rate_limiter = TokenBucket()
-            self._channel_rate_limiter = None
-
-        # 自适应并发控制（tunnel 模式使用更高的并发上限）
+        # 自适应并发控制
         self._metrics = MetricsCollector()
-        if self._proxy_mode == "tunnel":
-            max_c = concurrency or getattr(config, "TUNNEL_MAX_CONCURRENCY", 48)
-            initial_c = getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16)
-        else:
-            max_c = concurrency or config.MAX_CONCURRENCY
-            initial_c = config.INITIAL_CONCURRENCY
+        max_c = concurrency or config.MAX_CONCURRENCY
+        initial_c = config.INITIAL_CONCURRENCY
         self._controller = AdaptiveController(
             initial=initial_c,
             min_c=config.MIN_CONCURRENCY,
@@ -163,8 +148,7 @@ class Worker:
         logger.info(f"   并发范围: [{config.MIN_CONCURRENCY}, {self._controller._max}]")
         logger.info(f"   邮编: {self.zip_code}")
         logger.info(f"   截图功能: {'开启' if self._enable_screenshot else '关闭'}")
-        logger.info(f"   代理模式: {self._proxy_mode.upper()}"
-                     + (f" ({1} 通道)" if self._proxy_mode == "tunnel" else ""))
+        logger.info(f"   代理模式: TPS")
 
         self._running = True
         self._stats["start_time"] = time.time()
@@ -176,11 +160,7 @@ class Worker:
         # 启动前先从 Server 拉取设置（代理地址、邮编等），远程 Worker 无需本地配置
         await self._pull_initial_settings()
 
-        # DPS 模式注意：控制器在 __init__ 时以 config.PROXY_MODE 模式创建，
-        # 若初始同步切换了模式，_sync_controller_mode_profile 会重建控制器
-        # tunnel 模式使用 per-channel AIMD（每通道独立信号量+metrics）
-
-        # 初始化 session（此时 proxy_api_url 已从 Server 同步）
+        # 初始化 session（此时 proxy_url 已从 Server 同步）
         await self._init_session()
 
         # 启动自适应控制器
@@ -194,13 +174,8 @@ class Worker:
                 self._batch_submitter(),     # 3. 批量回传结果
                 self._screenshot_gate_monitor(),  # 4. 截图完成监控（检查子进程标记）
                 self._settings_sync(),       # 5. 定期同步服务端设置
+                self._standby_warmer(),      # 6. 热备 session 预热
             ]
-            # 隧道模式：添加 IP 轮换监控协程
-            if self._proxy_mode == "tunnel":
-                coroutines.append(self._ip_rotation_watcher())
-            # TPS 模式：添加热备 session 预热协程
-            if self._proxy_mode == "tps":
-                coroutines.append(self._standby_warmer())
             await asyncio.gather(*coroutines)
         except asyncio.CancelledError:
             pass
@@ -454,47 +429,8 @@ class Worker:
                 # 由 Server 端超时回收机制自动重置为 pending 重新分发
                 await asyncio.sleep(1)
 
-    async def _sync_controller_mode_profile(self, mode: str):
-        """代理模式切换时，重建自适应控制器和速率限流器。
-
-        AdaptiveController 在 __init__ 时根据 config.PROXY_MODE 决定是否创建
-        per-channel 控制器。模式切换后必须重建控制器，否则 TPS→tunnel 切换后
-        仍使用全局单信号量而非 per-channel AIMD。
-        """
-        # 停止旧控制器（热切换时有正在运行的后台任务）
-        old_controller = self._controller
-        await old_controller.stop()
-
-        # 重建 AdaptiveController（config.PROXY_MODE 已在调用前设置）
-        if mode == "tunnel":
-            max_c = getattr(config, "TUNNEL_MAX_CONCURRENCY", 48)
-            initial_c = getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16)
-        else:
-            max_c = config.MAX_CONCURRENCY
-            initial_c = config.INITIAL_CONCURRENCY
-
-        self._controller = AdaptiveController(
-            initial=initial_c,
-            min_c=config.MIN_CONCURRENCY,
-            max_c=max_c,
-            metrics=self._metrics,
-        )
-
-        # 热切换时需要立即启动新控制器的后台评估
-        if self._running:
-            await self._controller.start()
-
-        if mode == "tunnel":
-            # 切换到 per-channel 限流
-            self._rate_limiter = None
-            self._channel_rate_limiter = ChannelRateLimiter()
-        else:
-            # 切换到全局限流
-            self._rate_limiter = TokenBucket()
-            self._channel_rate_limiter = None
-
     # ═══════════════════════════════════════════════
-    # 核心处理逻辑（保持不变）
+    # 核心处理逻辑
     # ═══════════════════════════════════════════════
 
     async def _apply_settings(self, s: dict, is_initial: bool = False) -> list:
@@ -506,16 +442,8 @@ class Worker:
         changes = []
         has_quota = "_quota" in s
 
-        # --- 固定隧道代理地址 ---
-        new_tunnel_url = s.get("tunnel_proxy_url", "")
-        if new_tunnel_url != config.PROXY_URL:
-            config.PROXY_URL = new_tunnel_url
-            changes.append(f"proxy_url={'***' + new_tunnel_url[-20:] if new_tunnel_url else '(cleared)'}")
-
-        # --- v3: TPS 模式无需通道/模式切换 ---
-
         # --- 代理地址 ---
-        new_proxy_url = s.get("proxy_url")
+        new_proxy_url = s.get("proxy_url") or s.get("tunnel_proxy_url", "")
         if new_proxy_url and new_proxy_url != config.PROXY_URL:
             config.PROXY_URL = new_proxy_url
             changes.append(f"proxy=***{new_proxy_url[-20:]}")
@@ -534,47 +462,13 @@ class Worker:
                 self._rate_limiter.rate = new_rate
                 changes.append(f"QPS={new_rate}")
 
-        # --- Per-channel QPS ---
-        new_pcq = None  # per_channel removed in v3
-        if new_pcq:
-            if is_initial and self._channel_rate_limiter:
-                if new_pcq != self._channel_rate_limiter.per_channel_rate:
-                    self._channel_rate_limiter.per_channel_rate = new_pcq
-                    changes.append(f"per_ch_QPS={new_pcq}")
-                config.TOKEN_BUCKET_RATE = new_pcq
-                if self._channel_rate_limiter:
-                    self._channel_rate_limiter.per_channel_rate = new_pcq
-                changes.append(f"per_ch_qps={new_pcq}")
-
-        # --- Per-channel 最大并发 ---
-        new_pcmc = None  # per_channel removed in v3
-        if new_pcmc and self._proxy_mode == "tunnel":
-            config.MAX_CONCURRENCY = new_pcmc
-            for cc in self._controller._channel_controllers.values():
-                if cc._max != new_pcmc:
-                    cc._max = new_pcmc
-            changes.append(f"per_ch_max_c={new_pcmc}")
-
-        # --- DPS 优化参数 ---
-        new_tmc = s.get("max_concurrency")
-        if new_tmc and new_tmc != getattr(config, "TUNNEL_MAX_CONCURRENCY", 48):
-            config.MAX_CONCURRENCY = new_tmc
-            if self._proxy_mode == "tunnel":
-                self._controller._max = new_tmc
-            changes.append(f"tunnel_max_c={new_tmc}")
-
-        new_tic = s.get("initial_concurrency")
-        if new_tic and new_tic != getattr(config, "TUNNEL_INITIAL_CONCURRENCY", 16):
-            config.INITIAL_CONCURRENCY = new_tic
-            changes.append(f"tunnel_init_c={new_tic}")
-
         # --- 并发控制：min / max / initial ---
         new_min = s.get("min_concurrency")
         if new_min and new_min != self._controller._min:
             self._controller._min = new_min
             changes.append(f"min_c={new_min}")
 
-        if (is_initial or not has_quota) and self._proxy_mode != "tunnel":
+        if is_initial or not has_quota:
             new_max = s.get("max_concurrency")
             if new_max and new_max != self._controller._max:
                 self._controller._max = new_max
@@ -675,14 +569,7 @@ class Worker:
 
     async def _init_session(self):
         """初始化 Amazon session（失败时重试，确保 _session_ready 最终被 set）"""
-        if self._proxy_mode == "tunnel":
-            await self._init_session_tunnel()
-        else:
-            await self._init_session_tps()
-
-    async def _init_session_tps(self):
-        """TPS 模式：初始化单个全局 Session"""
-        logger.info("🔧 初始化 Amazon session (TPS)...")
+        logger.info("🔧 初始化 Amazon session...")
         self._session_ready.clear()
         self._session = await self._create_session_with_retry()
         self._success_since_rotate = 0
@@ -692,47 +579,14 @@ class Worker:
         logger.error("❌ Session 初始化 3 次全部失败，Worker 将在处理任务时继续重试")
         self._session_ready.set()
 
-    async def _init_session_tunnel(self):
-        """
-        隧道模式初始化：
-        1. 获取隧道代理地址（只需 1 个，所有 Session 共享）
-        2. 初始化 SessionPool，预热前几个 Session 槽位
-        """
-        logger.info(f"🔧 初始化隧道模式 ({1} 会话槽位)...")
-        self._session_ready.clear()
-
-        # 1. 获取隧道代理地址（API 只需调一次，返回固定隧道地址）
-        assigned = await self.proxy_manager.init_tunnel()
-        if assigned == 0:
-            logger.error("❌ 无法获取隧道代理，Worker 将在后续重试")
-            self._session_ready.set()
-            return
-
-        # 2. 初始化 SessionPool，预热前几个槽位
-        self._session_pool = SessionPool(self.proxy_manager, self.zip_code)
-        warmup_count = min(3, assigned)
-        warmup_ok = 0
-        for ch_id in range(1, warmup_count + 1):
-            session = await self._session_pool.get_session(ch_id)
-            if session and session.is_ready():
-                warmup_ok += 1
-        if warmup_ok > 0:
-            logger.info(f"✅ SessionPool 预热完成: {warmup_ok}/{warmup_count} 槽位就绪")
-        else:
-            logger.error("❌ SessionPool 预热失败: 无可用 Session")
-        self._session_ready.set()
-
     async def _rotate_session(self, reason: str = "主动轮换"):
         """
-        轮换 session（仅 TPS 模式）。
-        隧道模式下由 proxy_manager.report_blocked(channel) + SessionPool 处理。
+        轮换 session。
 
         优先使用热备 session（hot swap，<0.5s），不可用时回退到冷轮换。
         Burst 缓解：旧 session 延迟 5s 关闭（让 in-flight 请求自然完成），
         轮换后设 3s 宽限期（期间空标题/空页面不再触发额外轮换）。
         """
-        if self._proxy_mode == "tunnel":
-            return  # 隧道模式不使用全局 session 轮换
         async with self._rotate_lock:
             # 防抖：5秒内不重复轮换
             now = time.monotonic()
@@ -965,7 +819,7 @@ class Worker:
 
                 # === 配额执行（每次都执行，不受 version 限制）===
                 quota = s.get("quota", s.get("_quota"))
-                if quota and self._proxy_mode != "tunnel":
+                if quota:
                     new_max_c = quota.get("concurrency")
                     if new_max_c and new_max_c != self._controller._max:
                         old_max = self._controller._max
@@ -1046,9 +900,7 @@ class Worker:
 
     async def _apply_jitter(self):
         """微抖动：绑定目标节拍间隔，避免过度随机造成碰撞。"""
-        _qps = (self._channel_rate_limiter.per_channel_rate
-                if self._channel_rate_limiter
-                else (self._rate_limiter.rate if self._rate_limiter else 5.0))
+        _qps = self._rate_limiter.rate if self._rate_limiter else 5.0
         _jitter_max = min(0.3, 0.5 / _qps)
         await asyncio.sleep(random.uniform(0, _jitter_max))
 
@@ -1070,65 +922,34 @@ class Worker:
         resp_bytes = 0
         last_error_type = "network"
         last_error_detail = ""
-        is_tunnel = (self._proxy_mode == "tunnel")
-
         attempt = 0
         while attempt < max_retries:
             try:
-                # === Session 获取（按模式分支）===
-                session = None
-                channel = None
+                # === Session 获取 ===
+                if not self._session_ready.is_set():
+                    logger.debug(f"ASIN {asin} 等待 session 就绪...")
+                    try:
+                        await asyncio.wait_for(self._session_ready.wait(), timeout=30)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"ASIN {asin} 等待 session 超时 30s")
+                        attempt += 1
+                        continue
+                if self._session is None or not self._session.is_ready():
+                    attempt += 1
+                    logger.warning(f"ASIN {asin} session 仍未就绪 (尝试 {attempt}/{max_retries})")
+                    await asyncio.sleep(2)
+                    continue
+                session = self._session
 
-                if is_tunnel:
-                    # 隧道模式：从 proxy_manager 分配可用通道
-                    channel = self.proxy_manager.get_available_channel()
-                    if channel is None:
-                        # 全部通道被封 → 等待 IP 轮换
-                        logger.warning(f"ASIN {asin} 全部通道被封，等待 IP 轮换...")
-                        await self.proxy_manager.wait_for_rotation()
-                        attempt += 1
-                        continue
-                    if self._session_pool is None:
-                        attempt += 1
-                        logger.warning(f"ASIN {asin} 隧道 session_pool 未就绪 (尝试 {attempt}/{max_retries})")
-                        await asyncio.sleep(1)
-                        continue
-                    session = await self._session_pool.get_session(channel)
-                    if session is None or not session.is_ready():
-                        attempt += 1
-                        logger.warning(f"ASIN {asin} [ch{channel}] session 未就绪 (尝试 {attempt}/{max_retries})")
-                        await asyncio.sleep(2)
-                        continue
-                else:
-                    # TPS 模式：等待全局 session 就绪
-                    if not self._session_ready.is_set():
-                        logger.debug(f"ASIN {asin} 等待 session 就绪...")
-                        try:
-                            await asyncio.wait_for(self._session_ready.wait(), timeout=30)
-                        except asyncio.TimeoutError:
-                            logger.warning(f"ASIN {asin} 等待 session 超时 30s")
-                            attempt += 1
-                            continue
-                    if self._session is None or not self._session.is_ready():
-                        attempt += 1
-                        logger.warning(f"ASIN {asin} session 仍未就绪 (尝试 {attempt}/{max_retries})")
-                        await asyncio.sleep(2)
-                        continue
-                    session = self._session
-
-                ch_tag = f" [ch{channel}]" if is_tunnel else ""
-
-                # 令牌桶限流：TPS 全局限流，DPS per-channel 限流
+                # 令牌桶限流
                 t_token_start = time.time()
-                if is_tunnel and self._channel_rate_limiter:
-                    await self._channel_rate_limiter.acquire(channel)
-                elif self._rate_limiter:
+                if self._rate_limiter:
                     await self._rate_limiter.acquire()
                 t_token_wait = time.time() - t_token_start
 
                 # 发起请求（信号量仅包裹 HTTP 请求，响应处理不占槽位）
                 t_sem_start = time.time()
-                await self._controller.acquire(channel)
+                await self._controller.acquire()
                 t_sem_wait = time.time() - t_sem_start
                 await self._apply_jitter()
                 recv_speed = self._calc_recv_speed()
@@ -1138,13 +959,13 @@ class Worker:
                     resp_bytes = len(resp.content) if resp and hasattr(resp, 'content') else 0
                 finally:
                     req_elapsed = time.time() - req_start
-                    self._controller.release(channel)
+                    self._controller.release()
 
                 # 请求失败（超时/网络异常）→ 不换 IP，等待后重试
                 if resp is None:
-                    self._controller.record_result(req_elapsed, False, False, 0, channel_id=channel)
+                    self._controller.record_result(req_elapsed, False, False, 0)
                     attempt += 1
-                    logger.warning(f"ASIN {asin}{ch_tag} 请求超时 (尝试 {attempt}/{max_retries})")
+                    logger.warning(f"ASIN {asin} 请求超时 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
 
@@ -1154,35 +975,30 @@ class Worker:
                     if session.is_captcha(resp):
                         captcha_solved = await session.solve_captcha(resp)
                         if captcha_solved:
-                            logger.info(f"ASIN {asin}{ch_tag} CAPTCHA 已自动解决，重新请求")
+                            logger.info(f"ASIN {asin} CAPTCHA 已自动解决，重新请求")
                             # 解决成功，不计为 blocked，直接重试（不增加 attempt）
                             continue
 
-                    self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
                     last_error_type = "blocked"
                     last_error_detail = f"HTTP {resp.status_code}"
-                    if is_tunnel:
-                        logger.warning(f"ASIN {asin} [ch{channel}] 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
-                        await self.proxy_manager.report_blocked(channel)
-                        continue  # 继续循环 → 下次分配到其他通道
-                    else:
-                        logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
-                        await self._rotate_session(reason="被封锁")
-                        await self._submit_result(
-                            task_id, None, success=False,
-                            error_type=last_error_type, error_detail=last_error_detail,
-                            batch_id=task.get("batch_id")
-                        )
-                        self._stats["failed"] += 1
-                        self._stats["total"] += 1
-                        return (False, True, resp_bytes)  # 标记被封，让控制器知道
+                    logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
+                    await self._rotate_session(reason="被封锁")
+                    await self._submit_result(
+                        task_id, None, success=False,
+                        error_type=last_error_type, error_detail=last_error_detail,
+                        batch_id=task.get("batch_id")
+                    )
+                    self._stats["failed"] += 1
+                    self._stats["total"] += 1
+                    return (False, True, resp_bytes)
 
                 # 404 处理
                 if session.is_404(resp):
-                    self._controller.record_result(req_elapsed, True, False, resp_bytes, channel_id=channel)
-                    logger.info(f"ASIN {asin}{ch_tag} 商品不存在 (404)")
+                    self._controller.record_result(req_elapsed, True, False, resp_bytes)
+                    logger.info(f"ASIN {asin} 商品不存在 (404)")
                     result_data = self.parser._default_result(asin, zip_code)
                     result_data["title"] = "[商品不存在]"
                     result_data["batch_name"] = task.get("batch_name", "")
@@ -1211,59 +1027,45 @@ class Worker:
                     if session.is_captcha(resp):
                         captcha_solved = await session.solve_captcha(resp)
                         if captcha_solved:
-                            logger.info(f"ASIN {asin}{ch_tag} 解析层 CAPTCHA 已自动解决，重新请求")
+                            logger.info(f"ASIN {asin} 解析层 CAPTCHA 已自动解决，重新请求")
                             continue  # 不增加 attempt，直接重试
 
-                    self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
                     last_error_type = "captcha"
                     last_error_detail = "validateCaptcha / Robot Check"
-                    logger.warning(f"ASIN {asin}{ch_tag} {title} (尝试 {attempt}/{max_retries})")
-                    if is_tunnel:
-                        await self.proxy_manager.report_blocked(channel)
-                    else:
-                        await self._rotate_session(reason="页面拦截")
+                    logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
+                    await self._rotate_session(reason="页面拦截")
                     continue
 
                 if title == "[API封锁]":
-                    self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
                     attempt += 1
                     self._stats["blocked"] += 1
                     last_error_type = "blocked"
                     last_error_detail = "api-services-support@amazon.com"
-                    logger.warning(f"ASIN {asin}{ch_tag} {title} (尝试 {attempt}/{max_retries})")
-                    if is_tunnel:
-                        await self.proxy_manager.report_blocked(channel)
-                    else:
-                        await self._rotate_session(reason="页面拦截")
+                    logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
+                    await self._rotate_session(reason="页面拦截")
                     continue
 
                 if title in ["[页面为空]", "[HTML解析失败]"]:
-                    self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     attempt += 1
                     last_error_type = "parse_error"
                     last_error_detail = title
-                    logger.warning(f"ASIN {asin}{ch_tag} {title} (尝试 {attempt}/{max_retries})")
-                    if not is_tunnel:
-                        # 机制 1+2：等待 session 轮换后再重试
-                        await self._wait_for_rotation_before_retry(asin, reason=title)
-                    else:
-                        await asyncio.sleep(2)
+                    logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
+                    await self._wait_for_rotation_before_retry(asin, reason=title)
                     continue
 
                 # 标题为空视为软拦截（降级页面），触发 session 轮换后重试
                 if not title or title == "N/A":
-                    self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     attempt += 1
                     last_error_type = "parse_error"
                     last_error_detail = "标题为空"
-                    logger.warning(f"ASIN {asin}{ch_tag} 标题为空 (尝试 {attempt}/{max_retries})")
-                    if not is_tunnel:
-                        # 机制 1+2：等待 session 轮换后再重试
-                        await self._wait_for_rotation_before_retry(asin, reason="标题为空")
-                    else:
-                        await asyncio.sleep(2)
+                    logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt}/{max_retries})")
+                    await self._wait_for_rotation_before_retry(asin, reason="标题为空")
                     continue
 
                 # 邮编/货币校验：检测是否采集到了非美国地区的数据
@@ -1271,15 +1073,12 @@ class Worker:
                 if price and price not in ["N/A", "不可售", "See price in cart", "No Featured Offer"]:
                     # v3: [非USD] 前缀或直接出现非美国货币符号
                     if "[非USD]" in price or any(c in price for c in ["¥", "€", "£", "CNY"]) or ("$" not in price and price.replace(",","").replace(".","").strip().isdigit()):
-                        self._controller.record_result(req_elapsed, False, True, resp_bytes, channel_id=channel)
+                        self._controller.record_result(req_elapsed, False, True, resp_bytes)
                         attempt += 1
                         last_error_type = "parse_error"
                         last_error_detail = f"非美国价格: {price}"
-                        logger.warning(f"ASIN {asin}{ch_tag} 非美国价格 '{price}' (尝试 {attempt}/{max_retries})")
-                        if is_tunnel:
-                            await self.proxy_manager.report_blocked(channel)
-                        else:
-                            await self._rotate_session(reason="非美国区域数据")
+                        logger.warning(f"ASIN {asin} 非美国价格 '{price}' (尝试 {attempt}/{max_retries})")
+                        await self._rotate_session(reason="非美国区域数据")
                         continue
 
                 # 核心字段缺失检测：有标题但价格/库存/品牌全为空 → 页面降级，重试
@@ -1301,12 +1100,12 @@ class Worker:
                 _is_incomplete = _price_na and _stock_999 and not _is_nfo and not _is_unavail and not _has_valid_info
 
                 if _is_degraded or _is_incomplete:
-                    self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     attempt += 1
                     reason = "核心字段全部缺失" if _is_degraded else "价格缺失+库存999"
                     last_error_type = "parse_error"
                     last_error_detail = f"解析不完整（{reason}）"
-                    logger.warning(f"ASIN {asin}{ch_tag} {reason}，疑似降级页面 (尝试 {attempt}/{max_retries})")
+                    logger.warning(f"ASIN {asin} {reason}，疑似降级页面 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
 
@@ -1332,13 +1131,13 @@ class Worker:
                         logger.debug(f"NFO {asin} offer-listing 请求失败: {e}")
 
                 # 成功
-                self._controller.record_result(req_elapsed, True, False, resp_bytes, channel_id=channel)
+                self._controller.record_result(req_elapsed, True, False, resp_bytes)
                 await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"))
                 self._stats["success"] += 1
                 self._stats["total"] += 1
 
                 title_short = result_data["title"][:40] if result_data["title"] else "N/A"
-                logger.info(f"OK {asin}{ch_tag} | {title_short}... | {result_data['current_price']}")
+                logger.info(f"OK {asin} | {title_short}... | {result_data['current_price']}")
                 # 链路计时日志（仅采样 20% 避免日志过多）
                 if self._stats["total"] % 5 == 0:
                     logger.info(f"⏱️ 链路 | token:{t_token_wait:.2f}s sem:{t_sem_wait:.2f}s http:{req_elapsed:.2f}s parse:{t_parse:.3f}s bytes:{resp_bytes}")
@@ -1352,11 +1151,10 @@ class Worker:
                         html_content=resp.text,
                     )
 
-                # 主动轮换：每 N 次成功请求更换 session 防止被检测（仅 TPS 模式）
-                if not is_tunnel:
-                    self._success_since_rotate += 1
-                    if self._success_since_rotate >= self._rotate_every:
-                        await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
+                # 主动轮换：每 N 次成功请求更换 session 防止被检测
+                self._success_since_rotate += 1
+                if self._success_since_rotate >= self._rotate_every:
+                    await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
 
                 return (True, False, resp_bytes)
 
@@ -1604,7 +1402,7 @@ class Worker:
                 self._standby_session = None
 
             # 重建 session
-            await self._init_session_tps()
+            await self._init_session()
 
             # 重置 AIMD 控制器
             self._controller._concurrency = config.INITIAL_CONCURRENCY
@@ -1662,58 +1460,6 @@ class Worker:
     # 隧道模式 IP 轮换监控
     # ═══════════════════════════════════════════════
 
-    async def _ip_rotation_watcher(self):
-        """
-        IP 轮换监控协程（仅隧道模式）。
-
-        双策略：
-        1. 被封换 IP：当 ≥50% channel 被封时，主动调用 换 IP
-           + 换 IP 后重建被封 channel 的 Session
-        2. 定时安全轮换：到达轮换周期时自动重置封锁状态
-        """
-        logger.info(f"🔄 IP 轮换监控启动 (周期: {config.TUNNEL_ROTATE_INTERVAL}s)")
-        while self._running:
-            try:
-                await asyncio.sleep(2)
-                if not self._running:
-                    break
-
-                # 策略 1：被封换 IP（≥50% channel 被封时主动换 IP）
-                total_ch = len(self.proxy_manager._channels)
-                blocked_ch = sum(
-                    1 for ch in self.proxy_manager._channels.values() if ch.blocked
-                )
-                if total_ch > 0 and blocked_ch >= max(1, total_ch // 2):
-                    logger.warning(
-                        f"🔄 {blocked_ch}/{total_ch} channel 被封，主动换 IP..."
-                    )
-                    changed = await self.proxy_manager.change_ip()
-                    if changed:
-                        logger.info("🔄 主动换 IP 成功，重建被封 Session...")
-                        # 重建被封的 session
-                        if self._session_pool:
-                            for ch_id, ch_state in self.proxy_manager._channels.items():
-                                if not ch_state.blocked:
-                                    continue
-                                await self._session_pool.rebuild_session(ch_id)
-                        continue
-
-                # 策略 2：定时安全轮换（保留作为兜底）
-                rotated = await self.proxy_manager.handle_ip_rotation()
-                if rotated:
-                    logger.info(
-                        f"🔄 定时 IP 轮换完成（Session 保持）"
-                        f" | 下次轮换: {self.proxy_manager.time_to_next_rotation():.0f}s"
-                    )
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"🔄 IP 轮换监控异常: {e}")
-                await asyncio.sleep(5)
-
-        logger.info("🔄 IP 轮换监控退出")
-
     # ═══════════════════════════════════════════════
     # 生命周期
     # ═══════════════════════════════════════════════
@@ -1731,12 +1477,9 @@ class Worker:
                 await self._batch_submitter_task
             except asyncio.CancelledError:
                 pass
-        # 关闭 Session（TPS 模式）
+        # 关闭 Session
         if self._session:
             await self._session.close()
-        # 关闭 SessionPool（隧道模式）
-        if self._session_pool:
-            await self._session_pool.close_all()
         # 停止截图子进程
         await self._stop_screenshot_process()
 

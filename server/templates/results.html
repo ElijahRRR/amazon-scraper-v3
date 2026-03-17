@@ -68,6 +68,9 @@
                     <button class="btn btn-outline-accent btn-sm" onclick="openExportModal()">
                         <i class="bi bi-download"></i> 导出
                     </button>
+                    <button class="btn btn-outline-danger btn-sm" id="deleteSelectedBtn" onclick="deleteSelected()" style="display:none;">
+                        <i class="bi bi-trash3"></i> 删除选中 (<span id="selectedCount">0</span>)
+                    </button>
                     <button class="btn btn-outline-danger btn-sm" onclick="clearData()">
                         <i class="bi bi-trash3"></i> 清空数据
                     </button>
@@ -88,6 +91,7 @@
             <table class="table table-hover mb-0">
                 <thead>
                     <tr>
+                        <th style="width:30px;"><input type="checkbox" id="selectAll" onchange="toggleSelectAll(this)"></th>
                         <th>ASIN</th>
                         <th>标题</th>
                         <th>当前价格</th>
@@ -101,7 +105,7 @@
                     </tr>
                 </thead>
                 <tbody id="resultBody">
-                    <tr><td colspan="10" class="text-center text-secondary p-4">加载中...</td></tr>
+                    <tr><td colspan="11" class="text-center text-secondary p-4">加载中...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -276,7 +280,7 @@ async function loadResults(cursor = null, direction = 'next') {
 
         renderResults(data.items);
     } catch(e) {
-        document.getElementById('resultBody').innerHTML = `<tr><td colspan="10" class="text-center text-danger p-4">加载失败: ${esc(e.message)}</td></tr>`;
+        document.getElementById('resultBody').innerHTML = `<tr><td colspan="11" class="text-center text-danger p-4">加载失败: ${esc(e.message)}</td></tr>`;
     }
 }
 
@@ -305,7 +309,8 @@ function loadPrev() {
 function renderResults(items) {
     const tbody = document.getElementById('resultBody');
     if (!items || items.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="10" class="text-center text-secondary p-4">暂无数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="11" class="text-center text-secondary p-4">暂无数据</td></tr>';
+        updateSelectUI();
         return;
     }
 
@@ -330,6 +335,7 @@ function renderResults(items) {
                 : esc(fba);
 
         html += `<tr>
+            <td><input type="checkbox" class="row-check" value="${asin}" onchange="updateSelectUI()"></td>
             <td><a href="https://www.amazon.com/dp/${asin}" target="_blank" class="text-accent">${asin}</a></td>
             <td title="${esc(r.title || '')}">${title}</td>
             <td>${price}</td>
@@ -343,6 +349,53 @@ function renderResults(items) {
         </tr>`;
     }
     tbody.innerHTML = html;
+    updateSelectUI();
+}
+
+function toggleSelectAll(master) {
+    document.querySelectorAll('.row-check').forEach(cb => cb.checked = master.checked);
+    updateSelectUI();
+}
+
+function updateSelectUI() {
+    const checked = document.querySelectorAll('.row-check:checked');
+    const btn = document.getElementById('deleteSelectedBtn');
+    const count = document.getElementById('selectedCount');
+    if (checked.length > 0) {
+        btn.style.display = '';
+        count.textContent = checked.length;
+    } else {
+        btn.style.display = 'none';
+    }
+    // 同步全选框状态
+    const all = document.querySelectorAll('.row-check');
+    const selectAll = document.getElementById('selectAll');
+    if (selectAll) selectAll.checked = all.length > 0 && checked.length === all.length;
+}
+
+async function deleteSelected() {
+    const checked = [...document.querySelectorAll('.row-check:checked')];
+    if (!checked.length) return;
+    const asins = checked.map(cb => cb.value);
+    if (!confirm(`确定删除选中的 ${asins.length} 条数据？此操作不可恢复！`)) return;
+    try {
+        const body = { asins };
+        if (state.batchId) body.batch_id = parseInt(state.batchId);
+        const resp = await fetch('/api/results', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+            loadResults();
+            loadChangeStats();
+        } else {
+            alert('删除失败: ' + (data.detail || '未知错误'));
+        }
+    } catch(e) {
+        alert('网络错误: ' + e.message);
+    }
 }
 
 function showScreenshot(path) {

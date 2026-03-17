@@ -128,6 +128,7 @@ async def lifespan(app):
     _load_settings()
     os.makedirs(config.EXPORT_DIR, exist_ok=True)
     os.makedirs(config.SCREENSHOT_DIR, exist_ok=True)
+    os.makedirs(_SCHEDULES_DIR, exist_ok=True)
     logger.info("数据库初始化完成")
     asyncio.create_task(_timeout_task_loop())
     asyncio.create_task(_auto_scrape_scheduler())
@@ -161,12 +162,15 @@ async def _timeout_task_loop():
 
 
 async def _auto_scrape_scheduler():
-    """定时自动采集调度"""
+    """定时自动采集调度（支持 interval_days 和文件指定 ASIN）"""
     while True:
         await asyncio.sleep(60)
         try:
             schedules = _runtime_settings.get("auto_scrape_schedules", [])
             now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            changed = False
+
             for sched in schedules:
                 if not sched.get("enabled"):
                     continue
@@ -178,23 +182,43 @@ async def _auto_scrape_scheduler():
                 except ValueError:
                     continue
 
-                today = now.strftime("%Y-%m-%d")
-                if sched.get("last_run_date") == today:
-                    continue
+                # 检查时间点是否到达
                 if now.hour < hour or (now.hour == hour and now.minute < minute):
                     continue
 
-                # 创建自动采集批次
-                asins = await db.get_all_asins()
+                # 检查间隔天数
+                interval = sched.get("interval_days", 1)
+                last_run = sched.get("last_run_date", "")
+                if last_run:
+                    try:
+                        last_date = datetime.strptime(last_run, "%Y-%m-%d")
+                        if (now - last_date).days < interval:
+                            continue
+                    except ValueError:
+                        pass
+
+                # 获取 ASIN 列表：优先从文件，否则全库
+                source_file = sched.get("source_file", "")
+                if source_file and os.path.isfile(source_file):
+                    asins = _extract_asins_from_file(source_file)
+                else:
+                    asins = await db.get_all_asins()
+
                 if not asins:
                     continue
 
-                batch_name = f"auto_{now.strftime('%Y%m%d_%H%M')}"
-                batch_id = await db.create_batch(batch_name)
-                await db.create_tasks(batch_id, asins, _runtime_settings.get("zip_code", "10001"))
+                sched_name = sched.get("name", "task")
+                batch_name = f"auto_{sched_name}_{now:%Y%m%d_%H%M}"
+                zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+                ns = sched.get("needs_screenshot", False)
+                batch_id = await db.create_batch(batch_name, ns)
+                await db.create_tasks(batch_id, asins, zc, ns)
                 sched["last_run_date"] = today
+                changed = True
+                logger.info(f"自动采集已调度: {batch_name}, {len(asins)} ASINs (间隔{interval}天)")
+
+            if changed:
                 _save_settings()
-                logger.info(f"自动采集已调度: {batch_name}, {len(asins)} ASINs")
         except Exception as e:
             logger.error(f"自动采集调度异常: {e}")
 
@@ -903,6 +927,328 @@ async def api_diagnostic():
         "active_workers": len(_worker_registry),
         "settings_version": _settings_version,
     }
+
+
+@app.delete("/api/results")
+async def api_delete_results(request: Request):
+    """按条件删除采集结果"""
+    body = await request.json()
+    batch_id = body.get("batch_id")
+    asins = body.get("asins")  # list of ASIN strings
+    search = body.get("search")  # fuzzy search string
+
+    # 构建 ASIN 列表：精确指定 or 搜索匹配
+    target_asins = set()
+
+    if asins:
+        target_asins.update(asins)
+
+    if search:
+        # 搜索匹配（复用 get_results 的逻辑）
+        terms = [t.strip() for t in search.split(",") if t.strip()]
+        if terms:
+            or_clauses = []
+            params = []
+            for term in terms:
+                or_clauses.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
+                params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
+            where = " OR ".join(or_clauses)
+            sql = f"SELECT d.asin FROM asin_data d WHERE {where}"
+            async with db._db.execute(sql, params) as c:
+                rows = await c.fetchall()
+                for row in rows:
+                    target_asins.add(row["asin"])
+
+    if not target_asins:
+        return {"ok": True, "deleted": 0}
+
+    # 如果指定了 batch_id，取交集：只删 batch 内的
+    if batch_id:
+        sql = "SELECT asin FROM batch_asins WHERE batch_id = ?"
+        async with db._db.execute(sql, (batch_id,)) as c:
+            batch_asins = {row["asin"] for row in await c.fetchall()}
+        target_asins &= batch_asins
+
+    if not target_asins:
+        return {"ok": True, "deleted": 0}
+
+    asin_list = list(target_asins)
+    placeholders = ",".join("?" * len(asin_list))
+
+    async with db._write_lock:
+        await db._db.execute("BEGIN")
+        await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", asin_list)
+        await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", asin_list)
+        await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", asin_list)
+        await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", asin_list)
+        await db._db.execute("COMMIT")
+
+    return {"ok": True, "deleted": len(asin_list)}
+
+
+# ==================== 定时采集管理 ====================
+
+_SCHEDULES_DIR = os.path.join(config.PROJECT_DIR, "data", "schedules")
+
+
+def _get_schedules() -> list:
+    return _runtime_settings.get("auto_scrape_schedules", [])
+
+
+def _save_schedules(schedules: list):
+    _runtime_settings["auto_scrape_schedules"] = schedules
+    _save_settings()
+
+
+def _extract_asins_from_file(filepath: str) -> list:
+    """从文件提取 ASIN 列表"""
+    asins = []
+    seen = set()
+    if not os.path.isfile(filepath):
+        return asins
+    with open(filepath, "rb") as f:
+        content = f.read()
+    filename = filepath.lower()
+    if filename.endswith(".xlsx"):
+        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=1, values_only=True):
+            for cell in row:
+                if cell:
+                    val = str(cell).strip().upper()
+                    if re.match(r'^B[0-9A-Z]{9}$', val) and val not in seen:
+                        asins.append(val)
+                        seen.add(val)
+        wb.close()
+    elif filename.endswith(".csv"):
+        text = content.decode("utf-8", errors="ignore")
+        reader = csv.reader(io.StringIO(text))
+        for row in reader:
+            for cell in row:
+                val = cell.strip().upper()
+                if re.match(r'^B[0-9A-Z]{9}$', val) and val not in seen:
+                    asins.append(val)
+                    seen.add(val)
+    else:
+        text = content.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            val = line.strip().upper()
+            if re.match(r'^B[0-9A-Z]{9}$', val) and val not in seen:
+                asins.append(val)
+                seen.add(val)
+    return asins
+
+
+@app.get("/api/schedules")
+async def api_list_schedules():
+    return {"schedules": _get_schedules()}
+
+
+@app.post("/api/schedules")
+async def api_create_schedule(request: Request,
+                              file: UploadFile = File(...),
+                              name: str = Form(""),
+                              time_str: str = Form(..., alias="time"),
+                              interval_days: int = Form(1),
+                              needs_screenshot: bool = Form(False)):
+    """创建定时采集任务"""
+    # 验证时间格式
+    try:
+        h, m = map(int, time_str.split(":"))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, "时间格式错误，应为 HH:MM")
+
+    if interval_days < 1:
+        raise HTTPException(400, "间隔天数至少为 1")
+
+    # 保存 ASIN 文件
+    os.makedirs(_SCHEDULES_DIR, exist_ok=True)
+    import uuid
+    sched_id = f"sched_{uuid.uuid4().hex[:8]}"
+    ext = os.path.splitext(file.filename or "")[1] or ".txt"
+    source_file = os.path.join(_SCHEDULES_DIR, f"{sched_id}{ext}")
+    content = await file.read()
+    with open(source_file, "wb") as f:
+        f.write(content)
+
+    # 验证文件中有 ASIN
+    asin_list = _extract_asins_from_file(source_file)
+    if not asin_list:
+        os.remove(source_file)
+        raise HTTPException(400, "文件中未找到有效 ASIN")
+
+    # 首次创建：last_run_date 设为昨天，确保首次检查时立即触发
+    from datetime import timedelta
+    yesterday = (datetime.now() - timedelta(days=interval_days)).strftime("%Y-%m-%d")
+
+    sched = {
+        "id": sched_id,
+        "name": name or f"定时任务-{time_str}",
+        "time": time_str,
+        "interval_days": interval_days,
+        "source_file": source_file,
+        "asin_count": len(asin_list),
+        "needs_screenshot": needs_screenshot,
+        "enabled": True,
+        "last_run_date": yesterday,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    schedules = _get_schedules()
+    schedules.append(sched)
+    _save_schedules(schedules)
+
+    return {"ok": True, "schedule": sched, "schedules": schedules}
+
+
+@app.put("/api/schedules/{sched_id}")
+async def api_update_schedule(sched_id: str, request: Request):
+    """修改定时任务（enabled/time/interval_days/name）"""
+    body = await request.json()
+    schedules = _get_schedules()
+    target = None
+    for s in schedules:
+        if s.get("id") == sched_id:
+            target = s
+            break
+    if target is None:
+        raise HTTPException(404, "定时任务不存在")
+
+    if "enabled" in body:
+        target["enabled"] = bool(body["enabled"])
+    if "name" in body:
+        target["name"] = body["name"]
+    if "time" in body:
+        try:
+            h, m = map(int, body["time"].split(":"))
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                target["time"] = body["time"]
+        except (ValueError, AttributeError):
+            pass
+    if "interval_days" in body:
+        val = int(body["interval_days"])
+        if val >= 1:
+            target["interval_days"] = val
+
+    _save_schedules(schedules)
+    return {"ok": True, "schedules": schedules}
+
+
+@app.delete("/api/schedules/{sched_id}")
+async def api_delete_schedule(sched_id: str):
+    """删除定时任务 + ASIN 文件"""
+    schedules = _get_schedules()
+    target = None
+    new_schedules = []
+    for s in schedules:
+        if s.get("id") == sched_id:
+            target = s
+        else:
+            new_schedules.append(s)
+    if target is None:
+        raise HTTPException(404, "定时任务不存在")
+
+    # 删除 ASIN 文件
+    source_file = target.get("source_file", "")
+    if source_file and os.path.isfile(source_file):
+        os.remove(source_file)
+
+    _save_schedules(new_schedules)
+    return {"ok": True, "schedules": new_schedules}
+
+
+@app.post("/api/schedules/{sched_id}/run")
+async def api_run_schedule_now(sched_id: str):
+    """手动立即执行一次定时任务"""
+    schedules = _get_schedules()
+    target = None
+    for s in schedules:
+        if s.get("id") == sched_id:
+            target = s
+            break
+    if target is None:
+        raise HTTPException(404, "定时任务不存在")
+
+    source_file = target.get("source_file", "")
+    asin_list = _extract_asins_from_file(source_file)
+    if not asin_list:
+        raise HTTPException(400, "ASIN 文件为空或不存在")
+
+    now = datetime.now()
+    batch_name = f"auto_{target.get('name', 'task')}_{now:%Y%m%d_%H%M}"
+    zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
+    ns = target.get("needs_screenshot", False)
+    batch_id = await db.create_batch(batch_name, ns)
+    await db.create_tasks(batch_id, asin_list, zc, ns)
+
+    target["last_run_date"] = now.strftime("%Y-%m-%d")
+    _save_schedules(schedules)
+    logger.info(f"手动执行定时任务: {batch_name}, {len(asin_list)} ASINs")
+
+    return {"ok": True, "batch_id": batch_id, "batch_name": batch_name, "asin_count": len(asin_list)}
+
+
+# ==================== 兼容旧 schedule API（settings.html 旧 UI 调用） ====================
+
+@app.get("/api/auto-scrape/schedules")
+async def api_legacy_list_schedules():
+    return {"schedules": _get_schedules()}
+
+
+@app.post("/api/auto-scrape/schedules")
+async def api_legacy_add_schedule(request: Request):
+    """旧式简单定时（无文件，使用全库 ASIN）"""
+    body = await request.json()
+    time_str = body.get("time", "")
+    try:
+        h, m = map(int, time_str.split(":"))
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, "时间格式错误")
+
+    import uuid
+    sched = {
+        "id": f"sched_{uuid.uuid4().hex[:8]}",
+        "name": f"全库采集-{time_str}",
+        "time": time_str,
+        "interval_days": 1,
+        "source_file": "",  # 空=全库 ASIN
+        "asin_count": 0,
+        "needs_screenshot": False,
+        "enabled": True,
+        "last_run_date": "",
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    schedules = _get_schedules()
+    schedules.append(sched)
+    _save_schedules(schedules)
+    return {"ok": True, "schedules": schedules}
+
+
+@app.put("/api/auto-scrape/schedules/{index}")
+async def api_legacy_toggle_schedule(index: int, request: Request):
+    body = await request.json()
+    schedules = _get_schedules()
+    if 0 <= index < len(schedules):
+        if "enabled" in body:
+            schedules[index]["enabled"] = bool(body["enabled"])
+        _save_schedules(schedules)
+    return {"ok": True, "schedules": schedules}
+
+
+@app.delete("/api/auto-scrape/schedules/{index}")
+async def api_legacy_delete_schedule(index: int):
+    schedules = _get_schedules()
+    if 0 <= index < len(schedules):
+        removed = schedules.pop(index)
+        sf = removed.get("source_file", "")
+        if sf and os.path.isfile(sf):
+            os.remove(sf)
+        _save_schedules(schedules)
+    return {"ok": True, "schedules": schedules}
 
 
 @app.delete("/api/database")

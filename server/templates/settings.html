@@ -233,43 +233,70 @@
         <div class="card mt-3">
             <div class="card-header d-flex justify-content-between align-items-center">
                 <span><i class="bi bi-clock-history"></i> 定时自动采集</span>
-                <button class="btn btn-sm btn-accent" onclick="addSchedule()">
-                    <i class="bi bi-plus-lg"></i> 新增
+                <button class="btn btn-sm btn-accent" onclick="showNewScheduleForm()">
+                    <i class="bi bi-plus-lg"></i> 新建任务
                 </button>
             </div>
             <div class="card-body">
                 <small class="text-secondary d-block mb-3">
-                    设置每天定时对主库所有 ASIN 发起重新采集，支持多个时间点。
+                    定时对指定 ASIN 文件发起自动采集，支持自定义间隔天数。
                 </small>
                 <div id="scheduleList"></div>
                 <div id="scheduleEmpty" class="text-secondary text-center py-3" style="display:none;">
-                    暂无定时任务，点击"新增"添加
+                    暂无定时任务，点击"新建任务"添加
                 </div>
-                <div id="scheduleNewRow" class="row g-2 align-items-end mt-2" style="display:none;">
-                    <div class="col-auto">
-                        <label class="form-label">时</label>
-                        <select id="newScheduleHour" class="form-select" style="width:80px;">
-                            {% for h in range(24) %}
-                            <option value="{{ '%02d'|format(h) }}" {{ 'selected' if h == 8 }}>{{ '%02d'|format(h) }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="col-auto d-flex align-items-center" style="padding-bottom:6px; font-size:1.2rem; font-weight:700;">:</div>
-                    <div class="col-auto">
-                        <label class="form-label">分</label>
-                        <select id="newScheduleMinute" class="form-select" style="width:80px;">
-                            {% for m in range(60) %}
-                            <option value="{{ '%02d'|format(m) }}">{{ '%02d'|format(m) }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="col-auto d-flex gap-1" style="padding-bottom:1px;">
-                        <button class="btn btn-accent" onclick="confirmAddSchedule()">
-                            <i class="bi bi-check-lg"></i> 确认
-                        </button>
-                        <button class="btn btn-outline-secondary" onclick="cancelAddSchedule()">
-                            取消
-                        </button>
+                <!-- 新建定时任务表单 -->
+                <div id="scheduleNewForm" class="mt-3 p-3 rounded" style="display:none; background:var(--card-bg); border:1px solid var(--border);">
+                    <h6 class="mb-3" style="color:var(--accent-light);">新建定时采集任务</h6>
+                    <div class="row g-2">
+                        <div class="col-12">
+                            <label class="form-label">任务名称</label>
+                            <input type="text" class="form-control" id="newSchedName" placeholder="如：每日核心商品监控">
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">执行时间</label>
+                            <div class="d-flex align-items-center gap-1">
+                                <select id="newSchedHour" class="form-select" style="width:75px;">
+                                    {% for h in range(24) %}
+                                    <option value="{{ '%02d'|format(h) }}" {{ 'selected' if h == 8 }}>{{ '%02d'|format(h) }}</option>
+                                    {% endfor %}
+                                </select>
+                                <span style="font-weight:700;">:</span>
+                                <select id="newSchedMinute" class="form-select" style="width:75px;">
+                                    {% for m in range(60) %}
+                                    <option value="{{ '%02d'|format(m) }}">{{ '%02d'|format(m) }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label">执行间隔</label>
+                            <select id="newSchedInterval" class="form-select">
+                                <option value="1">每天</option>
+                                <option value="2">每 2 天</option>
+                                <option value="3">每 3 天</option>
+                                <option value="7">每 7 天</option>
+                                <option value="14">每 14 天</option>
+                                <option value="30">每 30 天</option>
+                            </select>
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">ASIN 文件 <small class="text-secondary">(.xlsx / .csv / .txt)</small></label>
+                            <input type="file" class="form-control" id="newSchedFile" accept=".xlsx,.csv,.txt">
+                            <small class="text-secondary">留空则使用主库全部 ASIN</small>
+                        </div>
+                        <div class="col-12">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="newSchedScreenshot">
+                                <label class="form-check-label" for="newSchedScreenshot">需要截图</label>
+                            </div>
+                        </div>
+                        <div class="col-12 d-flex gap-2 mt-2">
+                            <button class="btn btn-accent" onclick="submitNewSchedule()">
+                                <i class="bi bi-check-lg"></i> 创建
+                            </button>
+                            <button class="btn btn-outline-secondary" onclick="hideNewScheduleForm()">取消</button>
+                        </div>
                     </div>
                 </div>
                 <div id="scheduleResult" class="mt-2" style="display:none;"></div>
@@ -368,12 +395,12 @@ async function resetDefaults() {
     }
 }
 
-// 定时采集 — 多任务管理
+// 定时采集管理
 let _schedules = [];
 
 async function loadSchedules() {
     try {
-        const resp = await fetch('/api/auto-scrape/schedules');
+        const resp = await fetch('/api/schedules');
         const data = await resp.json();
         _schedules = data.schedules || [];
         renderSchedules();
@@ -391,102 +418,156 @@ function renderSchedules() {
         return;
     }
     empty.style.display = 'none';
-    list.innerHTML = _schedules.map((s, i) => {
-        const statusText = s.last_run_date
-            ? `上次运行: ${s.last_run_date}`
-            : '尚未运行';
+    const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    list.innerHTML = _schedules.map(s => {
+        const id = esc(s.id);
+        const intervalText = s.interval_days === 1 ? '每天' : `每 ${s.interval_days} 天`;
+        const asinText = s.source_file ? `${s.asin_count || '?'} ASINs` : '全库';
+        const statusText = s.last_run_date ? `上次: ${s.last_run_date}` : '未运行';
         const enabledClass = s.enabled ? 'text-success' : 'text-secondary';
         const enabledIcon = s.enabled ? 'bi-check-circle-fill' : 'bi-pause-circle';
         const enabledTitle = s.enabled ? '点击禁用' : '点击启用';
         return `<div class="d-flex align-items-center gap-2 mb-2 p-2 rounded" style="background:var(--card-bg); border:1px solid var(--border);">
-            <button class="btn btn-sm ${enabledClass}" onclick="toggleSchedule(${i})" title="${enabledTitle}" style="border:none; background:none;">
+            <button class="btn btn-sm ${enabledClass}" onclick="toggleSchedule('${id}')" title="${enabledTitle}" style="border:none; background:none;">
                 <i class="bi ${enabledIcon}" style="font-size:1.1rem;"></i>
             </button>
-            <strong style="min-width:50px;">${s.time}</strong>
-            <small class="text-secondary" style="flex:1;">${statusText}</small>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteSchedule(${i})" title="删除">
+            <div style="flex:1; min-width:0;">
+                <div class="text-truncate"><strong>${esc(s.name)}</strong></div>
+                <small class="text-secondary">${s.time} | ${intervalText} | ${asinText} | ${statusText}</small>
+            </div>
+            <button class="btn btn-sm btn-outline-accent" onclick="runScheduleNow('${id}')" title="立即执行">
+                <i class="bi bi-play-fill"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteSchedule('${id}', '${esc(s.name)}')" title="删除">
                 <i class="bi bi-trash3"></i>
             </button>
         </div>`;
     }).join('');
 }
 
-function addSchedule() {
-    document.getElementById('scheduleNewRow').style.display = '';
-    document.getElementById('newScheduleHour').focus();
+function showNewScheduleForm() {
+    document.getElementById('scheduleNewForm').style.display = '';
 }
 
-function cancelAddSchedule() {
-    document.getElementById('scheduleNewRow').style.display = 'none';
+function hideNewScheduleForm() {
+    document.getElementById('scheduleNewForm').style.display = 'none';
 }
 
-async function confirmAddSchedule() {
-    const h = document.getElementById('newScheduleHour').value;
-    const m = document.getElementById('newScheduleMinute').value;
+async function submitNewSchedule() {
+    const name = document.getElementById('newSchedName').value.trim();
+    const h = document.getElementById('newSchedHour').value;
+    const m = document.getElementById('newSchedMinute').value;
+    const interval = document.getElementById('newSchedInterval').value;
+    const fileInput = document.getElementById('newSchedFile');
+    const screenshot = document.getElementById('newSchedScreenshot').checked;
+
     const timeStr = `${h}:${m}`;
-    try {
-        const resp = await fetch('/api/auto-scrape/schedules', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ time: timeStr }),
-        });
-        const data = await resp.json();
-        if (resp.ok) {
-            _schedules = data.schedules;
-            renderSchedules();
-            document.getElementById('scheduleNewRow').style.display = 'none';
-            document.getElementById('newScheduleHour').value = '08';
-            document.getElementById('newScheduleMinute').value = '00';
-            showScheduleMsg('success', '已添加');
-        } else {
-            showScheduleMsg('danger', data.detail || '添加失败');
+
+    if (fileInput.files.length > 0) {
+        // 有文件：用 multipart 调新 API
+        const fd = new FormData();
+        fd.append('name', name || `定时任务-${timeStr}`);
+        fd.append('time', timeStr);
+        fd.append('interval_days', interval);
+        fd.append('needs_screenshot', screenshot ? 'true' : 'false');
+        fd.append('file', fileInput.files[0]);
+        try {
+            const resp = await fetch('/api/schedules', { method: 'POST', body: fd });
+            const data = await resp.json();
+            if (resp.ok) {
+                _schedules = data.schedules;
+                renderSchedules();
+                hideNewScheduleForm();
+                showScheduleMsg('success', `已创建：${data.schedule.asin_count} 个 ASIN`);
+            } else {
+                showScheduleMsg('danger', data.detail || '创建失败');
+            }
+        } catch(e) {
+            showScheduleMsg('danger', '网络错误: ' + e.message);
         }
-    } catch(e) {
-        showScheduleMsg('danger', '网络错误: ' + e.message);
+    } else {
+        // 无文件：全库 ASIN 模式
+        try {
+            const resp = await fetch('/api/auto-scrape/schedules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ time: timeStr }),
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                // 补充 interval_days 和 name
+                const schedules = data.schedules;
+                const last = schedules[schedules.length - 1];
+                if (last) {
+                    last.name = name || last.name;
+                    last.interval_days = parseInt(interval) || 1;
+                    // 用 PUT 更新
+                    await fetch(`/api/schedules/${last.id}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: last.name, interval_days: last.interval_days }),
+                    });
+                }
+                await loadSchedules();
+                hideNewScheduleForm();
+                showScheduleMsg('success', '已创建（全库 ASIN）');
+            } else {
+                showScheduleMsg('danger', data.detail || '创建失败');
+            }
+        } catch(e) {
+            showScheduleMsg('danger', '网络错误: ' + e.message);
+        }
     }
 }
 
-async function toggleSchedule(index) {
-    const current = _schedules[index];
+async function toggleSchedule(schedId) {
+    const s = _schedules.find(x => x.id === schedId);
+    if (!s) return;
     try {
-        const resp = await fetch(`/api/auto-scrape/schedules/${index}`, {
+        const resp = await fetch(`/api/schedules/${schedId}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled: !current.enabled }),
+            body: JSON.stringify({ enabled: !s.enabled }),
         });
         const data = await resp.json();
-        if (resp.ok) {
-            _schedules = data.schedules;
-            renderSchedules();
-        }
-    } catch(e) {
-        console.error('切换失败:', e);
-    }
+        if (resp.ok) { _schedules = data.schedules; renderSchedules(); }
+    } catch(e) { console.error('切换失败:', e); }
 }
 
-async function deleteSchedule(index) {
-    if (!confirm(`确定删除 ${_schedules[index].time} 的定时任务？`)) return;
+async function deleteSchedule(schedId, name) {
+    if (!confirm(`确定删除定时任务「${name}」？`)) return;
     try {
-        const resp = await fetch(`/api/auto-scrape/schedules/${index}`, { method: 'DELETE' });
+        const resp = await fetch(`/api/schedules/${schedId}`, { method: 'DELETE' });
         const data = await resp.json();
         if (resp.ok) {
             _schedules = data.schedules;
             renderSchedules();
             showScheduleMsg('success', '已删除');
         }
-    } catch(e) {
-        showScheduleMsg('danger', '删除失败: ' + e.message);
-    }
+    } catch(e) { showScheduleMsg('danger', '删除失败: ' + e.message); }
+}
+
+async function runScheduleNow(schedId) {
+    if (!confirm('确定立即执行此定时任务？')) return;
+    try {
+        const resp = await fetch(`/api/schedules/${schedId}/run`, { method: 'POST' });
+        const data = await resp.json();
+        if (resp.ok) {
+            showScheduleMsg('success', `已创建批次: ${data.batch_name} (${data.asin_count} ASINs)`);
+            await loadSchedules();
+        } else {
+            showScheduleMsg('danger', data.detail || '执行失败');
+        }
+    } catch(e) { showScheduleMsg('danger', '网络错误: ' + e.message); }
 }
 
 function showScheduleMsg(type, msg) {
     const div = document.getElementById('scheduleResult');
     div.style.display = 'block';
     div.innerHTML = `<div class="alert alert-${type} py-1">${msg}</div>`;
-    setTimeout(() => { div.style.display = 'none'; }, 2000);
+    setTimeout(() => { div.style.display = 'none'; }, 3000);
 }
 
-// 页面加载时获取定时任务列表
 document.addEventListener('DOMContentLoaded', () => {
     loadSchedules();
 });

@@ -1095,7 +1095,7 @@ class Worker:
                     last_error_type = "parse_error"
                     last_error_detail = "解析不完整（核心字段全部缺失）"
                     logger.warning(f"ASIN {asin} 核心字段全部缺失，疑似降级页面 (尝试 {attempt}/{max_retries})")
-                    await asyncio.sleep(2)
+                    await self._wait_for_rotation_before_retry(asin, reason="核心字段缺失")
                     continue
 
                 # v3: No Featured Offer 产品请求 AOD AJAX 端点补充价格/运费/配送/FBA

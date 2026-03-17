@@ -482,13 +482,17 @@ async def api_reset_settings():
 async def api_pull_tasks(request: Request,
                          worker_id: str = Query(...),
                          count: int = Query(10),
-                         needs_screenshot: Optional[bool] = Query(None)):
+                         needs_screenshot: Optional[bool] = Query(None),
+                         enable_screenshot: Optional[bool] = Query(None)):
     ip = request.client.host if request.client else None
-    _register_worker(worker_id, ip=ip)
+    # enable_screenshot 来自 worker 的 query param，更新 registry
+    _register_worker(worker_id, enable_screenshot=enable_screenshot, ip=ip)
 
     ns = None
     if needs_screenshot is not None:
         ns = needs_screenshot
+    elif enable_screenshot is not None:
+        ns = enable_screenshot
     elif worker_id in _worker_registry:
         if not _worker_registry[worker_id].get("enable_screenshot", True):
             ns = False

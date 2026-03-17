@@ -984,37 +984,38 @@ class Database:
         last_id = 0
         while True:
             joins = []
+            join_params: list = []
             where = ["d.id > ?"]
-            params: list = [last_id]
+            where_params: list = [last_id]
 
             if batch_id:
                 joins.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
-                params.insert(0, batch_id)
+                join_params.append(batch_id)
 
             if change_filter == "price_stock":
                 sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='price_stock'"
                 if batch_id:
                     sub += " AND batch_id=?"
-                    params.append(batch_id)
+                    join_params.append(batch_id)
                 sub += ") ac ON ac.asin = d.asin"
                 joins.append(sub)
             elif change_filter == "title_bullets":
                 sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='title_bullets'"
                 if batch_id:
                     sub += " AND batch_id=?"
-                    params.append(batch_id)
+                    join_params.append(batch_id)
                 sub += ") ac ON ac.asin = d.asin"
                 joins.append(sub)
             elif change_filter == "new":
                 if batch_id:
                     joins.append("JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1")
-                    params.append(batch_id)
+                    join_params.append(batch_id)
                 else:
                     joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='new') ac ON ac.asin = d.asin")
 
             join_clause = " ".join(joins)
             where_clause = " AND ".join(where)
-            params.append(batch_size)
+            params = join_params + where_params + [batch_size]
 
             sql = f"SELECT d.* FROM asin_data d {join_clause} WHERE {where_clause} ORDER BY d.id ASC LIMIT ?"
 

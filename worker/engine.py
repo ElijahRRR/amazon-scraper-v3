@@ -820,7 +820,7 @@ class Worker:
                 # === 配额执行（每次都执行，不受 version 限制）===
                 quota = s.get("quota", s.get("_quota"))
                 if quota:
-                    new_max_c = quota.get("concurrency")
+                    new_max_c = quota.get("max_concurrency") or quota.get("concurrency")
                     if new_max_c and new_max_c != self._controller._max:
                         old_max = self._controller._max
                         self._controller._max = new_max_c
@@ -831,7 +831,7 @@ class Worker:
                             self._controller._concurrency = new_max_c
                         logger.info(f"📊 配额: max_c {old_max}->{new_max_c}")
 
-                    new_qps = quota.get("qps")
+                    new_qps = quota.get("max_qps") or quota.get("qps")
                     if new_qps and self._rate_limiter and abs(new_qps - self._rate_limiter.rate) > 0.1:
                         old_qps = self._rate_limiter.rate
                         self._rate_limiter.rate = new_qps
@@ -1394,13 +1394,16 @@ class Worker:
             await self._init_session()
 
             # 重置 AIMD 控制器
+            old_c = self._controller._concurrency
+            await self._controller._resize_semaphore(old_c, config.INITIAL_CONCURRENCY)
             self._controller._concurrency = config.INITIAL_CONCURRENCY
-            await self._controller._resize_semaphore(
-                self._controller.current_concurrency, config.INITIAL_CONCURRENCY)
             self._controller._cooldown_until = 0
 
-            # 重置统计
-            self._stats = {"success": 0, "failed": 0, "total": 0}
+            # 重置统计（保留 start_time 和 blocked）
+            self._stats = {
+                "total": 0, "success": 0, "failed": 0, "blocked": 0,
+                "start_time": self._stats.get("start_time"),
+            }
             self._success_since_rotate = 0
             self._empty_title_count = 0
             self._rotation_epoch += 1

@@ -575,10 +575,13 @@ async def api_submit_result(request: Request):
     task_id = data.pop("task_id", None)
     batch_id = data.pop("batch_id", None)
 
+    if task_id:
+        is_new = await db.complete_task(task_id)
+        if not is_new:
+            # 任务已被其他 Worker 完成，跳过重复写入
+            return {"ok": True, "duplicate": True}
     saved = await db.save_result(data, batch_id)
-    if task_id and saved:
-        await db.complete_task(task_id)
-    elif task_id and not saved:
+    if task_id and not saved:
         await db.fail_task(task_id, "parse_error", "save_result returned False")
 
     worker_id = data.get("worker_id", "")
@@ -597,12 +600,14 @@ async def api_submit_batch(request: Request):
     for item in results:
         task_id = item.pop("task_id", None)
         batch_id = item.pop("batch_id", None)
-        ok = await db.save_result(item, batch_id)
+        # 先标记完成，如果已被其他 Worker 完成则跳过
         if task_id:
-            if ok:
-                await db.complete_task(task_id)
-            else:
-                await db.fail_task(task_id, "parse_error", "save_result returned False")
+            is_new = await db.complete_task(task_id)
+            if not is_new:
+                continue  # 重复提交，跳过
+        ok = await db.save_result(item, batch_id)
+        if task_id and not ok:
+            await db.fail_task(task_id, "parse_error", "save_result returned False")
         if ok:
             saved += 1
 

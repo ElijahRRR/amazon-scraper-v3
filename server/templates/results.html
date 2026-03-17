@@ -483,16 +483,51 @@ async function doExport() {
 }
 
 async function clearData() {
-    const choice = confirm('确定清空所有采集数据和截图？此操作不可恢复！');
-    if (!choice) return;
+    const hasBatch = !!state.batchId;
+    const hasSearch = !!state.search;
+    const hasFilter = hasBatch || hasSearch;
+
+    let msg, body;
+    if (hasBatch && hasSearch) {
+        const batchSel = document.getElementById('batchFilter');
+        const batchText = batchSel.options[batchSel.selectedIndex]?.text || '';
+        msg = `确定删除批次「${batchText}」中搜索匹配的数据？此操作不可恢复！`;
+        body = { batch_id: parseInt(state.batchId), search: state.search };
+    } else if (hasBatch) {
+        const batchSel = document.getElementById('batchFilter');
+        const batchText = batchSel.options[batchSel.selectedIndex]?.text || '';
+        msg = `确定删除批次「${batchText}」的全部数据？此操作不可恢复！`;
+        body = { batch_id: parseInt(state.batchId) };
+    } else if (hasSearch) {
+        msg = `确定删除搜索匹配「${state.search}」的全部数据？此操作不可恢复！`;
+        body = { search: state.search };
+    } else {
+        msg = '未选择任何筛选条件，将清空全部采集数据和截图！确定继续？';
+        body = null;
+    }
+
+    if (!confirm(msg)) return;
+
     try {
-        const resp = await fetch('/api/database', { method: 'DELETE' });
+        let resp;
+        if (body) {
+            resp = await fetch('/api/results', {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+        } else {
+            resp = await fetch('/api/database', { method: 'DELETE' });
+        }
         const data = await resp.json();
         if (resp.ok) {
-            alert('数据已清空');
-            location.reload();
+            const deleted = data.deleted != null ? `已删除 ${data.deleted} 条` : '数据已清空';
+            alert(deleted);
+            loadResults();
+            loadChangeStats();
+            loadBatches();
         } else {
-            alert('清空失败: ' + (data.detail || '未知错误'));
+            alert('删除失败: ' + (data.detail || '未知错误'));
         }
     } catch(e) {
         alert('网络错误: ' + e.message);

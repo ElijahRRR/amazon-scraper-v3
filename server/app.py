@@ -937,14 +937,14 @@ async def api_delete_results(request: Request):
     asins = body.get("asins")  # list of ASIN strings
     search = body.get("search")  # fuzzy search string
 
-    # 构建 ASIN 列表：精确指定 or 搜索匹配
+    # 构建 ASIN 列表
     target_asins = set()
+    has_explicit_filter = bool(asins or search)
 
     if asins:
         target_asins.update(asins)
 
     if search:
-        # 搜索匹配（复用 get_results 的逻辑）
         terms = [t.strip() for t in search.split(",") if t.strip()]
         if terms:
             or_clauses = []
@@ -959,11 +959,13 @@ async def api_delete_results(request: Request):
                 for row in rows:
                     target_asins.add(row["asin"])
 
-    if not target_asins:
-        return {"ok": True, "deleted": 0}
-
-    # 如果指定了 batch_id，取交集：只删 batch 内的
-    if batch_id:
+    # 纯 batch_id（无 asins/search）→ 删除该批次所有 ASIN
+    if batch_id and not has_explicit_filter:
+        sql = "SELECT asin FROM batch_asins WHERE batch_id = ?"
+        async with db._db.execute(sql, (batch_id,)) as c:
+            target_asins = {row["asin"] for row in await c.fetchall()}
+    # batch_id + 其他条件 → 取交集
+    elif batch_id and target_asins:
         sql = "SELECT asin FROM batch_asins WHERE batch_id = ?"
         async with db._db.execute(sql, (batch_id,)) as c:
             batch_asins = {row["asin"] for row in await c.fetchall()}

@@ -270,15 +270,9 @@
                             </div>
                         </div>
                         <div class="col-6">
-                            <label class="form-label">执行间隔</label>
-                            <select id="newSchedInterval" class="form-select">
-                                <option value="1">每天</option>
-                                <option value="2">每 2 天</option>
-                                <option value="3">每 3 天</option>
-                                <option value="7">每 7 天</option>
-                                <option value="14">每 14 天</option>
-                                <option value="30">每 30 天</option>
-                            </select>
+                            <label class="form-label">执行间隔（天）</label>
+                            <input type="number" class="form-control" id="newSchedInterval" value="1" min="1" placeholder="1">
+                            <small class="text-secondary">1=每天，2=每两天，以此类推</small>
                         </div>
                         <div class="col-12">
                             <label class="form-label">ASIN 文件 <small class="text-secondary">(.xlsx / .csv / .txt)</small></label>

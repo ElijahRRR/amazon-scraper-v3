@@ -1284,7 +1284,7 @@ class AmazonParser:
             d['best_sellers_rank'] = v
         elif 'manufacturer' in k_lower:
             d['manufacturer'] = v
-        elif 'brand' in k_lower and 'processor' not in k_lower and 'compatible' not in k_lower:
+        elif k_lower.strip() == 'brand':
             d['brand'] = v
         elif 'date first available' in k_lower:
             d['date_first_available'] = v

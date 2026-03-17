@@ -90,13 +90,13 @@
       "Run a minute-level monitor that records API progress, worker/process state, and log anomalies until completion",
       "Generate a final report summarizing stability, throughput, and suspected bugs"
     ],
-    "passes": false,
+    "passes": true,
     "evidence": [
       ".agent/monitor/batch_runtime_monitor.py",
       ".agent/runtime_logs/",
       ".agent/evidence/f005-260k-runtime-report.md"
     ],
-    "notes": "Target batch is `batch_20260316_193458` (`batch_id=1`, total `260932`). Monitoring is live via `.agent/monitor/batch_runtime_monitor.py`, with snapshots already recorded at `2026-03-16T11:47:55Z` and `2026-03-16T11:48:55Z`. Current topology is 4 online workers; startup evidence shows proxy `429`, blank-page retries, and occasional session/block rotation before the run settled into a steadier throughput pattern.",
-    "last_verified_at": "2026-03-16T11:48:55Z"
+    "notes": "The monitor completed and wrote `.agent/evidence/f005-260k-runtime-report.md` after the target batch reached `pending=0` and `processing=0`. Final batch result was `257762 done`, `3170 failed`, `260932 total` (success rate `98.79%`). The run stayed stable enough to finish with 4 workers online, but the report captured sustained proxy `429`, timeout, blank-page, block/session-rotation, and degraded-page/parse-error patterns as the main operational risks.",
+    "last_verified_at": "2026-03-16T17:25:44Z"
   }
 ]

@@ -97,6 +97,23 @@ def _save_settings():
         logger.warning(f"保存设置失败: {e}")
 
 
+def _remove_screenshot_files(file_paths: list):
+    """删除截图物理文件，忽略不存在的"""
+    for fp in file_paths:
+        if not fp:
+            continue
+        # file_path 可能是相对路径 (/static/screenshots/...) 或绝对路径
+        if fp.startswith("/static/"):
+            full = os.path.join(config.PROJECT_DIR, "server", fp.lstrip("/"))
+        else:
+            full = fp
+        try:
+            if os.path.isfile(full):
+                os.remove(full)
+        except OSError:
+            pass
+
+
 def _register_worker(worker_id: str, enable_screenshot: bool = None, ip: str = None):
     if not _WORKER_ID_RE.match(worker_id):
         return
@@ -421,6 +438,13 @@ async def api_delete_batch(batch_name: str):
     if not batch:
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
+    # 先收集截图物理文件路径
+    screenshot_files = []
+    async with db._db.execute(
+        "SELECT file_path FROM screenshots WHERE batch_id=? AND file_path IS NOT NULL", (batch_id,)
+    ) as c:
+        screenshot_files = [row["file_path"] for row in await c.fetchall()]
+
     async with db._write_lock:
         await db._db.execute("BEGIN")
         await db._db.execute("DELETE FROM tasks WHERE batch_id=?", (batch_id,))
@@ -429,6 +453,9 @@ async def api_delete_batch(batch_name: str):
         await db._db.execute("DELETE FROM asin_changes WHERE batch_id=?", (batch_id,))
         await db._db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
         await db._db.execute("COMMIT")
+
+    # 删除物理截图文件
+    _remove_screenshot_files(screenshot_files)
     return {"ok": True}
 
 
@@ -983,6 +1010,13 @@ async def api_delete_results(request: Request):
     asin_list = list(target_asins)
     placeholders = ",".join("?" * len(asin_list))
 
+    # 先收集截图物理文件路径
+    screenshot_files = []
+    async with db._db.execute(
+        f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", asin_list
+    ) as c:
+        screenshot_files = [row["file_path"] for row in await c.fetchall()]
+
     async with db._write_lock:
         await db._db.execute("BEGIN")
         await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", asin_list)
@@ -991,6 +1025,8 @@ async def api_delete_results(request: Request):
         await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", asin_list)
         await db._db.execute("COMMIT")
 
+    # 删除物理截图文件
+    _remove_screenshot_files(screenshot_files)
     return {"ok": True, "deleted": len(asin_list)}
 
 

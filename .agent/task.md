@@ -1,14 +1,15 @@
 # Task Definition
 
-- Mode: build
-- Task: Verify the newly added server-triggered worker soft-restart functionality
+- Mode: review
+- Task: Review the full codebase for correctness bugs, cross-module contract mismatches, and coverage gaps
 - Constraints:
-  - Prefer end-to-end verification over static inspection only.
-  - Keep the verification isolated from any long-running production batch state.
-  - If a defect is found, fix only what is necessary to make the restart path usable and re-verify.
+  - Focus on behavior-affecting issues in the current codebase, not style.
+  - Prefer reproduced findings with concrete file/line references.
+  - Keep the review centered on `worker/`, `server/`, and `common/` runtime flows.
 - Acceptance Criteria:
-  - A server-side restart request reaches the target worker through `/api/worker/sync`.
-  - The worker performs `_soft_restart()` successfully, recreates its session, and remains online.
-  - Verification includes concrete server responses and worker log evidence.
+  - Run a baseline verification pass.
+  - Inspect the end-to-end flow across worker task pulling, server coordination, database persistence, screenshot handling, and export.
+  - Record active findings and evidence in `.agent/review_list.json` and `.agent/evidence/`.
+  - Produce a concise findings-first review for the user.
 - Out of Scope:
-  - Broader worker-management redesign beyond validating this restart feature.
+  - Implementing fixes unless the user explicitly asks for remediation.

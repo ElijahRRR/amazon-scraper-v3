@@ -1,10 +1,16 @@
 __pycache__/
 *.pyc
 .env
+.DS_Store
 data/scraper.db
+data/scraper.db-shm
+data/scraper.db-wal
 data/exports/
+data/schedules/
 server/static/screenshots/
 screenshot_cache/
 runtime_settings.json
 *.egg-info/
 .venv/
+.agent/runtime_logs/
+.agent/evidence/

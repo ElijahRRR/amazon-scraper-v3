@@ -110,11 +110,34 @@
       "Trigger `/api/workers/{worker_id}/restart` and confirm the worker rebuilds its session and stays online",
       "Record the result and any defects with reproduction evidence"
     ],
-    "passes": false,
+    "passes": true,
     "evidence": [
-      ".agent/evidence/f006-worker-soft-restart.md"
+      ".agent/evidence/f006-worker-soft-restart.md",
+      "python3 -m py_compile server/app.py worker/engine.py run_server.py run_worker.py",
+      "http://127.0.0.1:8898/api/workers",
+      "http://127.0.0.1:8898/api/progress?batch_id=2"
     ],
-    "notes": "Pending isolated end-to-end verification of commit `eba3edd`.",
-    "last_verified_at": null
+    "notes": "Isolated verification on `http://127.0.0.1:8898` passed: the server-side restart flag reached `restart-test-worker`, the worker rebuilt its session, stayed online, and completed a 200-ASIN batch with `done=200`, `failed=0`. Residual issue: the restart endpoint currently returns success even for nonexistent worker ids.",
+    "last_verified_at": "2026-03-17T05:46:42Z"
+  },
+  {
+    "id": "F-007",
+    "priority": "P1",
+    "category": "analysis",
+    "description": "Analyze why some workers enter degraded-page / parse-error bursts immediately after `Session 初始化成功`, and propose concrete mitigations.",
+    "steps": [
+      "Inspect the session initialization, product fetch, and degraded-page detection paths",
+      "Correlate the code with retained worker log evidence around session-init windows",
+      "Identify the most likely root causes and rank mitigations by expected impact"
+    ],
+    "passes": true,
+    "evidence": [
+      ".agent/evidence/f007-session-init-degraded-burst-analysis.md",
+      ".agent/runtime_logs/worker_stage2.log",
+      ".agent/runtime_logs/worker_stage3.log",
+      ".agent/runtime_logs/worker_stage4.log"
+    ],
+    "notes": "The analysis concluded that the bursts are mainly caused by false-positive session readiness, no product-page canary, immediate 16-way cold-start traffic, and the fact that degraded parse failures do not currently invalidate the session. Recommended fix order: strict init verification + canary, cold-start probation, rotate on degraded-page clusters, then improve 200-level block telemetry/detection.",
+    "last_verified_at": "2026-03-17T08:46:20Z"
   }
 ]

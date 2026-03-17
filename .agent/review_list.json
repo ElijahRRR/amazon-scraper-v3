@@ -1,44 +1,95 @@
 [
   {
-    "id": "R-001",
-    "priority": "P1",
-    "dimension": "correctness",
-    "check": "Verify screenshot failure path stays consistent with server retry semantics",
-    "status": "finding",
-    "evidence": [
-      ".agent/evidence/review-screenshot-subprocess.md",
-      "common/database.py:946",
-      "worker/screenshot.py:186",
-      "worker/screenshot.py:316"
-    ],
-    "finding": "When a render fails, screenshot.py renames the source HTML to .failed and stops scanning it, but the server writes the screenshot row back to status='pending' for retry_count < 3. That leaves a pending screenshot with no remaining producer to retry it, so screenshot progress can remain stuck indefinitely after the first failure.",
-    "last_checked_at": "2026-03-16T10:16:00Z"
-  },
-  {
-    "id": "R-002",
-    "priority": "P2",
-    "dimension": "diagnosability",
-    "check": "Verify failed HTML is actually preserved for debugging",
-    "status": "finding",
-    "evidence": [
-      ".agent/evidence/review-screenshot-subprocess.md",
-      "worker/screenshot.py:188",
-      "worker/screenshot.py:320"
-    ],
-    "finding": "The new .failed rename no longer blocks batch completion, but _check_batch_completion() immediately removes the whole batch directory once no .html files remain. In practice the .failed artifact is deleted right away, so the promised postmortem HTML is not retained.",
-    "last_checked_at": "2026-03-16T10:16:00Z"
-  },
-  {
-    "id": "R-003",
+    "id": "R-100",
     "priority": "P3",
     "dimension": "baseline",
-    "check": "Run lightweight syntax validation on screenshot worker changes",
+    "check": "Run repository baseline tests before the code review",
     "status": "passed",
     "evidence": [
-      "python3 -m py_compile worker/engine.py worker/screenshot.py test_screenshot.py",
-      "python3 - <<'PY' ... ast.parse(...) ... PY"
+      "python3 -m unittest"
     ],
     "finding": "",
-    "last_checked_at": "2026-03-16T10:16:00Z"
+    "last_checked_at": "2026-03-17T09:42:33Z"
+  },
+  {
+    "id": "R-101",
+    "priority": "P1",
+    "dimension": "correctness",
+    "check": "Verify screenshot-disabled workers cannot pull screenshot tasks",
+    "status": "finding",
+    "evidence": [
+      ".agent/evidence/review-full-codebase-20260317.md",
+      "worker/engine.py:733",
+      "worker/engine.py:736",
+      "server/app.py:482",
+      "server/app.py:487",
+      "server/app.py:490"
+    ],
+    "finding": "The worker sends `enable_screenshot=0` when polling for work, but the server only reads `needs_screenshot`. Until the later heartbeat updates the registry, a `--no-screenshot` worker is registered as screenshot-capable and can pull screenshot tasks. Reproduced via ASGI request: `/api/tasks/pull?worker_id=no-shot-worker&count=1&enable_screenshot=0` returned a task with `needs_screenshot=True`, which can leave screenshot rows stuck pending because that worker never enqueues HTML.",
+    "last_checked_at": "2026-03-17T09:45:27Z"
+  },
+  {
+    "id": "R-102",
+    "priority": "P1",
+    "dimension": "correctness",
+    "check": "Verify server-issued global quotas are actually applied by workers",
+    "status": "finding",
+    "evidence": [
+      ".agent/evidence/review-full-codebase-20260317.md",
+      "server/app.py:230",
+      "server/app.py:233",
+      "server/app.py:625",
+      "worker/engine.py:821",
+      "worker/engine.py:834"
+    ],
+    "finding": "The coordinator publishes quota keys as `max_concurrency` and `max_qps`, but the worker reads `quota.get('concurrency')` and `quota.get('qps')`. As a result the distributed quota mechanism is a no-op: workers keep their local max concurrency and token-bucket rate even when the server computes tighter limits.",
+    "last_checked_at": "2026-03-17T09:45:11Z"
+  },
+  {
+    "id": "R-103",
+    "priority": "P1",
+    "dimension": "correctness",
+    "check": "Verify soft restart really resets runtime concurrency",
+    "status": "finding",
+    "evidence": [
+      ".agent/evidence/review-full-codebase-20260317.md",
+      "worker/engine.py:1397",
+      "worker/engine.py:1399"
+    ],
+    "finding": "Soft restart overwrites `self._controller._concurrency` before calling `_resize_semaphore()`, so the resize sees the same old/new value and leaves the semaphore unchanged. Reproduced with a worker whose semaphore had 21 permits: after `_soft_restart()` the public concurrency reset to 16, but the semaphore still had 21 permits, so actual request parallelism stayed above the intended recovery limit.",
+    "last_checked_at": "2026-03-17T09:45:10Z"
+  },
+  {
+    "id": "R-104",
+    "priority": "P2",
+    "dimension": "correctness",
+    "check": "Verify soft restart preserves the stats structure used during shutdown",
+    "status": "finding",
+    "evidence": [
+      ".agent/evidence/review-full-codebase-20260317.md",
+      "worker/engine.py:1402",
+      "worker/engine.py:1408",
+      "worker/engine.py:1477",
+      "worker/engine.py:1488"
+    ],
+    "finding": "Soft restart replaces `_stats` with a partial dict containing only `success`, `failed`, and `total`. The shutdown path later assumes `start_time` and `blocked` still exist; reproduced by calling `_soft_restart()` and then `_print_stats()`, which raises `KeyError: 'start_time'`.",
+    "last_checked_at": "2026-03-17T09:46:13Z"
+  },
+  {
+    "id": "R-105",
+    "priority": "P2",
+    "dimension": "correctness",
+    "check": "Verify batch-scoped change exports return the expected rows",
+    "status": "finding",
+    "evidence": [
+      ".agent/evidence/review-full-codebase-20260317.md",
+      "common/database.py:990",
+      "common/database.py:997",
+      "common/database.py:1017",
+      "server/app.py:786",
+      "server/app.py:808"
+    ],
+    "finding": "In `iter_results()`, the `last_id` cursor is inserted into `params` before the extra `batch_id` placeholders added by change-filter joins. For batch-scoped exports such as `change_filter='price_stock'`, SQLite binds the cursor value into the subquery's `batch_id=?` slot, so filtered exports come back empty. Reproduced on a temp DB where `change_filter='all'` returned `['B000000001']` but `change_filter='price_stock'` returned `[]` for the same batch.",
+    "last_checked_at": "2026-03-17T09:45:00Z"
   }
 ]

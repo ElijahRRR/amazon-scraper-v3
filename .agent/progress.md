@@ -323,3 +323,150 @@
   - none
 - Next action:
   - Wait for the user's next instruction; the runtime is fully stopped.
+
+### Session: 2026-03-17T05:46:42Z
+- Target item id: F-006
+- Objective: Verify the new server-triggered worker soft-restart flow end-to-end
+- Baseline status: commit `eba3edd` had added the restart endpoint, worker sync flag, soft restart handler, and frontend button, but the flow had not yet been validated in an isolated runtime
+- Work performed:
+  - Inspected the soft-restart code path in `server/app.py`, `worker/engine.py`, and `server/templates/workers.html`.
+  - Ran baseline syntax verification with `python3 -m py_compile server/app.py worker/engine.py run_server.py run_worker.py`.
+  - Started an isolated server on `8898` and an isolated worker `restart-test-worker --no-screenshot`.
+  - Uploaded a 200-ASIN verification batch (`restart_verify_20260317`, `batch_id=2`), triggered `POST /api/workers/restart-test-worker/restart`, and observed the worker log through `收到软重启指令` -> `初始化 Amazon session` -> `软重启完成`.
+  - Queried `/api/workers` and `/api/progress?batch_id=2` to confirm the worker stayed online and the batch completed with `done=200`, `failed=0`.
+  - Added one boundary check showing `POST /api/workers/ghost-worker-does-not-exist/restart` still returns `200 OK`, which is an operational validation gap.
+- Verification commands:
+  - `python3 -m py_compile server/app.py worker/engine.py run_server.py run_worker.py`
+  - `python3 - <<'PY' ... GET http://127.0.0.1:8898/api/workers ... GET http://127.0.0.1:8898/api/progress?batch_id=2 ... PY`
+  - `python3 - <<'PY' ... POST http://127.0.0.1:8898/api/workers/ghost-worker-does-not-exist/restart ... PY`
+- Verification result:
+  - pass (baseline syntax check)
+  - pass (restart endpoint reached the worker and triggered `_soft_restart()`)
+  - pass (worker remained online after the restart)
+  - pass (verification batch finished `done=200`, `failed=0`)
+  - note (non-blocking): nonexistent worker ids currently receive a success response from the restart endpoint
+- Evidence paths:
+  - `.agent/evidence/f006-worker-soft-restart.md`
+  - `.agent/feature_list.json`
+- Blockers:
+  - none
+- Next action:
+  - Stop the isolated `8898` verification runtime and report the validated behavior plus the nonexistent-worker edge case to the user.
+
+### Session: 2026-03-17T05:48:12Z
+- Target item id: F-006
+- Objective: Clean up the isolated `8898` verification runtime after soft-restart testing
+- Baseline status: F-006 had already passed, but the temporary `run_server.py` and `restart-test-worker` processes on `8898` were still running idle
+- Work performed:
+  - Sent `SIGTERM` to the isolated worker and server processes used for verification.
+  - Confirmed the worker process on `http://127.0.0.1:8898` was gone.
+  - Confirmed the isolated `8898` server process was gone; the only remaining `run_server.py` in `ps` belonged to a separate pre-existing runtime outside this verification loop.
+- Verification commands:
+  - `kill -TERM 27434 27383`
+  - `ps -Ao pid,ppid,pgid,etime,command | rg 'run_server.py|run_worker.py --server http://127.0.0.1:8898 --worker-id restart-test-worker|worker/screenshot.py http://127.0.0.1:8898' || true`
+- Verification result:
+  - pass (isolated `restart-test-worker` process absent)
+  - pass (isolated `8898` server process absent)
+  - note (expected): one unrelated pre-existing `run_server.py` process remained in the machine process list
+- Evidence paths:
+  - `.agent/evidence/f006-worker-soft-restart.md`
+- Blockers:
+  - none
+- Next action:
+  - Report the F-006 verification result to the user; no isolated verification runtime remains.
+
+### Session: 2026-03-17T08:46:20Z
+- Target item id: F-007
+- Objective: Explain why degraded-page / parse-error bursts sometimes appear immediately after `Session 初始化成功`, and produce a fix plan
+- Baseline status: retained runtime logs already showed session-correlated parse-error clusters, but the causal chain across `session.initialize()`, immediate product traffic, and parser classification had not yet been written down
+- Work performed:
+  - Inspected `worker/session.py`, `worker/engine.py`, `worker/parser.py`, `common/config.py`, and the retained runtime evidence from the 260k batch.
+  - Verified that `Session 初始化成功` only proves homepage + ZIP flow success, not product-page health.
+  - Confirmed two permissive init checks: `_set_zip_code()` accepts non-JSON HTTP 200 as success, and `_verify_zip_code()` accepts missing location widget as success if no foreign-currency marker is found.
+  - Correlated those checks with a concrete bad session window in `.agent/runtime_logs/worker_stage2.log`, where `✅ Session 初始化成功` was followed within 1 second by `HTTP 200` block detection plus a burst of `[页面为空]`.
+  - Identified the amplification factors: immediate startup at `INITIAL_CONCURRENCY=16`, `MIN_CONCURRENCY=16`, no product-page canary, and degraded parse failures that retry without rotating the session.
+  - Wrote the analysis and mitigation order into `.agent/evidence/f007-session-init-degraded-burst-analysis.md`.
+- Verification commands:
+  - `rg -n "_init_session_tps|Session 初始化成功|降级页面|核心字段全部缺失|parse_error|标题为空|页面为空" worker common .agent/evidence .agent/runtime_logs`
+  - `nl -ba worker/session.py | sed -n '79,268p'`
+  - `nl -ba worker/engine.py | sed -n '677,767p'`
+  - `nl -ba worker/engine.py | sed -n '1137,1239p'`
+  - `nl -ba worker/parser.py | sed -n '1134,1141p'`
+  - `nl -ba common/config.py | sed -n '40,68p'`
+  - `python3 - <<'PY' ... inspect bad windows around session-init lines in .agent/runtime_logs/worker_stage2.log ... PY`
+- Verification result:
+  - pass (root-cause chain identified with code references)
+  - pass (runtime-log example reproduced and matched the code path)
+  - pass (actionable mitigation order produced)
+- Evidence paths:
+  - `.agent/evidence/f007-session-init-degraded-burst-analysis.md`
+  - `.agent/runtime_logs/worker_stage2.log`
+  - `.agent/runtime_logs/worker_stage3.log`
+  - `.agent/runtime_logs/worker_stage4.log`
+- Blockers:
+  - none
+- Next action:
+  - Present the root-cause analysis and ranked fix list to the user; implement only if requested.
+
+### Session: 2026-03-17T08:46:20Z
+- Target item id: R-004/R-005
+- Objective: Review commit `b81977c` (`session rotation burst mitigation + empty title mechanisms 1&2`) for correctness and coverage gaps
+- Baseline status: the commit applied only to `worker/engine.py`; syntax still passed via `python3 -m py_compile`
+- Work performed:
+  - Reviewed the `b81977c` diff for `worker/engine.py`.
+  - Compared the new rotation/grace/empty-title logic with the existing degraded-page branches in `_process_task()`.
+  - Checked the retained runtime evidence to see which degraded-page branch actually dominated the historical bursts.
+  - Recorded two findings in `.agent/review_list.json` and wrote supporting evidence to `.agent/evidence/review-session-burst-mitigation.md`.
+- Verification commands:
+  - `git show --stat --summary b81977c`
+  - `git show b81977c -- worker/engine.py`
+  - `python3 -m py_compile worker/engine.py worker/session.py common/config.py`
+  - `nl -ba worker/engine.py | sed -n '725,830p'`
+  - `nl -ba worker/engine.py | sed -n '1242,1310p'`
+- Verification result:
+  - pass (review baseline syntax check)
+  - finding (the new hook does not cover the existing `核心字段全部缺失 / 价格缺失+库存999` degraded-page branch)
+  - finding (mechanism 2 still routes through the same 5-second debounce and therefore does not force a rotation)
+- Evidence paths:
+  - `.agent/evidence/review-session-burst-mitigation.md`
+  - `.agent/review_list.json`
+- Blockers:
+  - none
+- Next action:
+  - Report the findings to the user and wait for remediation direction.
+
+### Session: 2026-03-17T09:46:30Z
+- Target item id: R-101..R-105
+- Objective: Re-scope the review from the previous single-commit pass to a full-codebase correctness review
+- Baseline status: `python3 -m unittest` passed (`Ran 7 tests`, `OK`)
+- Work performed:
+  - Re-read the repository structure and reviewed the current `worker`, `server`, and `common` flows end to end.
+  - Replaced the prior single-commit review scope in `.agent/task.md` with a full-codebase review scope.
+  - Reproduced five active correctness issues: screenshot capability mismatch during task pull, quota key mismatch, soft-restart semaphore reset failure, soft-restart stats corruption, and batch-scoped change export parameter misbinding.
+  - Wrote consolidated evidence to `.agent/evidence/review-full-codebase-20260317.md` and refreshed `.agent/review_list.json`.
+- Verification commands:
+  - `python3 -m unittest`
+  - `python3 - <<'PY' ... httpx.ASGITransport(app=server.app.app) ... GET /api/tasks/pull?worker_id=no-shot-worker&count=1&enable_screenshot=0 ... PY`
+  - `python3 - <<'PY' ... quota = {'max_concurrency': 7, 'max_qps': 3.5} ... PY`
+  - `python3 - <<'PY' ... await w._soft_restart() ... print({'after_concurrency': ..., 'after_sem': ...}) ... PY`
+  - `python3 - <<'PY' ... await w._soft_restart(); w._print_stats() ... PY`
+  - `python3 - <<'PY' ... async for item in db.iter_results(batch_id=batch_id, change_filter='price_stock') ... PY`
+- Verification result:
+  - pass for baseline tests
+  - finding reproduced: screenshot-disabled worker received `needs_screenshot=True`
+  - finding reproduced: worker ignored server quota keys
+  - finding reproduced: semaphore stayed at 21 while public concurrency reset to 16
+  - finding reproduced: `_print_stats()` raised `KeyError: 'start_time'` after soft restart
+  - finding reproduced: filtered export returned `[]` while unfiltered export returned the batch row
+- Evidence paths:
+  - `.agent/evidence/review-full-codebase-20260317.md`
+- Files changed:
+  - `.agent/task.md`
+  - `.agent/review_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+  - `.agent/evidence/review-full-codebase-20260317.md`
+- Blockers:
+  - none
+- Next action:
+  - If the user asks for fixes, start with the cross-module contract mismatches in `worker/engine.py` and `server/app.py`, then repair `worker._soft_restart()` and `common/database.iter_results()`.

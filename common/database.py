@@ -487,18 +487,15 @@ class Database:
                 )
             await self._db.execute("COMMIT")
 
-    async def complete_task(self, task_id: int) -> bool:
-        """标记任务完成。返回 False 表示任务已被其他 Worker 完成（重复提交）"""
+    async def complete_task(self, task_id: int):
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         async with self._write_lock:
             await self._db.execute("BEGIN")
-            # 只更新 processing 状态的任务，已 done 的不重复处理
-            cursor = await self._db.execute(
-                "UPDATE tasks SET status='done', updated_at=? WHERE id=? AND status='processing'",
+            await self._db.execute(
+                "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
                 (now, task_id)
             )
             await self._db.execute("COMMIT")
-            return cursor.rowcount > 0
 
     async def release_tasks(self, task_ids: List[int]):
         """释放任务回 pending 状态"""

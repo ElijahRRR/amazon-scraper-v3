@@ -115,6 +115,12 @@ class Worker:
         self._rotate_lock = asyncio.Lock()
         self._last_rotate_time = 0.0  # 轮换防抖（monotonic）
         self._session_ready = asyncio.Event()  # Session 就绪信号
+        self._rotation_epoch = 0              # 轮换计数（每次成功轮换 +1）
+        self._rotation_grace_until = 0.0      # 轮换后宽限期（monotonic），期间不触发新轮换
+
+        # 机制 2：空标题累计触发主动轮换
+        self._empty_title_count = 0
+        self._empty_title_rotate_threshold = 50
 
         # Hot Standby Session（TPS 模式专用：预热备用 session，消除轮换停摆）
         self._standby_session: Optional[AmazonSession] = None
@@ -722,6 +728,8 @@ class Worker:
         隧道模式下由 proxy_manager.report_blocked(channel) + SessionPool 处理。
 
         优先使用热备 session（hot swap，<0.5s），不可用时回退到冷轮换。
+        Burst 缓解：旧 session 延迟 5s 关闭（让 in-flight 请求自然完成），
+        轮换后设 3s 宽限期（期间空标题/空页面不再触发额外轮换）。
         """
         if self._proxy_mode == "tunnel":
             return  # 隧道模式不使用全局 session 轮换
@@ -736,8 +744,6 @@ class Worker:
             self._session_ready.clear()
             old_session = self._session
             self._session = None
-            if old_session:
-                await old_session.close()
 
             # === 优先 Hot Swap：使用预热的备用 session ===
             if self._standby_session and self._standby_session.is_ready():
@@ -745,26 +751,84 @@ class Worker:
                 self._standby_session = None
                 self._standby_ready.clear()
                 self._success_since_rotate = 0
+                self._empty_title_count = 0
                 self._last_rotate_time = time.monotonic()
+                self._rotation_epoch += 1
+                self._rotation_grace_until = time.monotonic() + 3.0
                 self._session_ready.set()
                 logger.info("🔄 Session 轮换成功（hot swap，瞬间切换）")
+                # 旧 session 延迟关闭：让 in-flight 请求自然完成，避免 burst
+                if old_session:
+                    asyncio.create_task(self._delayed_close_session(old_session, delay=5))
                 # 异步报告被封，让备用预热协程获取新代理
                 await self.proxy_manager.report_blocked()
                 return
 
             # === Fallback：冷轮换 ===
             logger.info("🔄 热备不可用，执行冷轮换...")
+            # 冷轮换时旧 session 也延迟关闭
+            if old_session:
+                asyncio.create_task(self._delayed_close_session(old_session, delay=5))
             await self.proxy_manager.report_blocked()
             await asyncio.sleep(1)
 
             self._session = await self._create_session_with_retry(delay=3)
             self._success_since_rotate = 0
+            self._empty_title_count = 0
             self._last_rotate_time = time.monotonic()
+            self._rotation_epoch += 1
+            self._rotation_grace_until = time.monotonic() + 3.0
             if self._session:
                 logger.info("🔄 Session 冷轮换成功")
             else:
                 logger.error("❌ Session 轮换 3 次全部失败")
             self._session_ready.set()
+
+    async def _delayed_close_session(self, session: AmazonSession, delay: float = 5):
+        """延迟关闭旧 session，让 in-flight 请求有时间完成"""
+        try:
+            await asyncio.sleep(delay)
+            await session.close()
+            logger.debug("🔄 旧 session 延迟关闭完成")
+        except Exception as e:
+            logger.debug(f"旧 session 延迟关闭异常（忽略）: {e}")
+
+    async def _wait_for_rotation_before_retry(self, asin: str, reason: str = ""):
+        """
+        机制 1 + 机制 2 联合处理：空标题/空页面时等待 session 轮换后再重试。
+
+        机制 1（独立触发）：直接请求 session 轮换，等待新 session 就绪后返回。
+        机制 2（累计触发）：累计空标题计数，达到阈值时主动轮换。
+        Burst 缓解：宽限期内不触发额外轮换，只等待当前轮换完成。
+        """
+        self._empty_title_count += 1
+        current_epoch = self._rotation_epoch
+        now = time.monotonic()
+
+        # 宽限期内（轮换后 3s）：不触发新轮换，只等待新 session 就绪
+        in_grace = now < self._rotation_grace_until
+        if in_grace:
+            logger.debug(f"ASIN {asin} {reason} 在宽限期内，等待新 session")
+            await self._session_ready.wait()
+            return
+
+        # 机制 2：累计空标题达到阈值，优先触发
+        if self._empty_title_count >= self._empty_title_rotate_threshold:
+            logger.info(f"🔄 机制2: 空标题累计 {self._empty_title_count} 次，触发主动轮换")
+            await self._rotate_session(reason=f"空标题累计 {self._empty_title_count} 次")
+        else:
+            # 机制 1：独立触发轮换（受 5s 防抖保护）
+            await self._rotate_session(reason=f"{reason}")
+
+        # 等待 epoch 变化（确认轮换完成），最多等 15s
+        if self._rotation_epoch == current_epoch:
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                if self._rotation_epoch != current_epoch or not self._running:
+                    break
+
+        # 确保新 session 就绪
+        await self._session_ready.wait()
 
     async def _standby_warmer(self):
         """TPS 热备 Session 预热协程：后台维护一个已初始化的备用 session。"""
@@ -1181,17 +1245,25 @@ class Worker:
                     last_error_type = "parse_error"
                     last_error_detail = title
                     logger.warning(f"ASIN {asin}{ch_tag} {title} (尝试 {attempt}/{max_retries})")
-                    await asyncio.sleep(2)
+                    if not is_tunnel:
+                        # 机制 1+2：等待 session 轮换后再重试
+                        await self._wait_for_rotation_before_retry(asin, reason=title)
+                    else:
+                        await asyncio.sleep(2)
                     continue
 
-                # 标题为空视为软拦截，重试
+                # 标题为空视为软拦截（降级页面），触发 session 轮换后重试
                 if not title or title == "N/A":
                     self._controller.record_result(req_elapsed, False, False, resp_bytes, channel_id=channel)
                     attempt += 1
                     last_error_type = "parse_error"
                     last_error_detail = "标题为空"
                     logger.warning(f"ASIN {asin}{ch_tag} 标题为空 (尝试 {attempt}/{max_retries})")
-                    await asyncio.sleep(2)
+                    if not is_tunnel:
+                        # 机制 1+2：等待 session 轮换后再重试
+                        await self._wait_for_rotation_before_retry(asin, reason="标题为空")
+                    else:
+                        await asyncio.sleep(2)
                     continue
 
                 # 邮编/货币校验：检测是否采集到了非美国地区的数据
@@ -1543,6 +1615,8 @@ class Worker:
             # 重置统计
             self._stats = {"success": 0, "failed": 0, "total": 0}
             self._success_since_rotate = 0
+            self._empty_title_count = 0
+            self._rotation_epoch += 1
 
             logger.info(f"🔄 软重启完成: 新 session 已就绪, 并发重置为 {config.INITIAL_CONCURRENCY}")
         except Exception as e:

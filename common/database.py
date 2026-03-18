@@ -260,6 +260,7 @@ class Database:
                 priority INTEGER DEFAULT 0,
                 needs_screenshot BOOLEAN DEFAULT 0,
                 worker_id TEXT,
+                lease_epoch INTEGER DEFAULT 0,
                 retry_count INTEGER DEFAULT 0,
                 error_type TEXT,
                 error_detail TEXT,
@@ -270,6 +271,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks(batch_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority DESC);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status_worker ON tasks(status, worker_id, updated_at);
 
             -- 截图任务表（独立追踪，可靠重试）
             CREATE TABLE IF NOT EXISTS screenshots (
@@ -287,6 +289,18 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_screenshots_status ON screenshots(status);
             CREATE INDEX IF NOT EXISTS idx_screenshots_batch ON screenshots(batch_id);
         """)
+
+        # 迁移：为已有 tasks 表添加 lease_epoch 列（CREATE TABLE IF NOT EXISTS 不修改已有表）
+        try:
+            await self._db.execute("ALTER TABLE tasks ADD COLUMN lease_epoch INTEGER DEFAULT 0")
+            logger.info("数据库迁移: tasks 表新增 lease_epoch 列")
+        except Exception:
+            pass  # 列已存在
+        try:
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status_worker ON tasks(status, worker_id, updated_at)")
+        except Exception:
+            pass
 
     # ==================== 批次操作 ====================
 
@@ -382,12 +396,11 @@ class Database:
 
     async def pull_tasks(self, worker_id: str, count: int = 10,
                          needs_screenshot=None) -> List[Dict]:
-        """Worker 拉取待处理任务（原子操作）"""
+        """Worker 拉取待处理任务（原子操作，不再内联超时回收）"""
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         tasks = []
 
         async with self._write_lock:
-            await self._reset_timeout_tasks_unlocked()
             await self._db.execute("BEGIN IMMEDIATE")
             try:
                 ss_filter = ""
@@ -405,7 +418,8 @@ class Database:
 
                 async with self._db.execute(
                     f"""SELECT t.id, t.batch_id, t.asin, t.zip_code, t.retry_count,
-                               t.priority, t.needs_screenshot, b.name as batch_name
+                               t.priority, t.needs_screenshot, t.lease_epoch,
+                               b.name as batch_name
                         FROM tasks t
                         JOIN batches b ON b.id = t.batch_id
                         WHERE t.status = 'pending' AND t.priority = ?{ss_filter}
@@ -430,6 +444,7 @@ class Database:
                         "retry_count": row["retry_count"],
                         "priority": row["priority"],
                         "needs_screenshot": bool(row["needs_screenshot"]),
+                        "lease_epoch": row["lease_epoch"],
                     }
                     tasks.append(task)
                     ids.append(row["id"])
@@ -449,67 +464,107 @@ class Database:
 
         return tasks
 
-    async def _reset_timeout_tasks_unlocked(self):
-        """回退超时任务（必须在 _write_lock 内调用）"""
-        cutoff = (datetime.utcnow() - timedelta(minutes=config.TASK_TIMEOUT_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
-        await self._db.execute(
-            "UPDATE tasks SET status='pending', worker_id=NULL WHERE status='processing' AND updated_at < ?",
-            (cutoff,)
-        )
+    async def reclaim_dead_worker_tasks(self, dead_worker_ids: List[str]):
+        """回收死 Worker 的任务 + 硬超时兜底（liveness safety net）
 
-    async def reset_timeout_tasks(self):
+        所有回收路径都 bump lease_epoch，让旧 Worker 的迟到结果失效。
+        合成一条 SQL 防止双重 bump。
+        """
+        if not dead_worker_ids:
+            dead_worker_ids = []
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        hard_cutoff = (datetime.utcnow() - timedelta(minutes=config.TASK_TIMEOUT_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+
         async with self._write_lock:
             await self._db.execute("BEGIN")
-            await self._reset_timeout_tasks_unlocked()
+            if dead_worker_ids:
+                placeholders = ",".join("?" * len(dead_worker_ids))
+                cursor = await self._db.execute(
+                    f"""UPDATE tasks SET status='pending', worker_id=NULL,
+                           lease_epoch=lease_epoch+1, updated_at=?
+                       WHERE status='processing' AND (
+                           worker_id IN ({placeholders}) OR updated_at < ?
+                       )""",
+                    [now] + dead_worker_ids + [hard_cutoff]
+                )
+            else:
+                # 没有死 Worker，只做硬超时兜底
+                cursor = await self._db.execute(
+                    "UPDATE tasks SET status='pending', worker_id=NULL, "
+                    "lease_epoch=lease_epoch+1, updated_at=? "
+                    "WHERE status='processing' AND updated_at < ?",
+                    (now, hard_cutoff)
+                )
+            reclaimed = cursor.rowcount
             await self._db.execute("COMMIT")
+        if reclaimed > 0:
+            logger.info(f"回收 {reclaimed} 个任务 (dead_workers={len(dead_worker_ids)}, hard_cutoff={hard_cutoff})")
+        return reclaimed
 
-    async def fail_task(self, task_id: int, error_type: str = "", error_detail: str = ""):
+    async def fail_task(self, task_id: int, worker_id: str, lease_epoch: int,
+                        error_type: str = "", error_detail: str = "") -> dict:
+        """标记任务失败（校验 worker_id + lease_epoch）
+
+        Returns: {"accepted": True/False, "stale": True/False}
+        """
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         async with self._write_lock:
             async with self._db.execute(
-                "SELECT retry_count FROM tasks WHERE id = ?", (task_id,)
+                "SELECT retry_count FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                (task_id, worker_id, lease_epoch)
             ) as c:
                 row = await c.fetchone()
                 if not row:
-                    return
+                    return {"accepted": False, "stale": True}
                 retry_count = row[0] + 1
 
             await self._db.execute("BEGIN")
             if retry_count >= config.MAX_RETRIES:
                 await self._db.execute(
-                    "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? WHERE id=?",
-                    (retry_count, error_type, error_detail, now, task_id)
+                    "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
+                    "WHERE id=? AND worker_id=? AND lease_epoch=?",
+                    (retry_count, error_type, error_detail, now, task_id, worker_id, lease_epoch)
                 )
             else:
+                # 回 pending + bump epoch
                 await self._db.execute(
-                    "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, worker_id=NULL, updated_at=? WHERE id=?",
-                    (retry_count, error_type, error_detail, now, task_id)
+                    "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, "
+                    "worker_id=NULL, lease_epoch=lease_epoch+1, updated_at=? "
+                    "WHERE id=? AND worker_id=? AND lease_epoch=?",
+                    (retry_count, error_type, error_detail, now, task_id, worker_id, lease_epoch)
                 )
             await self._db.execute("COMMIT")
+        return {"accepted": True, "stale": False}
 
-    async def complete_task(self, task_id: int):
+    async def release_tasks(self, worker_id: str, tasks: List[Dict]):
+        """释放任务回 pending（校验 worker_id + lease_epoch，bump epoch）
+
+        tasks: [{"task_id": int, "lease_epoch": int}, ...]
+        """
+        if not tasks:
+            return 0
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        released = 0
+
+        # 按 epoch 分组批量更新
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for t in tasks:
+            groups[t["lease_epoch"]].append(t["task_id"])
+
         async with self._write_lock:
             await self._db.execute("BEGIN")
-            await self._db.execute(
-                "UPDATE tasks SET status='done', updated_at=? WHERE id=?",
-                (now, task_id)
-            )
+            for epoch, ids in groups.items():
+                placeholders = ",".join("?" * len(ids))
+                cursor = await self._db.execute(
+                    f"UPDATE tasks SET status='pending', worker_id=NULL, "
+                    f"lease_epoch=lease_epoch+1, updated_at=? "
+                    f"WHERE id IN ({placeholders}) AND worker_id=? AND lease_epoch=? AND status='processing'",
+                    [now] + ids + [worker_id, epoch]
+                )
+                released += cursor.rowcount
             await self._db.execute("COMMIT")
-
-    async def release_tasks(self, task_ids: List[int]):
-        """释放任务回 pending 状态"""
-        if not task_ids:
-            return
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        async with self._write_lock:
-            await self._db.execute("BEGIN")
-            placeholders = ",".join("?" * len(task_ids))
-            await self._db.execute(
-                f"UPDATE tasks SET status='pending', worker_id=NULL, updated_at=? WHERE id IN ({placeholders})",
-                [now] + task_ids
-            )
-            await self._db.execute("COMMIT")
+        return released
 
     async def prioritize_batch(self, batch_id: int, priority: int = 10):
         async with self._write_lock:
@@ -541,142 +596,197 @@ class Database:
 
     # ==================== 结果操作（含变动检测）====================
 
-    async def save_result(self, data: dict, batch_id: int = None) -> bool:
-        """保存采集结果，自动检测变动并写入 asin_changes"""
-        asin = data.get("asin", "").strip()
-        if not asin:
-            return False
+    async def accept_success_result(self, task_id: int, worker_id: str, lease_epoch: int,
+                                    data: dict, batch_id: int = None) -> dict:
+        """原子事务：校验 lease → 写数据 → 标 done
 
-        if _is_parse_failure(data):
-            title = data.get("title", "")[:40]
-            brand = data.get("brand", "")[:20]
-            price = data.get("current_price", "")
-            logger.warning(f"解析失败数据跳过: {asin} title='{title}' brand='{brand}' price='{price}'")
-            return False
-
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        data["content_hash"] = _compute_content_hash(data)
-        data["title_bullets_hash"] = _compute_title_bullets_hash(data)
-
+        Returns: {"accepted": True, "saved": True} 正常
+                 {"accepted": True, "saved": False, "server_reject": True} 解析失败
+                 {"accepted": False, "stale": True} lease 不匹配
+        """
         async with self._write_lock:
-            resolved_screenshot_path = await self._get_done_screenshot_path(asin, batch_id)
-
-            # 查询已有记录
-            async with self._db.execute(
-                "SELECT * FROM asin_data WHERE asin = ?", (asin,)
-            ) as c:
-                existing = await c.fetchone()
-
             await self._db.execute("BEGIN")
             try:
-                if existing:
-                    existing_dict = dict(existing)
-                    existing_screenshot_path = _normalize_screenshot_path(
-                        existing_dict.get("screenshot_path")
-                    )
-                    changes = []
+                # Step 1: 校验 lease（原子 gate）
+                cursor = await self._db.execute(
+                    "UPDATE tasks SET status='done', updated_at=? "
+                    "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                    (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                     task_id, worker_id, lease_epoch)
+                )
+                if cursor.rowcount == 0:
+                    await self._db.execute("ROLLBACK")
+                    return {"accepted": False, "stale": True}
 
-                    # 1. 价格/库存变动检测
-                    price_change = _compare_price(existing_dict.get("current_price"), data.get("current_price"))
-                    buybox_change = _compare_price(existing_dict.get("buybox_price"), data.get("buybox_price"))
-                    stock_qty_change = _compare_stock_qty(existing_dict.get("stock_count"), data.get("stock_count"))
-                    stock_status_change = _compare_stock_status(existing_dict.get("stock_status"), data.get("stock_status"))
-
-                    if any([price_change, buybox_change, stock_qty_change, stock_status_change]):
-                        detail_parts = []
-                        if price_change:
-                            detail_parts.append(f"price:{price_change}")
-                        if buybox_change:
-                            detail_parts.append(f"buybox:{buybox_change}")
-                        if stock_qty_change:
-                            detail_parts.append(f"stock_qty:{stock_qty_change}")
-                        if stock_status_change:
-                            detail_parts.append(f"stock_status:{stock_status_change}")
-
-                        prev_vals = f"price={existing_dict.get('current_price')}, buybox={existing_dict.get('buybox_price')}, stock={existing_dict.get('stock_count')}, status={existing_dict.get('stock_status')}"
-                        new_vals = f"price={data.get('current_price')}, buybox={data.get('buybox_price')}, stock={data.get('stock_count')}, status={data.get('stock_status')}"
-
-                        changes.append(("price_stock", ", ".join(detail_parts), prev_vals, new_vals))
-
-                    # 2. 标题/五点描述变动检测
-                    old_tb_hash = existing_dict.get("title_bullets_hash", "")
-                    new_tb_hash = data.get("title_bullets_hash", "")
-                    if old_tb_hash and new_tb_hash and old_tb_hash != new_tb_hash:
-                        prev_title = (existing_dict.get("title") or "")[:100]
-                        new_title = (data.get("title") or "")[:100]
-                        changes.append(("title_bullets", "title_or_bullets_changed",
-                                        f"title={prev_title}", f"title={new_title}"))
-
-                    # 写入变动记录
-                    for change_type, detail, prev_val, new_val in changes:
-                        await self._db.execute(
-                            "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail, prev_value, new_value) VALUES (?, ?, ?, ?, ?, ?)",
-                            (asin, batch_id, change_type, detail, prev_val, new_val)
-                        )
-
-                    # 更新主表（screenshot_path 由截图上传 API 单独管理，不在此覆盖）
-                    update_fields = []
-                    update_values = []
-                    for f in ASIN_DATA_FIELDS:
-                        if f in ("asin", "screenshot_path"):
-                            continue
-                        val = data.get(f)
-                        if val is not None:
-                            update_fields.append(f"{f} = ?")
-                            update_values.append(val)
-
-                    if resolved_screenshot_path and resolved_screenshot_path != existing_screenshot_path:
-                        update_fields.append("screenshot_path = ?")
-                        update_values.append(resolved_screenshot_path)
-
-                    update_fields.append("updated_at = ?")
-                    update_values.append(now)
-                    update_values.append(asin)
-
+                # Step 2: 解析失败检测
+                if _is_parse_failure(data):
+                    asin = data.get("asin", "")
+                    logger.warning(f"server_reject: {asin} 解析失败数据")
+                    # 降级为 failed（不回 pending 重试，Worker 已重试过）
                     await self._db.execute(
-                        f"UPDATE asin_data SET {', '.join(update_fields)} WHERE asin = ?",
-                        update_values
+                        "UPDATE tasks SET status='failed', error_type='server_reject', "
+                        "error_detail='parse_failure_on_server' WHERE id=?",
+                        (task_id,)
                     )
-                else:
-                    # 新 ASIN，插入（screenshot_path 由截图上传 API 单独管理）
-                    insert_fields = ["asin"]
-                    insert_values = [asin]
-                    for f in ASIN_DATA_FIELDS:
-                        if f in ("asin", "screenshot_path"):
-                            continue
-                        val = data.get(f)
-                        if val is not None:
-                            insert_fields.append(f)
-                            insert_values.append(val)
+                    await self._db.execute("COMMIT")
+                    return {"accepted": True, "saved": False, "server_reject": True}
 
-                    if resolved_screenshot_path:
-                        insert_fields.append("screenshot_path")
-                        insert_values.append(resolved_screenshot_path)
-
-                    insert_fields.extend(["created_at", "updated_at"])
-                    insert_values.extend([now, now])
-
-                    placeholders = ",".join("?" * len(insert_values))
-                    await self._db.execute(
-                        f"INSERT INTO asin_data ({', '.join(insert_fields)}) VALUES ({placeholders})",
-                        insert_values
-                    )
-
-                    # 记录新增变动
-                    if batch_id:
-                        await self._db.execute(
-                            "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail) VALUES (?, ?, 'new', 'first_seen')",
-                            (asin, batch_id)
-                        )
+                # Step 3: 写入 asin_data（事务内，不拿锁不开新事务）
+                saved = await self._save_result_inner_unlocked(data, batch_id)
 
                 await self._db.execute("COMMIT")
+                return {"accepted": True, "saved": saved}
             except Exception:
                 try:
                     await self._db.execute("ROLLBACK")
                 except Exception:
                     pass
                 raise
+
+    async def accept_failed_result(self, task_id: int, worker_id: str, lease_epoch: int,
+                                   error_type: str = "", error_detail: str = "") -> dict:
+        """原子受理失败结果（校验 lease）"""
+        return await self.fail_task(task_id, worker_id, lease_epoch, error_type, error_detail)
+
+    async def _save_result_inner_unlocked(self, data: dict, batch_id: int = None) -> bool:
+        """保存采集结果到 asin_data（调用方必须持有 _write_lock 并在事务内）"""
+        asin = data.get("asin", "").strip()
+        if not asin:
+            return False
+
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        data["content_hash"] = _compute_content_hash(data)
+        data["title_bullets_hash"] = _compute_title_bullets_hash(data)
+
+        resolved_screenshot_path = await self._get_done_screenshot_path(asin, batch_id)
+
+        async with self._db.execute(
+            "SELECT * FROM asin_data WHERE asin = ?", (asin,)
+        ) as c:
+            existing = await c.fetchone()
+
+        if existing:
+            existing_dict = dict(existing)
+            existing_screenshot_path = _normalize_screenshot_path(
+                existing_dict.get("screenshot_path")
+            )
+            changes = []
+
+            # 1. 价格/库存变动检测
+            price_change = _compare_price(existing_dict.get("current_price"), data.get("current_price"))
+            buybox_change = _compare_price(existing_dict.get("buybox_price"), data.get("buybox_price"))
+            stock_qty_change = _compare_stock_qty(existing_dict.get("stock_count"), data.get("stock_count"))
+            stock_status_change = _compare_stock_status(existing_dict.get("stock_status"), data.get("stock_status"))
+
+            if any([price_change, buybox_change, stock_qty_change, stock_status_change]):
+                detail_parts = []
+                if price_change:
+                    detail_parts.append(f"price:{price_change}")
+                if buybox_change:
+                    detail_parts.append(f"buybox:{buybox_change}")
+                if stock_qty_change:
+                    detail_parts.append(f"stock_qty:{stock_qty_change}")
+                if stock_status_change:
+                    detail_parts.append(f"stock_status:{stock_status_change}")
+
+                prev_vals = f"price={existing_dict.get('current_price')}, buybox={existing_dict.get('buybox_price')}, stock={existing_dict.get('stock_count')}, status={existing_dict.get('stock_status')}"
+                new_vals = f"price={data.get('current_price')}, buybox={data.get('buybox_price')}, stock={data.get('stock_count')}, status={data.get('stock_status')}"
+
+                changes.append(("price_stock", ", ".join(detail_parts), prev_vals, new_vals))
+
+            # 2. 标题/五点描述变动检测
+            old_tb_hash = existing_dict.get("title_bullets_hash", "")
+            new_tb_hash = data.get("title_bullets_hash", "")
+            if old_tb_hash and new_tb_hash and old_tb_hash != new_tb_hash:
+                prev_title = (existing_dict.get("title") or "")[:100]
+                new_title = (data.get("title") or "")[:100]
+                changes.append(("title_bullets", "title_or_bullets_changed",
+                                f"title={prev_title}", f"title={new_title}"))
+
+            # 写入变动记录
+            for change_type, detail, prev_val, new_val in changes:
+                await self._db.execute(
+                    "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail, prev_value, new_value) VALUES (?, ?, ?, ?, ?, ?)",
+                    (asin, batch_id, change_type, detail, prev_val, new_val)
+                )
+
+            # 更新主表
+            update_fields = []
+            update_values = []
+            for f in ASIN_DATA_FIELDS:
+                if f in ("asin", "screenshot_path"):
+                    continue
+                val = data.get(f)
+                if val is not None:
+                    update_fields.append(f"{f} = ?")
+                    update_values.append(val)
+
+            if resolved_screenshot_path and resolved_screenshot_path != existing_screenshot_path:
+                update_fields.append("screenshot_path = ?")
+                update_values.append(resolved_screenshot_path)
+
+            update_fields.append("updated_at = ?")
+            update_values.append(now)
+            update_values.append(asin)
+
+            await self._db.execute(
+                f"UPDATE asin_data SET {', '.join(update_fields)} WHERE asin = ?",
+                update_values
+            )
+        else:
+            # 新 ASIN，插入
+            insert_fields = ["asin"]
+            insert_values = [asin]
+            for f in ASIN_DATA_FIELDS:
+                if f in ("asin", "screenshot_path"):
+                    continue
+                val = data.get(f)
+                if val is not None:
+                    insert_fields.append(f)
+                    insert_values.append(val)
+
+            if resolved_screenshot_path:
+                insert_fields.append("screenshot_path")
+                insert_values.append(resolved_screenshot_path)
+
+            insert_fields.extend(["created_at", "updated_at"])
+            insert_values.extend([now, now])
+
+            placeholders = ",".join("?" * len(insert_values))
+            await self._db.execute(
+                f"INSERT INTO asin_data ({', '.join(insert_fields)}) VALUES ({placeholders})",
+                insert_values
+            )
+
+            # 记录新增变动
+            if batch_id:
+                await self._db.execute(
+                    "INSERT INTO asin_changes (asin, batch_id, change_type, change_detail) VALUES (?, ?, 'new', 'first_seen')",
+                    (asin, batch_id)
+                )
+
         return True
+
+    async def save_result(self, data: dict, batch_id: int = None) -> bool:
+        """兼容入口：直接保存结果（不走 lease 校验，用于测试/直接写入）"""
+        asin = data.get("asin", "").strip()
+        if not asin:
+            return False
+        if _is_parse_failure(data):
+            logger.warning(f"解析失败数据跳过: {asin}")
+            return False
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                result = await self._save_result_inner_unlocked(data, batch_id)
+                await self._db.execute("COMMIT")
+                return result
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
 
     async def _get_done_screenshot_path(self, asin: str, batch_id: int = None) -> Optional[str]:
         queries = []

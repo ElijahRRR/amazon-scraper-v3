@@ -73,12 +73,14 @@ class Worker:
         self._queue_size = getattr(config, "TASK_QUEUE_SIZE", 100)
         self._prefetch_threshold = getattr(config, "TASK_PREFETCH_THRESHOLD", 0.5)
 
-        # 统计
+        # 统计（双口径：采集层 success/failed + 提交层 accepted/stale）
         self._stats = {
             "total": 0,
             "success": 0,
             "failed": 0,
             "blocked": 0,
+            "accepted": 0,
+            "stale": 0,
             "start_time": None,
         }
 
@@ -272,9 +274,9 @@ class Worker:
                 threshold = int(self._queue_size * self._prefetch_threshold)
 
                 if queue_size < threshold:
-                    # 拉取量 = 当前并发数的 2 倍（预取），但不超过队列剩余空间
+                    # 拉取量 = 当前并发数（缩短暴露窗口），但不超过队列剩余空间
                     fetch_count = min(
-                        self._controller.current_concurrency * 2,
+                        self._controller.current_concurrency,
                         self._queue_size - queue_size,
                     )
                     fetch_count = max(fetch_count, 5)  # 至少拉 5 个
@@ -293,7 +295,7 @@ class Worker:
                         has_priority = any(t.get("priority", 0) > 0 for t in tasks)
                         if has_priority and not self._task_queue.empty():
                             # 只清空非优先任务，保留已有的优先任务（防止无限循环）
-                            dropped_ids = []
+                            dropped_tasks = []
                             kept_items = []
                             while not self._task_queue.empty():
                                 try:
@@ -303,14 +305,14 @@ class Worker:
                                         if old_task.get("priority", 0) > 0:
                                             kept_items.append(item)
                                         else:
-                                            dropped_ids.append(old_task["id"])
+                                            dropped_tasks.append(old_task)
                                 except asyncio.QueueEmpty:
                                     break
                             for item in kept_items:
                                 await self._task_queue.put(item)
-                            if dropped_ids:
-                                logger.info(f"🚀 检测到优先采集任务，已清空队列中 {len(dropped_ids)} 个普通任务（保留 {len(kept_items)} 个优先任务）")
-                                asyncio.create_task(self._release_tasks(dropped_ids))
+                            if dropped_tasks:
+                                logger.info(f"🚀 检测到优先采集任务，已清空队列中 {len(dropped_tasks)} 个普通任务（保留 {len(kept_items)} 个优先任务）")
+                                asyncio.create_task(self._release_tasks(dropped_tasks))
 
                         for task in tasks:
                             # 首次请求 priority=0（优先处理），重试请求 priority=1（低优先级）
@@ -745,12 +747,20 @@ class Worker:
             logger.error(f"拉取任务异常: {e}")
             return None  # 网络异常，快速重试
 
-    async def _release_tasks(self, task_ids: List[int]):
-        """通知 Server 归还未处理的任务（优先采集切换时调用）"""
+    async def _release_tasks(self, tasks_to_release: list):
+        """通知 Server 归还未处理的任务（优先采集切换时调用）
+
+        tasks_to_release: list of task dicts (must have "id" and "lease_epoch")
+        """
         try:
             url = f"{self.server_url}/api/tasks/release"
+            payload = {
+                "worker_id": self.worker_id,
+                "tasks": [{"task_id": t["id"], "lease_epoch": t.get("lease_epoch", 0)}
+                          for t in tasks_to_release],
+            }
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(url, json={"task_ids": task_ids})
+                resp = await client.post(url, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
                 logger.info(f"已归还 {data.get('released', 0)} 个旧任务到 pending")
@@ -917,6 +927,7 @@ class Worker:
         """
         asin = task["asin"]
         task_id = task["id"]
+        lease_epoch = task.get("lease_epoch", 0)
         zip_code = task.get("zip_code", self.zip_code)
         max_retries = self._max_retries
         resp_bytes = 0
@@ -989,7 +1000,7 @@ class Worker:
                     await self._submit_result(
                         task_id, None, success=False,
                         error_type=last_error_type, error_detail=last_error_detail,
-                        batch_id=task.get("batch_id")
+                        batch_id=task.get("batch_id"), lease_epoch=lease_epoch
                     )
                     self._stats["failed"] += 1
                     self._stats["total"] += 1
@@ -1002,7 +1013,7 @@ class Worker:
                     result_data = self.parser._default_result(asin, zip_code)
                     result_data["title"] = "[商品不存在]"
                     result_data["batch_name"] = task.get("batch_name", "")
-                    await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"))
+                    await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
                     if task.get("needs_screenshot") and self._enable_screenshot:
                         await self._enqueue_screenshot_html(
                             asin=asin,
@@ -1121,7 +1132,7 @@ class Worker:
 
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes)
-                await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"))
+                await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
                 self._stats["success"] += 1
                 self._stats["total"] += 1
 
@@ -1163,7 +1174,8 @@ class Worker:
         # 所有重试用完，标记失败
         logger.error(f"ASIN {asin} 采集失败 (已重试 {max_retries} 次) [{last_error_type}]")
         await self._submit_result(task_id, None, success=False,
-                                  error_type=last_error_type, error_detail=last_error_detail)
+                                  error_type=last_error_type, error_detail=last_error_detail,
+                                  batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
         self._stats["failed"] += 1
         self._stats["total"] += 1
         return (False, False, resp_bytes)
@@ -1174,19 +1186,21 @@ class Worker:
 
     async def _submit_result(self, task_id: int, result_data: Optional[Dict], success: bool,
                              error_type: str = None, error_detail: str = None,
-                             batch_id: int = None):
-        """将结果放入批量提交队列（v3: 扁平化 payload）"""
+                             batch_id: int = None, lease_epoch: int = 0):
+        """将结果放入批量提交队列（v3: 扁平化 payload + lease_epoch）"""
         if success and result_data:
             # v3: 扁平化结果到顶层，server 直接从 item 读取 asin 等字段
             payload = dict(result_data)
             payload["task_id"] = task_id
             payload["batch_id"] = batch_id
             payload["worker_id"] = self.worker_id
+            payload["lease_epoch"] = lease_epoch
         else:
             payload = {
                 "task_id": task_id,
                 "batch_id": batch_id,
                 "worker_id": self.worker_id,
+                "lease_epoch": lease_epoch,
                 "success": False,
             }
             if error_type:
@@ -1250,14 +1264,20 @@ class Worker:
             await self._submit_batch(batch)
 
     async def _submit_batch(self, batch: List[Dict], retry: int = 3):
-        """批量 POST 提交结果到服务器（含重试）"""
+        """批量 POST 提交结果到服务器（含重试 + stale 统计）"""
         url = f"{self.server_url}/api/tasks/result/batch"
         for attempt in range(retry):
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
                     resp = await client.post(url, json={"results": batch})
                 if resp.status_code == 200:
-                    logger.debug(f"批量提交 {len(batch)} 条结果成功")
+                    data = resp.json()
+                    accepted = data.get("accepted", 0)
+                    stale = data.get("stale", 0)
+                    self._stats["accepted"] += accepted
+                    self._stats["stale"] += stale
+                    if stale > 0:
+                        logger.debug(f"📊 批量提交: {accepted} accepted, {stale} stale")
                     return
                 logger.warning(f"批量提交失败 HTTP {resp.status_code} (尝试 {attempt+1}/{retry})")
             except Exception as e:
@@ -1275,7 +1295,13 @@ class Worker:
             for payload in batch:
                 try:
                     resp = await client.post(url, json=payload)
-                    if resp.status_code != 200:
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if data.get("stale"):
+                            self._stats["stale"] += 1
+                        elif data.get("ok"):
+                            self._stats["accepted"] += 1
+                    elif resp.status_code != 200:
                         logger.warning(f"逐条提交失败: task_id={payload.get('task_id')} HTTP {resp.status_code}")
                 except Exception as e:
                     logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
@@ -1399,9 +1425,10 @@ class Worker:
             self._controller._concurrency = config.INITIAL_CONCURRENCY
             self._controller._cooldown_until = 0
 
-            # 重置统计（保留 start_time 和 blocked）
+            # 重置统计（保留 start_time）
             self._stats = {
                 "total": 0, "success": 0, "failed": 0, "blocked": 0,
+                "accepted": 0, "stale": 0,
                 "start_time": self._stats.get("start_time"),
             }
             self._success_since_rotate = 0

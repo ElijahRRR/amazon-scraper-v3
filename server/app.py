@@ -163,15 +163,25 @@ templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
 # ==================== 后台任务 ====================
 
 async def _timeout_task_loop():
-    """每 30s 回退超时任务、清理离线 worker"""
+    """每 30s 心跳感知回收 + 硬超时兜底 + 清理离线 worker"""
     while True:
         await asyncio.sleep(30)
         try:
-            await db.reset_timeout_tasks()
-            # 清理 5 分钟无心跳的 worker
-            cutoff = time.time() - 300
-            dead = [wid for wid, w in _worker_registry.items() if w["last_seen"] < cutoff]
-            for wid in dead:
+            # 识别死 Worker：2 分钟无心跳
+            now = time.time()
+            heartbeat_cutoff = now - 120
+            dead_worker_ids = [
+                wid for wid, w in _worker_registry.items()
+                if w["last_seen"] < heartbeat_cutoff
+            ]
+
+            # 回收死 Worker 的 processing 任务 + 硬超时兜底（合成一条 SQL 防双重 epoch bump）
+            await db.reclaim_dead_worker_tasks(dead_worker_ids)
+
+            # 清理 5 分钟无心跳的 worker 注册信息
+            offline_cutoff = now - 300
+            truly_dead = [wid for wid, w in _worker_registry.items() if w["last_seen"] < offline_cutoff]
+            for wid in truly_dead:
                 del _worker_registry[wid]
                 _global_coordinator.pop(wid, None)
         except Exception as e:
@@ -563,54 +573,77 @@ async def api_pull_tasks(request: Request,
 @app.post("/api/tasks/release")
 async def api_release_tasks(request: Request):
     body = await request.json()
-    task_ids = body.get("task_ids", [])
-    await db.release_tasks(task_ids)
-    return {"ok": True}
+    worker_id = body.get("worker_id", "")
+    tasks = body.get("tasks", [])
+    # 兼容旧格式 {"task_ids": [1,2,3]}
+    if not tasks and "task_ids" in body:
+        tasks = [{"task_id": tid, "lease_epoch": 0} for tid in body["task_ids"]]
+    released = await db.release_tasks(worker_id, tasks)
+    return {"ok": True, "released": released}
 
 
 @app.post("/api/tasks/result")
 async def api_submit_result(request: Request):
-    """提交单个结果"""
+    """提交单个结果（lease 校验 → 原子写入）"""
     data = await request.json()
     task_id = data.pop("task_id", None)
     batch_id = data.pop("batch_id", None)
-
-    saved = await db.save_result(data, batch_id)
-    if task_id and saved:
-        await db.complete_task(task_id)
-    elif task_id and not saved:
-        await db.fail_task(task_id, "parse_error", "save_result returned False")
-
     worker_id = data.get("worker_id", "")
-    if worker_id in _worker_registry:
-        _worker_registry[worker_id]["results_submitted"] += 1
+    lease_epoch = data.pop("lease_epoch", 0)
 
-    return {"ok": saved}
+    if task_id:
+        if data.get("success", True):
+            result = await db.accept_success_result(task_id, worker_id, lease_epoch, data, batch_id)
+        else:
+            result = await db.accept_failed_result(
+                task_id, worker_id, lease_epoch,
+                data.get("error_type", ""), data.get("error_detail", ""))
+        if worker_id in _worker_registry and result.get("accepted"):
+            _worker_registry[worker_id]["results_submitted"] += 1
+        return {"ok": result.get("accepted", False), "stale": result.get("stale", False)}
+    else:
+        # 无 task_id 的直接写入（兼容）
+        saved = await db.save_result(data, batch_id)
+        return {"ok": saved, "stale": False}
 
 
 @app.post("/api/tasks/result/batch")
 async def api_submit_batch(request: Request):
-    """批量提交结果"""
+    """批量提交结果（lease 校验 → 原子写入）"""
     body = await request.json()
     results = body.get("results", [])
-    saved = 0
+    accepted = 0
+    stale = 0
+    failed = 0
+
     for item in results:
         task_id = item.pop("task_id", None)
         batch_id = item.pop("batch_id", None)
-        ok = await db.save_result(item, batch_id)
-        if task_id:
-            if ok:
-                await db.complete_task(task_id)
-            else:
-                await db.fail_task(task_id, "parse_error", "save_result returned False")
-        if ok:
-            saved += 1
-
         worker_id = item.get("worker_id", "")
-        if worker_id in _worker_registry:
-            _worker_registry[worker_id]["results_submitted"] += 1
+        lease_epoch = item.pop("lease_epoch", 0)
 
-    return {"saved": saved, "total": len(results)}
+        if task_id:
+            if item.get("success", True):
+                result = await db.accept_success_result(task_id, worker_id, lease_epoch, item, batch_id)
+            else:
+                result = await db.accept_failed_result(
+                    task_id, worker_id, lease_epoch,
+                    item.get("error_type", ""), item.get("error_detail", ""))
+
+            if result.get("stale"):
+                stale += 1
+            elif result.get("accepted"):
+                accepted += 1
+                if worker_id in _worker_registry:
+                    _worker_registry[worker_id]["results_submitted"] += 1
+            else:
+                failed += 1
+        else:
+            ok = await db.save_result(item, batch_id)
+            if ok:
+                accepted += 1
+
+    return {"accepted": accepted, "stale": stale, "failed": failed, "total": len(results)}
 
 
 @app.post("/api/tasks/screenshot")

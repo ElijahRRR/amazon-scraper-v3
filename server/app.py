@@ -184,6 +184,18 @@ async def _timeout_task_loop():
             for wid in truly_dead:
                 del _worker_registry[wid]
                 _global_coordinator.pop(wid, None)
+
+            # 清理导出临时文件（超过 1 小时的 export_*.xlsx）
+            try:
+                export_dir = config.EXPORT_DIR
+                if os.path.isdir(export_dir):
+                    for fname in os.listdir(export_dir):
+                        if fname.startswith("export_") and fname.endswith(".xlsx"):
+                            fpath = os.path.join(export_dir, fname)
+                            if now - os.path.getmtime(fpath) > 3600:
+                                os.remove(fpath)
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"超时任务循环异常: {e}")
 
@@ -911,7 +923,10 @@ async def _export_xlsx_streaming(filename: str, batch_id: int = None,
         wb.close()
         raise HTTPException(404, "无数据")
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    os.makedirs(config.EXPORT_DIR, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".xlsx", prefix="export_",
+        dir=config.EXPORT_DIR)
     tmp_path = tmp.name
     tmp.close()
     try:

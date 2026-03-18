@@ -107,7 +107,7 @@ class Worker:
 
         # 机制 2：空标题累计触发主动轮换
         self._empty_title_count = 0
-        self._empty_title_rotate_threshold = 50
+        self._empty_title_rotate_threshold = 15
 
         # Hot Standby Session（TPS 模式专用：预热备用 session，消除轮换停摆）
         self._standby_session: Optional[AmazonSession] = None

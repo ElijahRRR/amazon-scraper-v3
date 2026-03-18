@@ -1078,21 +1078,28 @@ async def api_delete_results(request: Request):
         return {"ok": True, "deleted": 0}
 
     asin_list = list(target_asins)
-    placeholders = ",".join("?" * len(asin_list))
+    CHUNK = 500  # SQLite 变量数上限安全值
 
     # 先收集截图物理文件路径
     screenshot_files = []
-    async with db._db.execute(
-        f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", asin_list
-    ) as c:
-        screenshot_files = [row["file_path"] for row in await c.fetchall()]
+    for i in range(0, len(asin_list), CHUNK):
+        chunk = asin_list[i:i+CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        async with db._db.execute(
+            f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", chunk
+        ) as c:
+            screenshot_files.extend(row["file_path"] for row in await c.fetchall())
 
+    # 分批删除
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", asin_list)
-        await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", asin_list)
-        await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", asin_list)
-        await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", asin_list)
+        for i in range(0, len(asin_list), CHUNK):
+            chunk = asin_list[i:i+CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
         await db._db.execute("COMMIT")
 
     # 删除物理截图文件

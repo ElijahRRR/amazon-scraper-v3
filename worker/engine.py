@@ -448,6 +448,7 @@ class Worker:
         new_proxy_url = s.get("proxy_url") or s.get("tunnel_proxy_url", "")
         if new_proxy_url and new_proxy_url != config.PROXY_URL:
             config.PROXY_URL = new_proxy_url
+            self.proxy_manager._proxy_url = new_proxy_url
             changes.append(f"proxy=***{new_proxy_url[-20:]}")
 
         # --- 邮编（仅初始同步）---

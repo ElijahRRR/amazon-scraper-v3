@@ -360,13 +360,13 @@ class Database:
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
-                before = self._db.total_changes
-
                 # 插入任务
+                before_tasks = self._db.total_changes
                 await self._db.executemany(
                     "INSERT OR IGNORE INTO tasks (batch_id, asin, zip_code, needs_screenshot) VALUES (?, ?, ?, ?)",
                     [(batch_id, asin, zip_code, ss_val) for asin in clean_asins]
                 )
+                task_inserted = self._db.total_changes - before_tasks
 
                 # 维护 batch_asins（判断是否新 ASIN）
                 for asin in clean_asins:
@@ -387,7 +387,7 @@ class Database:
                         [(asin, batch_id) for asin in clean_asins]
                     )
 
-                inserted = self._db.total_changes - before
+                inserted = task_inserted
                 await self._db.execute("COMMIT")
             except Exception:
                 await self._db.execute("ROLLBACK")
@@ -884,77 +884,61 @@ class Database:
         direction: next (向后翻页) / prev (向前翻页)
         返回: {"items": [...], "has_more": bool, "next_cursor": int, "prev_cursor": int, "total": int}
         """
-        where_parts = []
-        params = []
         join_parts = []
         count_join_parts = []
+        join_params: list = []
+        where_parts = []
+        where_params: list = []
 
-        # 批次筛选 - 通过 batch_asins JOIN（核心优化）
+        # 批次筛选 - 通过 batch_asins JOIN
         if batch_id:
             join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
             count_join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
-            params.append(batch_id)
+            join_params.append(batch_id)
+
+        # 变动筛选 - 通过 asin_changes JOIN（JOIN params 在 WHERE params 之前绑定）
+        if change_filter == "price_stock":
+            sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'price_stock'"
+            if batch_id:
+                sub += " AND batch_id = ?"
+                join_params.append(batch_id)
+            sub += ") ac ON ac.asin = d.asin"
+            join_parts.append(sub)
+            count_join_parts.append(sub)
+        elif change_filter == "title_bullets":
+            sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'title_bullets'"
+            if batch_id:
+                sub += " AND batch_id = ?"
+                join_params.append(batch_id)
+            sub += ") ac ON ac.asin = d.asin"
+            join_parts.append(sub)
+            count_join_parts.append(sub)
+        elif change_filter == "new":
+            if batch_id:
+                sub = "JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1"
+                join_params.append(batch_id)
+                join_parts.append(sub)
+                count_join_parts.append(sub)
+            else:
+                sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'new') ac ON ac.asin = d.asin"
+                join_parts.append(sub)
+                count_join_parts.append(sub)
 
         # 搜索（支持逗号分隔的批量搜索）
         if search:
             terms = [t.strip() for t in search.split(",") if t.strip()]
             if len(terms) == 1:
                 where_parts.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
-                params.extend([f"%{terms[0]}%", f"%{terms[0]}%", f"%{terms[0]}%"])
+                where_params.extend([f"%{terms[0]}%", f"%{terms[0]}%", f"%{terms[0]}%"])
             elif terms:
-                # 批量：每个词匹配 asin/title/brand，用 OR 连接
                 or_clauses = []
                 for t in terms:
                     or_clauses.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
-                    params.extend([f"%{t}%", f"%{t}%", f"%{t}%"])
+                    where_params.extend([f"%{t}%", f"%{t}%", f"%{t}%"])
                 where_parts.append(f"({' OR '.join(or_clauses)})")
 
-        # 变动筛选 - 通过 asin_changes JOIN（核心优化）
-        if change_filter == "price_stock":
-            join_parts.append(
-                "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'price_stock'"
-                + (" AND batch_id = ?" if batch_id else "")
-                + ") ac ON ac.asin = d.asin"
-            )
-            count_join_parts.append(
-                "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'price_stock'"
-                + (" AND batch_id = ?" if batch_id else "")
-                + ") ac ON ac.asin = d.asin"
-            )
-            if batch_id:
-                params.append(batch_id)
-        elif change_filter == "title_bullets":
-            join_parts.append(
-                "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'title_bullets'"
-                + (" AND batch_id = ?" if batch_id else "")
-                + ") ac ON ac.asin = d.asin"
-            )
-            count_join_parts.append(
-                "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'title_bullets'"
-                + (" AND batch_id = ?" if batch_id else "")
-                + ") ac ON ac.asin = d.asin"
-            )
-            if batch_id:
-                params.append(batch_id)
-        elif change_filter == "new":
-            if batch_id:
-                join_parts.append(
-                    "JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1"
-                )
-                count_join_parts.append(
-                    "JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1"
-                )
-                params.append(batch_id)
-            else:
-                join_parts.append(
-                    "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'new') ac ON ac.asin = d.asin"
-                )
-                count_join_parts.append(
-                    "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'new') ac ON ac.asin = d.asin"
-                )
-
-        # 构建 count 查询参数（不含 cursor）
-        count_params = list(params)
+        # 构建 count 查询参数（join_params + where_params，不含 cursor）
+        count_params = join_params + where_params
 
         # keyset 分页
         if cursor_id is not None:
@@ -962,7 +946,9 @@ class Database:
                 where_parts.append("d.id < ?")
             else:
                 where_parts.append("d.id > ?")
-            params.append(cursor_id)
+            where_params.append(cursor_id)
+
+        params = join_params + where_params
 
         where_clause = " AND ".join(where_parts) if where_parts else "1=1"
         join_clause = " ".join(join_parts) if join_parts else ""

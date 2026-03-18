@@ -587,9 +587,23 @@ async def api_release_tasks(request: Request):
     body = await request.json()
     worker_id = body.get("worker_id", "")
     tasks = body.get("tasks", [])
-    # 兼容旧格式 {"task_ids": [1,2,3]}
+    # 兼容旧格式 {"task_ids": [1,2,3]}（无 lease 校验，直接释放）
     if not tasks and "task_ids" in body:
-        tasks = [{"task_id": tid, "lease_epoch": 0} for tid in body["task_ids"]]
+        task_ids = body["task_ids"]
+        if task_ids:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            placeholders = ",".join("?" * len(task_ids))
+            async with db._write_lock:
+                await db._db.execute("BEGIN")
+                cursor = await db._db.execute(
+                    f"UPDATE tasks SET status='pending', worker_id=NULL, "
+                    f"lease_epoch=lease_epoch+1, updated_at=? "
+                    f"WHERE id IN ({placeholders}) AND status='processing'",
+                    [now] + task_ids
+                )
+                await db._db.execute("COMMIT")
+            return {"ok": True, "released": cursor.rowcount}
+        return {"ok": True, "released": 0}
     released = await db.release_tasks(worker_id, tasks)
     return {"ok": True, "released": released}
 
@@ -662,8 +676,16 @@ async def api_submit_batch(request: Request):
 async def api_upload_screenshot(request: Request,
                                 asin: str = Form(...),
                                 batch_name: str = Form(...),
+                                worker_id: str = Form(""),
                                 file: UploadFile = File(...)):
-    """接收截图上传"""
+    """接收截图上传（检查 worker 存活状态）"""
+    # 拒绝已死 worker 的截图上传
+    if worker_id and worker_id not in _worker_registry:
+        raise HTTPException(409, f"Worker {worker_id} 已离线，截图被丢弃")
+    if worker_id and worker_id in _worker_registry:
+        if time.time() - _worker_registry[worker_id]["last_seen"] > 120:
+            raise HTTPException(409, f"Worker {worker_id} 心跳超时，截图被丢弃")
+
     batch = await db.get_batch_by_name(batch_name)
     if not batch:
         raise HTTPException(400, f"批次不存在: {batch_name}")

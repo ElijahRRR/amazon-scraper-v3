@@ -65,7 +65,7 @@ BANDWIDTH_SOFT_CAP = 0.80
 GLOBAL_MAX_CONCURRENCY = 1000
 GLOBAL_MAX_QPS = 1000.0
 
-TASK_QUEUE_SIZE = 100
+TASK_QUEUE_SIZE = 64
 TASK_PREFETCH_THRESHOLD = 0.5
 
 # ============================================================

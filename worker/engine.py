@@ -157,7 +157,7 @@ class Worker:
 
         # 初始化队列
         self._task_queue = asyncio.PriorityQueue(maxsize=self._queue_size)
-        self._result_queue = asyncio.Queue()
+        self._result_queue = asyncio.Queue(maxsize=500)  # 反压：提交卡住时自动减速采集
 
         # 启动前先从 Server 拉取设置（代理地址、邮编等），远程 Worker 无需本地配置
         await self._pull_initial_settings()
@@ -792,6 +792,10 @@ class Worker:
                         "inflight": snap["inflight"],
                         "bandwidth_bps": snap["bandwidth_bps"],
                         "current_concurrency": self._controller.current_concurrency,
+                        "task_queue_size": self._task_queue.qsize() if self._task_queue else 0,
+                        "result_queue_size": self._result_queue.qsize() if self._result_queue else 0,
+                        "accepted": self._stats.get("accepted", 0),
+                        "stale": self._stats.get("stale", 0),
                     },
                 }
 

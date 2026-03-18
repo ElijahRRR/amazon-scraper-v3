@@ -742,6 +742,10 @@ async def api_workers():
             "block_rate": metrics.get("block_rate"),
             "latency_p50": metrics.get("latency_p50"),
             "inflight": metrics.get("inflight"),
+            "task_queue_size": metrics.get("task_queue_size"),
+            "result_queue_size": metrics.get("result_queue_size"),
+            "accepted": metrics.get("accepted", 0),
+            "stale": metrics.get("stale", 0),
             "quota_concurrency": quota.get("max_concurrency"),
             "quota_qps": quota.get("max_qps"),
         })

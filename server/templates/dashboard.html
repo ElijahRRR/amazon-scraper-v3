@@ -22,8 +22,11 @@
     </div>
     <div class="col-6 col-lg-3">
         <div class="stat-card warning">
-            <div class="stat-label">进行中</div>
+            <div class="stat-label">已分发</div>
             <div class="stat-number" id="stat-processing">{{ progress.processing }}</div>
+            <div class="text-secondary mt-1" style="font-size:0.75rem">
+                活跃采集: <span id="stat-inflight">-</span>
+            </div>
         </div>
     </div>
     <div class="col-6 col-lg-3">
@@ -150,6 +153,10 @@ setInterval(async () => {
         document.getElementById('stat-done').textContent = data.done;
         document.getElementById('stat-processing').textContent = data.processing;
         document.getElementById('stat-failed').textContent = data.failed;
+
+        // 汇总所有在线 Worker 的真实在飞请求数
+        const totalInflight = workers.filter(w => w.online).reduce((s, w) => s + (w.inflight || 0), 0);
+        document.getElementById('stat-inflight').textContent = totalInflight;
 
         // 进度条用 completion_rate，成功率单独显示
         document.getElementById('progress-pct').textContent = data.completion_rate + '%';

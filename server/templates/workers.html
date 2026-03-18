@@ -209,9 +209,12 @@
                         '<div class="wm-item"><span class="wm-label">封锁率</span><span class="wm-value ' + blockRateClass(w.block_rate != null ? w.block_rate * 100 : null) + '">' + val(w.block_rate != null ? w.block_rate * 100 : null, '%', 1) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">延迟 p50</span><span class="wm-value">' + val(w.latency_p50, 's', 1) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">在飞请求</span><span class="wm-value">' + val(w.inflight) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">本地排队</span><span class="wm-value">' + val(w.task_queue_size) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">待提交</span><span class="wm-value">' + val(w.result_queue_size) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">采集速度</span><span class="wm-value" style="color:var(--accent)">' + calcWorkerSpeed(w) + '</span></div>' +
                         '<div class="wm-item"><span class="wm-label">已拉取</span><span class="wm-value">' + val(w.tasks_pulled) + '</span></div>' +
-                        '<div class="wm-item"><span class="wm-label">已提交</span><span class="wm-value">' + val(w.results_submitted) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">已接受</span><span class="wm-value">' + val(w.accepted) + '</span></div>' +
+                        '<div class="wm-item"><span class="wm-label">已过期</span><span class="wm-value" style="color:' + (w.stale > 0 ? 'var(--metric-warn)' : 'inherit') + '">' + val(w.stale) + '</span></div>' +
                     '</div>' +
                     '<div class="worker-footer">' +
                         '<span><i class="bi bi-clock"></i> ' + fmtDuration(w.uptime) + '</span>' +

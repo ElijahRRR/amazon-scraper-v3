@@ -643,6 +643,100 @@ class Database:
                     pass
                 raise
 
+    async def accept_results_batch(self, items: list) -> dict:
+        """单事务批量处理结果（减少锁争用）
+
+        items: [{"task_id", "worker_id", "lease_epoch", "data", "batch_id", "success"}, ...]
+        Returns: {"accepted": int, "stale": int, "failed": int}
+        """
+        accepted = 0
+        stale = 0
+        failed = 0
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                for item in items:
+                    task_id = item.get("task_id")
+                    worker_id = item.get("worker_id", "")
+                    lease_epoch = item.get("lease_epoch", 0)
+                    batch_id = item.get("batch_id")
+                    data = item.get("data", {})
+                    is_success = item.get("success", True)
+
+                    if not task_id:
+                        # 无 task_id 的直接写入
+                        if is_success and data:
+                            saved = await self._save_result_inner_unlocked(data, batch_id)
+                            if saved:
+                                accepted += 1
+                        continue
+
+                    if is_success:
+                        # 校验 lease
+                        cursor = await self._db.execute(
+                            "UPDATE tasks SET status='done', updated_at=? "
+                            "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                            (now, task_id, worker_id, lease_epoch)
+                        )
+                        if cursor.rowcount == 0:
+                            stale += 1
+                            continue
+
+                        # 解析失败检测
+                        if _is_parse_failure(data):
+                            await self._db.execute(
+                                "UPDATE tasks SET status='failed', error_type='server_reject', "
+                                "error_detail='parse_failure_on_server' WHERE id=?",
+                                (task_id,)
+                            )
+                            failed += 1
+                            continue
+
+                        # 写入 asin_data
+                        saved = await self._save_result_inner_unlocked(data, batch_id)
+                        if saved:
+                            accepted += 1
+                        else:
+                            failed += 1
+                    else:
+                        # 失败结果：校验 lease 后标记失败/重试
+                        error_type = data.get("error_type", "")
+                        error_detail = data.get("error_detail", "")
+                        async with self._db.execute(
+                            "SELECT retry_count FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                            (task_id, worker_id, lease_epoch)
+                        ) as c:
+                            row = await c.fetchone()
+                        if not row:
+                            stale += 1
+                            continue
+                        retry_count = row[0] + 1
+                        if retry_count >= config.MAX_RETRIES:
+                            await self._db.execute(
+                                "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
+                                "WHERE id=?",
+                                (retry_count, error_type, error_detail, now, task_id)
+                            )
+                        else:
+                            await self._db.execute(
+                                "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, "
+                                "worker_id=NULL, lease_epoch=lease_epoch+1, updated_at=? WHERE id=?",
+                                (retry_count, error_type, error_detail, now, task_id)
+                            )
+                        accepted += 1
+
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+        return {"accepted": accepted, "stale": stale, "failed": failed}
+
     async def accept_failed_result(self, task_id: int, worker_id: str, lease_epoch: int,
                                    error_type: str = "", error_detail: str = "") -> dict:
         """原子受理失败结果（校验 lease）"""

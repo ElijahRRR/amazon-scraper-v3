@@ -635,41 +635,37 @@ async def api_submit_result(request: Request):
 
 @app.post("/api/tasks/result/batch")
 async def api_submit_batch(request: Request):
-    """批量提交结果（lease 校验 → 原子写入）"""
+    """批量提交结果（单事务，减少锁争用）"""
     body = await request.json()
     results = body.get("results", [])
-    accepted = 0
-    stale = 0
-    failed = 0
 
+    # 构建 batch items
+    batch_items = []
+    worker_id_set = set()
     for item in results:
         task_id = item.pop("task_id", None)
         batch_id = item.pop("batch_id", None)
         worker_id = item.get("worker_id", "")
         lease_epoch = item.pop("lease_epoch", 0)
+        is_success = item.pop("success", True)
+        worker_id_set.add(worker_id)
+        batch_items.append({
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "lease_epoch": lease_epoch,
+            "batch_id": batch_id,
+            "data": item,
+            "success": is_success,
+        })
 
-        if task_id:
-            if item.get("success", True):
-                result = await db.accept_success_result(task_id, worker_id, lease_epoch, item, batch_id)
-            else:
-                result = await db.accept_failed_result(
-                    task_id, worker_id, lease_epoch,
-                    item.get("error_type", ""), item.get("error_detail", ""))
+    result = await db.accept_results_batch(batch_items)
 
-            if result.get("stale"):
-                stale += 1
-            elif result.get("accepted"):
-                accepted += 1
-                if worker_id in _worker_registry:
-                    _worker_registry[worker_id]["results_submitted"] += 1
-            else:
-                failed += 1
-        else:
-            ok = await db.save_result(item, batch_id)
-            if ok:
-                accepted += 1
+    # results_submitted 只计 accepted
+    for wid in worker_id_set:
+        if wid in _worker_registry and result["accepted"] > 0:
+            _worker_registry[wid]["results_submitted"] += result["accepted"]
 
-    return {"accepted": accepted, "stale": stale, "failed": failed, "total": len(results)}
+    return {**result, "total": len(results)}
 
 
 @app.post("/api/tasks/screenshot")

@@ -22,11 +22,8 @@
     </div>
     <div class="col-6 col-lg-3">
         <div class="stat-card warning">
-            <div class="stat-label">已分发</div>
-            <div class="stat-number" id="stat-processing">{{ progress.processing }}</div>
-            <div class="text-secondary mt-1" style="font-size:0.75rem">
-                活跃采集: <span id="stat-inflight">-</span>
-            </div>
+            <div class="stat-label">已分发 / 活跃采集</div>
+            <div class="stat-number"><span id="stat-processing">{{ progress.processing }}</span> <span style="font-size:0.9rem;opacity:0.6">/</span> <span id="stat-inflight" style="color:var(--accent)">-</span></div>
         </div>
     </div>
     <div class="col-6 col-lg-3">

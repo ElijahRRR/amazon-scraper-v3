@@ -71,6 +71,10 @@
                     <button class="btn btn-outline-danger btn-sm" id="deleteSelectedBtn" onclick="deleteSelected()" style="display:none;">
                         <i class="bi bi-trash3"></i> 删除选中 (<span id="selectedCount">0</span>)
                     </button>
+                    <button class="btn btn-outline-warning btn-sm" onclick="document.getElementById('deleteFileInput').click()">
+                        <i class="bi bi-upload"></i> 上传删除
+                    </button>
+                    <input type="file" id="deleteFileInput" accept=".xlsx,.csv,.txt" style="display:none;" onchange="deleteByFile(this)">
                     <button class="btn btn-outline-danger btn-sm" onclick="clearData()">
                         <i class="bi bi-trash3"></i> 清空数据
                     </button>
@@ -523,6 +527,27 @@ async function clearData() {
         if (resp.ok) {
             const deleted = data.deleted != null ? `已删除 ${data.deleted} 条` : '数据已清空';
             alert(deleted);
+            loadResults();
+            loadChangeStats();
+            loadBatches();
+        } else {
+            alert('删除失败: ' + (data.detail || '未知错误'));
+        }
+    } catch(e) {
+        alert('网络错误: ' + e.message);
+    }
+}
+
+async function deleteByFile(input) {
+    if (!input.files.length) return;
+    const fd = new FormData();
+    fd.append('file', input.files[0]);
+    input.value = '';  // 重置，允许重复上传同一文件
+    try {
+        const resp = await fetch('/api/results/delete-by-file', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (resp.ok) {
+            alert(`已删除 ${data.deleted} 条数据（文件中识别到 ${data.asin_count} 个 ASIN）`);
             loadResults();
             loadChangeStats();
             loadBatches();

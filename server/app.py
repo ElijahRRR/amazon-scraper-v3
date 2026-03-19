@@ -1032,6 +1032,70 @@ async def api_diagnostic():
     }
 
 
+@app.post("/api/results/delete-by-file")
+async def api_delete_by_file(file: UploadFile = File(...)):
+    """上传文件识别 ASIN 后删除对应数据"""
+    content = await file.read()
+    filename = file.filename or ""
+
+    asins = []
+    if filename.endswith(".xlsx"):
+        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=1, values_only=True):
+            for cell in row:
+                if cell:
+                    val = str(cell).strip().upper()
+                    if re.match(r'^B[0-9A-Z]{9}$', val):
+                        asins.append(val)
+        wb.close()
+    elif filename.endswith(".csv"):
+        text = content.decode("utf-8", errors="ignore")
+        reader = csv.reader(io.StringIO(text))
+        for row in reader:
+            for cell in row:
+                val = cell.strip().upper()
+                if re.match(r'^B[0-9A-Z]{9}$', val):
+                    asins.append(val)
+    else:
+        text = content.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            val = line.strip().upper()
+            if re.match(r'^B[0-9A-Z]{9}$', val):
+                asins.append(val)
+
+    # 去重
+    asin_list = list(dict.fromkeys(asins))
+    if not asin_list:
+        raise HTTPException(400, "文件中未找到有效 ASIN")
+
+    CHUNK = 500
+    # 收集截图文件
+    screenshot_files = []
+    for i in range(0, len(asin_list), CHUNK):
+        chunk = asin_list[i:i+CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        async with db._db.execute(
+            f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", chunk
+        ) as c:
+            screenshot_files.extend(row["file_path"] for row in await c.fetchall())
+
+    # 分批删除
+    async with db._write_lock:
+        await db._db.execute("BEGIN")
+        for i in range(0, len(asin_list), CHUNK):
+            chunk = asin_list[i:i+CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
+        await db._db.execute("COMMIT")
+
+    _remove_screenshot_files(screenshot_files)
+    return {"ok": True, "deleted": len(asin_list), "asin_count": len(asin_list)}
+
+
 @app.delete("/api/results")
 async def api_delete_results(request: Request):
     """按条件删除采集结果"""

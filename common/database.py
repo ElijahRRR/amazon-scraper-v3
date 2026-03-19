@@ -174,6 +174,7 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 needs_screenshot BOOLEAN DEFAULT 0,
+                is_auto BOOLEAN DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -231,6 +232,12 @@ class Database:
                 screenshot_path TEXT,
                 content_hash TEXT,
                 title_bullets_hash TEXT,
+                baseline_price TEXT,
+                baseline_buybox_price TEXT,
+                baseline_stock_count TEXT,
+                baseline_stock_status TEXT,
+                baseline_title_bullets_hash TEXT,
+                baseline_updated_at TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -302,15 +309,33 @@ class Database:
         except Exception:
             pass
 
+        # 迁移：batches 表添加 is_auto
+        for col, default in [("is_auto", "0")]:
+            try:
+                await self._db.execute(f"ALTER TABLE batches ADD COLUMN {col} BOOLEAN DEFAULT {default}")
+                logger.info(f"数据库迁移: batches 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # 迁移：asin_data 表添加 baseline 字段
+        for col in ["baseline_price", "baseline_buybox_price", "baseline_stock_count",
+                     "baseline_stock_status", "baseline_title_bullets_hash", "baseline_updated_at"]:
+            try:
+                await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
+                logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
+            except Exception:
+                pass
+
     # ==================== 批次操作 ====================
 
-    async def create_batch(self, name: str, needs_screenshot: bool = False) -> int:
+    async def create_batch(self, name: str, needs_screenshot: bool = False,
+                           is_auto: bool = False) -> int:
         """创建批次，返回 batch_id"""
         async with self._write_lock:
             await self._db.execute("BEGIN")
             await self._db.execute(
-                "INSERT OR IGNORE INTO batches (name, needs_screenshot) VALUES (?, ?)",
-                (name, 1 if needs_screenshot else 0)
+                "INSERT OR IGNORE INTO batches (name, needs_screenshot, is_auto) VALUES (?, ?, ?)",
+                (name, 1 if needs_screenshot else 0, 1 if is_auto else 0)
             )
             await self._db.execute("COMMIT")
             async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name,)) as c:
@@ -743,7 +768,11 @@ class Database:
         return await self.fail_task(task_id, worker_id, lease_epoch, error_type, error_detail)
 
     async def _save_result_inner_unlocked(self, data: dict, batch_id: int = None) -> bool:
-        """保存采集结果到 asin_data（调用方必须持有 _write_lock 并在事务内）"""
+        """保存采集结果到 asin_data（调用方必须持有 _write_lock 并在事务内）
+
+        变动检测基准：baseline 字段（上次定时采集的数据）
+        baseline 更新：仅定时采集（is_auto=True）时更新
+        """
         asin = data.get("asin", "").strip()
         if not asin:
             return False
@@ -751,6 +780,16 @@ class Database:
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         data["content_hash"] = _compute_content_hash(data)
         data["title_bullets_hash"] = _compute_title_bullets_hash(data)
+
+        # 查询批次是否为定时采集
+        is_auto = False
+        if batch_id:
+            async with self._db.execute(
+                "SELECT is_auto FROM batches WHERE id = ?", (batch_id,)
+            ) as c:
+                row = await c.fetchone()
+                if row:
+                    is_auto = bool(row[0])
 
         resolved_screenshot_path = await self._get_done_screenshot_path(asin, batch_id)
 
@@ -766,36 +805,43 @@ class Database:
             )
             changes = []
 
-            # 1. 价格/库存变动检测
-            price_change = _compare_price(existing_dict.get("current_price"), data.get("current_price"))
-            buybox_change = _compare_price(existing_dict.get("buybox_price"), data.get("buybox_price"))
-            stock_qty_change = _compare_stock_qty(existing_dict.get("stock_count"), data.get("stock_count"))
-            stock_status_change = _compare_stock_status(existing_dict.get("stock_status"), data.get("stock_status"))
+            # 变动检测：对比 baseline（上次定时采集），而非当前值
+            bl_price = existing_dict.get("baseline_price")
+            bl_buybox = existing_dict.get("baseline_buybox_price")
+            bl_stock = existing_dict.get("baseline_stock_count")
+            bl_status = existing_dict.get("baseline_stock_status")
+            bl_tb_hash = existing_dict.get("baseline_title_bullets_hash")
+            has_baseline = bl_price is not None  # baseline 存在才做变动检测
 
-            if any([price_change, buybox_change, stock_qty_change, stock_status_change]):
-                detail_parts = []
-                if price_change:
-                    detail_parts.append(f"price:{price_change}")
-                if buybox_change:
-                    detail_parts.append(f"buybox:{buybox_change}")
-                if stock_qty_change:
-                    detail_parts.append(f"stock_qty:{stock_qty_change}")
-                if stock_status_change:
-                    detail_parts.append(f"stock_status:{stock_status_change}")
+            if has_baseline:
+                # 1. 价格/库存变动（对比 baseline）
+                price_change = _compare_price(bl_price, data.get("current_price"))
+                buybox_change = _compare_price(bl_buybox, data.get("buybox_price"))
+                stock_qty_change = _compare_stock_qty(bl_stock, data.get("stock_count"))
+                stock_status_change = _compare_stock_status(bl_status, data.get("stock_status"))
 
-                prev_vals = f"price={existing_dict.get('current_price')}, buybox={existing_dict.get('buybox_price')}, stock={existing_dict.get('stock_count')}, status={existing_dict.get('stock_status')}"
-                new_vals = f"price={data.get('current_price')}, buybox={data.get('buybox_price')}, stock={data.get('stock_count')}, status={data.get('stock_status')}"
+                if any([price_change, buybox_change, stock_qty_change, stock_status_change]):
+                    detail_parts = []
+                    if price_change:
+                        detail_parts.append(f"price:{price_change}")
+                    if buybox_change:
+                        detail_parts.append(f"buybox:{buybox_change}")
+                    if stock_qty_change:
+                        detail_parts.append(f"stock_qty:{stock_qty_change}")
+                    if stock_status_change:
+                        detail_parts.append(f"stock_status:{stock_status_change}")
 
-                changes.append(("price_stock", ", ".join(detail_parts), prev_vals, new_vals))
+                    prev_vals = f"price={bl_price}, buybox={bl_buybox}, stock={bl_stock}, status={bl_status}"
+                    new_vals = f"price={data.get('current_price')}, buybox={data.get('buybox_price')}, stock={data.get('stock_count')}, status={data.get('stock_status')}"
+                    changes.append(("price_stock", ", ".join(detail_parts), prev_vals, new_vals))
 
-            # 2. 标题/五点描述变动检测
-            old_tb_hash = existing_dict.get("title_bullets_hash", "")
-            new_tb_hash = data.get("title_bullets_hash", "")
-            if old_tb_hash and new_tb_hash and old_tb_hash != new_tb_hash:
-                prev_title = (existing_dict.get("title") or "")[:100]
-                new_title = (data.get("title") or "")[:100]
-                changes.append(("title_bullets", "title_or_bullets_changed",
-                                f"title={prev_title}", f"title={new_title}"))
+                # 2. 标题/五点描述变动（对比 baseline）
+                new_tb_hash = data.get("title_bullets_hash", "")
+                if bl_tb_hash and new_tb_hash and bl_tb_hash != new_tb_hash:
+                    prev_title = (existing_dict.get("title") or "")[:100]
+                    new_title = (data.get("title") or "")[:100]
+                    changes.append(("title_bullets", "title_or_bullets_changed",
+                                    f"title={prev_title}", f"title={new_title}"))
 
             # 写入变动记录
             for change_type, detail, prev_val, new_val in changes:
@@ -804,7 +850,7 @@ class Database:
                     (asin, batch_id, change_type, detail, prev_val, new_val)
                 )
 
-            # 更新主表
+            # 更新主表当前值
             update_fields = []
             update_values = []
             for f in ASIN_DATA_FIELDS:
@@ -818,6 +864,21 @@ class Database:
             if resolved_screenshot_path and resolved_screenshot_path != existing_screenshot_path:
                 update_fields.append("screenshot_path = ?")
                 update_values.append(resolved_screenshot_path)
+
+            # 定时采集：同时更新 baseline
+            if is_auto:
+                update_fields.append("baseline_price = ?")
+                update_values.append(data.get("current_price"))
+                update_fields.append("baseline_buybox_price = ?")
+                update_values.append(data.get("buybox_price"))
+                update_fields.append("baseline_stock_count = ?")
+                update_values.append(data.get("stock_count"))
+                update_fields.append("baseline_stock_status = ?")
+                update_values.append(data.get("stock_status"))
+                update_fields.append("baseline_title_bullets_hash = ?")
+                update_values.append(data.get("title_bullets_hash"))
+                update_fields.append("baseline_updated_at = ?")
+                update_values.append(now)
 
             update_fields.append("updated_at = ?")
             update_values.append(now)
@@ -842,6 +903,18 @@ class Database:
             if resolved_screenshot_path:
                 insert_fields.append("screenshot_path")
                 insert_values.append(resolved_screenshot_path)
+
+            # 首次入库：baseline = 当前值（无论手动还是定时）
+            insert_fields.extend([
+                "baseline_price", "baseline_buybox_price",
+                "baseline_stock_count", "baseline_stock_status",
+                "baseline_title_bullets_hash", "baseline_updated_at",
+            ])
+            insert_values.extend([
+                data.get("current_price"), data.get("buybox_price"),
+                data.get("stock_count"), data.get("stock_status"),
+                data.get("title_bullets_hash"), now,
+            ])
 
             insert_fields.extend(["created_at", "updated_at"])
             insert_values.extend([now, now])

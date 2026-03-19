@@ -1131,6 +1131,9 @@ class Worker:
                                 if offer.get('delivery'):
                                     result_data["delivery_date"] = offer['delivery']
                                 result_data["stock_status"] = "In Stock (via offer-listing)"
+                                # "See All Buying Options" 类页面：AOD 获取到价格但无库存信息，默认库存 5
+                                if str(result_data.get("stock_count", "0")) in ("0", "", "N/A"):
+                                    result_data["stock_count"] = "5"
                                 logger.info(f"NFO {asin} OLP: {offer['price']} ship={offer.get('shipping','?')} {offer.get('is_fba','?')} del={offer.get('delivery','?')}")
                     except Exception as e:
                         logger.debug(f"NFO {asin} offer-listing 请求失败: {e}")

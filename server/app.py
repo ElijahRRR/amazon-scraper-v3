@@ -250,7 +250,7 @@ async def _auto_scrape_scheduler():
                 batch_name = f"auto_{sched_name}_{now:%Y%m%d_%H%M}"
                 zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
                 ns = sched.get("needs_screenshot", False)
-                batch_id = await db.create_batch(batch_name, ns)
+                batch_id = await db.create_batch(batch_name, ns, is_auto=True)
                 await db.create_tasks(batch_id, asins, zc, ns)
                 sched["last_run_date"] = today
                 changed = True
@@ -1365,7 +1365,7 @@ async def api_run_schedule_now(sched_id: str):
     batch_name = f"auto_{target.get('name', 'task')}_{now:%Y%m%d_%H%M}"
     zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
     ns = target.get("needs_screenshot", False)
-    batch_id = await db.create_batch(batch_name, ns)
+    batch_id = await db.create_batch(batch_name, ns, is_auto=True)
     await db.create_tasks(batch_id, asin_list, zc, ns)
 
     target["last_run_date"] = now.strftime("%Y-%m-%d")

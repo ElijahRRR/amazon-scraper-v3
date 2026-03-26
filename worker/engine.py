@@ -44,8 +44,9 @@ class Worker:
     """流水线异步采集 Worker"""
 
     def __init__(self, server_url: str, worker_id: str = None, concurrency: int = None,
-                 zip_code: str = None, enable_screenshot: bool = True):
+                 zip_code: str = None, enable_screenshot: bool = True, api_key: str = None):
         self.server_url = server_url.rstrip("/")
+        self._api_key = api_key or os.environ.get("WORKER_API_KEY", "")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
         self._enable_screenshot = enable_screenshot
@@ -141,6 +142,13 @@ class Worker:
         # 全局并发协调
         self._global_block_epoch = 0   # 已处理的全局封锁 epoch
         self._recovery_jitter = 0.5    # Server 分配的恢复抖动系数
+
+    def _server_headers(self) -> dict:
+        """与 ERP Server 通信的统一 header（含 API Key 认证）"""
+        h = {}
+        if self._api_key:
+            h["X-Worker-Api-Key"] = self._api_key
+        return h
 
     async def start(self):
         """启动 Worker（流水线架构）"""
@@ -537,7 +545,7 @@ class Worker:
         """启动时从 Server 拉取一次设置，确保所有运行参数与 Server 一致。"""
         logger.info("⚙️ 从服务器拉取初始设置...")
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5, headers=self._server_headers()) as client:
                 resp = await client.get(f"{self.server_url}/api/settings")
                 if resp.status_code != 200:
                     logger.warning(f"⚠️ 拉取初始设置失败: HTTP {resp.status_code}")
@@ -738,7 +746,7 @@ class Worker:
                 "count": count or self._controller.current_concurrency,
                 "enable_screenshot": "1" if self._enable_screenshot else "0",
             }
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, headers=self._server_headers()) as client:
                 resp = await client.get(url, params=params)
             if resp.status_code == 200:
                 return resp.json().get("tasks", [])
@@ -760,7 +768,7 @@ class Worker:
                 "tasks": [{"task_id": t["id"], "lease_epoch": t.get("lease_epoch", 0)}
                           for t in tasks_to_release],
             }
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, headers=self._server_headers()) as client:
                 resp = await client.post(url, json=payload)
             if resp.status_code == 200:
                 data = resp.json()
@@ -802,7 +810,7 @@ class Worker:
 
                 # 优先使用新的综合同步端点
                 s = None
-                async with httpx.AsyncClient(timeout=5) as client:
+                async with httpx.AsyncClient(timeout=5, headers=self._server_headers()) as client:
                     try:
                         resp = await client.post(
                             f"{self.server_url}/api/worker/sync",
@@ -902,7 +910,7 @@ class Worker:
         """确认服务端该批次的采集任务是否已全部结束。"""
         url = f"{self.server_url}/api/progress"
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5, headers=self._server_headers()) as client:
                 resp = await client.get(url, params={"batch_id": batch_id})
             if resp.status_code != 200:
                 return False
@@ -1276,7 +1284,7 @@ class Worker:
         url = f"{self.server_url}/api/tasks/result/batch"
         for attempt in range(retry):
             try:
-                async with httpx.AsyncClient(timeout=15) as client:
+                async with httpx.AsyncClient(timeout=15, headers=self._server_headers()) as client:
                     resp = await client.post(url, json={"results": batch})
                 if resp.status_code == 200:
                     data = resp.json()
@@ -1299,7 +1307,7 @@ class Worker:
     async def _submit_batch_fallback(self, batch: List[Dict]):
         """逐条提交 fallback（批量接口不可用时）"""
         url = f"{self.server_url}/api/tasks/result"
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, headers=self._server_headers()) as client:
             for payload in batch:
                 try:
                     resp = await client.post(url, json=payload)
@@ -1330,6 +1338,8 @@ class Worker:
             await self._reap_screenshot_descendants("截图子进程重启前清理残留浏览器")
             env = os.environ.copy()
             env["SCREENSHOT_BASE_DIR"] = self._screenshot_base_dir
+            if self._api_key:
+                env["WORKER_API_KEY"] = self._api_key
             self._screenshot_process = await asyncio.create_subprocess_exec(
                 sys.executable, script,
                 self.server_url,
@@ -1630,6 +1640,7 @@ def main():
                             help=f"最大并发数上限（默认 {config.MAX_CONCURRENCY}，自适应控制器自动探索最优值）")
     arg_parser.add_argument("--zip-code", default=None, help=f"邮编（默认 {config.DEFAULT_ZIP_CODE}）")
     arg_parser.add_argument("--no-screenshot", action="store_true", help="禁用截图功能（仅采集数据）")
+    arg_parser.add_argument("--api-key", default=None, help="ERP Server Worker API Key（也可通过 WORKER_API_KEY 环境变量设置）")
     args = arg_parser.parse_args()
 
     worker = Worker(
@@ -1638,6 +1649,7 @@ def main():
         concurrency=args.concurrency,
         zip_code=args.zip_code,
         enable_screenshot=not args.no_screenshot,
+        api_key=args.api_key,
     )
 
     # 优雅退出

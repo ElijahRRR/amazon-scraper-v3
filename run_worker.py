@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=None, help="Initial concurrency")
     parser.add_argument("--zip-code", default=None, help="Delivery zip code")
     parser.add_argument("--no-screenshot", action="store_true", help="Disable screenshot")
+    parser.add_argument("--api-key", default=None, help="ERP Server Worker API Key (or set WORKER_API_KEY env)")
     args = parser.parse_args()
 
     worker = Worker(
@@ -23,6 +24,7 @@ def main():
         concurrency=args.concurrency,
         zip_code=args.zip_code,
         enable_screenshot=not args.no_screenshot,
+        api_key=args.api_key,
     )
     asyncio.run(worker.start())
 

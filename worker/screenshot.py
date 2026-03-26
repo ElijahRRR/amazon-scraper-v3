@@ -22,11 +22,12 @@ logger = logging.getLogger("screenshot_worker")
 class ScreenshotWorker:
     def __init__(self, server_url: str, base_dir: str = None,
                  browsers_count: int = 1, pages_per_browser: int = 5,
-                 proxy_url: str = None):
+                 proxy_url: str = None, api_key: str = None):
         default_base_dir = os.environ.get("SCREENSHOT_BASE_DIR") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "screenshot_cache"
         )
         self.server_url = server_url
+        self._api_key = api_key or os.environ.get("WORKER_API_KEY", "")
         self.base_dir = base_dir or default_base_dir
         self.html_dir = os.path.join(self.base_dir, "html")
         self._concurrency = pages_per_browser
@@ -81,7 +82,10 @@ class ScreenshotWorker:
 
     async def start(self):
         os.makedirs(self.html_dir, exist_ok=True)
-        self._http_client = httpx.AsyncClient(timeout=30)
+        server_headers = {}
+        if self._api_key:
+            server_headers["X-Worker-Api-Key"] = self._api_key
+        self._http_client = httpx.AsyncClient(timeout=30, headers=server_headers)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:

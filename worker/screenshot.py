@@ -85,7 +85,7 @@ class ScreenshotWorker:
         server_headers = {}
         if self._api_key:
             server_headers["X-Worker-Api-Key"] = self._api_key
-        self._http_client = httpx.AsyncClient(timeout=30, headers=server_headers)
+        self._http_client = httpx.AsyncClient(timeout=30, headers=server_headers, trust_env=False)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:

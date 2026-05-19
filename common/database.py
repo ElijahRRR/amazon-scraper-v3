@@ -9,16 +9,126 @@ Amazon ASIN 采集系统 v3 - 数据库模块
 import os
 import re
 import json
+import time
 import hashlib
 import aiosqlite
 import asyncio
 import logging
+from collections import defaultdict
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
 from common import config
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 锁竞争 / 阶段耗时 侦查仪表（recon 阶段使用，可随时删除）
+#
+# 使用方式：
+#   - async with self._write_lock:                  -> caller="other"
+#   - async with self._write_lock("accept_results_batch"):  -> caller="accept_results_batch"
+#
+# 统计指标：每个 caller 的 acquire 等待时长 + 持锁时长
+# 暴露接口：server/app.py 的 /api/_debug/lock-stats
+# ============================================================
+
+# 全局统计容器
+LOCK_STATS: Dict[str, Any] = {
+    "waits": defaultdict(list),       # caller -> [wait_ms, ...]
+    "holds": defaultdict(list),       # caller -> [hold_ms, ...]
+    "slow_holds": [],                 # [(ts, caller, hold_ms), ...]  仅 >200ms
+    "stage_timings": defaultdict(list),  # stage_name -> [ms, ...]   内部分阶段
+}
+
+_MAX_SAMPLES = 10000   # 每个 caller 最多保留样本数（满了滚动）
+_SLOW_HOLD_THRESHOLD_MS = 200
+
+
+def _record_wait(caller: str, ms: float):
+    arr = LOCK_STATS["waits"][caller]
+    arr.append(ms)
+    if len(arr) > _MAX_SAMPLES:
+        del arr[: _MAX_SAMPLES // 2]
+
+
+def _record_hold(caller: str, ms: float):
+    arr = LOCK_STATS["holds"][caller]
+    arr.append(ms)
+    if len(arr) > _MAX_SAMPLES:
+        del arr[: _MAX_SAMPLES // 2]
+    if ms > _SLOW_HOLD_THRESHOLD_MS:
+        sh = LOCK_STATS["slow_holds"]
+        sh.append((time.time(), caller, round(ms, 2)))
+        if len(sh) > 500:
+            del sh[:250]
+
+
+def record_stage(stage: str, ms: float):
+    """供锁内分阶段计时用（如 accept_results_batch 内部）"""
+    arr = LOCK_STATS["stage_timings"][stage]
+    arr.append(ms)
+    if len(arr) > _MAX_SAMPLES:
+        del arr[: _MAX_SAMPLES // 2]
+
+
+class _NamedLockCtx:
+    """显式命名的 async context manager"""
+    __slots__ = ("_parent", "_caller")
+
+    def __init__(self, parent, caller: str):
+        self._parent = parent
+        self._caller = caller
+
+    async def __aenter__(self):
+        await self._parent._do_enter(self._caller)
+        return self
+
+    async def __aexit__(self, *args):
+        await self._parent._do_exit()
+
+
+class TimedLock:
+    """asyncio.Lock 包装，自动按 caller 记录 wait/hold 时长。
+
+    - `async with timed_lock:`          -> caller='other'（默认）
+    - `async with timed_lock('name'):`  -> caller='name'（显式）
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._current_caller = "other"
+        self._hold_t0 = 0.0
+
+    # 显式命名：`async with self._write_lock("accept_results_batch"):`
+    def __call__(self, caller: str = "other"):
+        return _NamedLockCtx(self, caller)
+
+    # 兼容旧调用：`async with self._write_lock:` -> caller='other'
+    async def __aenter__(self):
+        await self._do_enter("other")
+        return self
+
+    async def __aexit__(self, *args):
+        await self._do_exit()
+
+    async def _do_enter(self, caller: str):
+        t0 = time.monotonic()
+        await self._lock.acquire()
+        wait_ms = (time.monotonic() - t0) * 1000
+        _record_wait(caller, wait_ms)
+        # 一旦拿到锁，此时无其他 coroutine 在临界区，写 self 不会 race
+        self._current_caller = caller
+        self._hold_t0 = time.monotonic()
+
+    async def _do_exit(self):
+        hold_ms = (time.monotonic() - self._hold_t0) * 1000
+        _record_hold(self._current_caller, hold_ms)
+        self._lock.release()
+
+
+# ============================================================
 
 # ==================== 变动对比辅助函数 ====================
 
@@ -152,7 +262,10 @@ class Database:
     def __init__(self, db_path: str = None):
         self.db_path = db_path or config.DB_PATH
         self._db: Optional[aiosqlite.Connection] = None
-        self._write_lock = asyncio.Lock()
+        # 用 TimedLock 替代裸 asyncio.Lock，自动按 caller 记录 wait/hold 时长
+        # 兼容旧用法：所有现有 `async with self._write_lock:` 计入 caller='other'
+        # 热点路径用 `async with self._write_lock("xxx"):` 单独追踪
+        self._write_lock = TimedLock()
 
     async def connect(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -844,7 +957,7 @@ class Database:
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         tasks = []
 
-        async with self._write_lock:
+        async with self._write_lock("pull_tasks"):
             await self._db.execute("BEGIN IMMEDIATE")
             try:
                 ss_filter = ""
@@ -1376,7 +1489,9 @@ class Database:
         failed = 0
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-        async with self._write_lock:
+        async with self._write_lock("accept_results_batch"):
+            # 用 BEGIN IMMEDIATE 显式拿写锁，与 pull_tasks 一致
+            _t_total = time.monotonic()
             await self._db.execute("BEGIN")
             try:
                 for item in items:
@@ -1390,18 +1505,22 @@ class Database:
                     if not task_id:
                         # 无 task_id 的直接写入
                         if is_success and data:
+                            _t = time.monotonic()
                             saved = await self._save_result_inner_unlocked(data, batch_id)
+                            record_stage("save_result", (time.monotonic() - _t) * 1000)
                             if saved:
                                 accepted += 1
                         continue
 
                     if is_success:
                         # 校验 lease
+                        _t = time.monotonic()
                         cursor = await self._db.execute(
                             "UPDATE tasks SET status='done', updated_at=? "
                             "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
                             (now, task_id, worker_id, lease_epoch)
                         )
+                        record_stage("update_tasks_lease", (time.monotonic() - _t) * 1000)
                         if cursor.rowcount == 0:
                             stale += 1
                             continue
@@ -1417,7 +1536,9 @@ class Database:
                             continue
 
                         # 写入 asin_data
+                        _t = time.monotonic()
                         saved = await self._save_result_inner_unlocked(data, batch_id)
+                        record_stage("save_result", (time.monotonic() - _t) * 1000)
                         if saved:
                             accepted += 1
                         else:
@@ -1450,13 +1571,16 @@ class Database:
                             )
                             # 重新入队不计入 accepted；若后续需要单独统计可在此累加 requeued
 
+                _t = time.monotonic()
                 await self._db.execute("COMMIT")
+                record_stage("commit", (time.monotonic() - _t) * 1000)
             except Exception:
                 try:
                     await self._db.execute("ROLLBACK")
                 except Exception:
                     pass
                 raise
+            record_stage("total_in_lock", (time.monotonic() - _t_total) * 1000)
 
         return {"accepted": accepted, "stale": stale, "failed": failed}
 

@@ -247,30 +247,40 @@ async def _timeout_task_loop():
             except Exception:
                 pass
 
-            # 每 10 次循环（约 5 分钟）做一次 TRUNCATE WAL checkpoint
-            # Tier 1 优化：PASSIVE→TRUNCATE，让 checkpoint 真正能完成并回收磁盘
-            # （PASSIVE 在 reader 持续存在时永远完不成，是 WAL 膨胀的根因）
+            # 每 10 次循环（约 5 分钟）做一次 WAL checkpoint —— 按需 TRUNCATE 策略
+            # 经 30k recon 实测：固定 TRUNCATE 会触发 ~200-400ms 的 commit 阻塞抖动，
+            # 影响 worker pull_tasks 和 accept_results_batch（max hold 407ms）。
+            # 新策略：
+            #   默认走 PASSIVE（非阻塞，能 checkpoint 多少算多少）
+            #   仅当 WAL 文件超过阈值才主动 TRUNCATE（兜底，几小时一次）
+            # WAL 自身有 PRAGMA wal_autocheckpoint=1000 + journal_size_limit=64MB 兜底
             _wal_checkpoint_counter += 1
             if _wal_checkpoint_counter >= 10:
                 _wal_checkpoint_counter = 0
-                try:
-                    res = await db.wal_checkpoint("TRUNCATE")
-                    if res:
-                        logger.debug(f"WAL checkpoint(TRUNCATE): busy={res[0]} log={res[1]} checkpointed={res[2]}")
-                except Exception as e:
-                    logger.warning(f"WAL checkpoint 失败: {e}")
-                # WAL 大小监控（参考 CSDN 文章建议，分两档告警）
+                wal_size = 0
                 try:
                     wal_path = config.DB_PATH + "-wal"
                     if os.path.exists(wal_path):
                         wal_size = os.path.getsize(wal_path)
-                        wal_mb = wal_size / 1024 / 1024
-                        if wal_size > 500 * 1024 * 1024:
-                            logger.error(f"WAL 文件过大: {wal_mb:.0f}MB（>500MB，疑似 checkpoint 被 reader 阻塞）")
-                        elif wal_size > 200 * 1024 * 1024:
-                            logger.warning(f"WAL 文件偏大: {wal_mb:.0f}MB（>200MB）")
                 except Exception:
                     pass
+                wal_mb = wal_size / 1024 / 1024
+                # 阈值：WAL > 128MB 才主动 TRUNCATE；否则 PASSIVE 不阻塞 writer
+                mode = "TRUNCATE" if wal_size > 128 * 1024 * 1024 else "PASSIVE"
+                try:
+                    res = await db.wal_checkpoint(mode)
+                    if res:
+                        logger.debug(
+                            f"WAL checkpoint({mode}) wal={wal_mb:.1f}MB "
+                            f"busy={res[0]} log={res[1]} checkpointed={res[2]}"
+                        )
+                except Exception as e:
+                    logger.warning(f"WAL checkpoint 失败: {e}")
+                # 分档告警
+                if wal_size > 500 * 1024 * 1024:
+                    logger.error(f"WAL 文件过大: {wal_mb:.0f}MB（>500MB）")
+                elif wal_size > 200 * 1024 * 1024:
+                    logger.warning(f"WAL 文件偏大: {wal_mb:.0f}MB（>200MB）")
 
             # 兜底扫描：把 DB 中到期可重试的 callback 重新入队
             # （服务重启、内存队列丢失、_completion_watcher 漏检测 等场景的安全网）
@@ -2176,6 +2186,55 @@ async def api_legacy_delete_schedule(index: int):
             os.remove(sf)
         _save_schedules(schedules)
     return {"ok": True, "schedules": schedules}
+
+
+# ==================== Recon 侦查端点（锁竞争 / 阶段耗时）====================
+# 临时仪表，用于诊断 _write_lock 竞争和 accept_results_batch 内部瓶颈
+# 完成诊断后可删除（含 common/database.py 中的 TimedLock / LOCK_STATS）
+
+def _pct(samples: list, p: float) -> float:
+    if not samples:
+        return 0.0
+    s = sorted(samples)
+    i = max(0, min(len(s) - 1, int(len(s) * p)))
+    return round(s[i], 2)
+
+
+def _summary(samples: list) -> dict:
+    if not samples:
+        return {"count": 0}
+    return {
+        "count": len(samples),
+        "p50": _pct(samples, 0.50),
+        "p95": _pct(samples, 0.95),
+        "p99": _pct(samples, 0.99),
+        "max": round(max(samples), 2),
+        "mean": round(sum(samples) / len(samples), 2),
+    }
+
+
+@app.get("/api/_debug/lock-stats")
+async def api_debug_lock_stats():
+    """返回锁等待 / 持锁 / 内部分阶段耗时分布。单位：毫秒。"""
+    from common.database import LOCK_STATS
+    return {
+        "waits": {k: _summary(list(v)) for k, v in LOCK_STATS["waits"].items()},
+        "holds": {k: _summary(list(v)) for k, v in LOCK_STATS["holds"].items()},
+        "stage_timings": {k: _summary(list(v)) for k, v in LOCK_STATS["stage_timings"].items()},
+        "slow_holds_recent": LOCK_STATS["slow_holds"][-50:],
+        "slow_holds_count": len(LOCK_STATS["slow_holds"]),
+    }
+
+
+@app.post("/api/_debug/lock-stats/reset")
+async def api_debug_lock_stats_reset():
+    """清空所有计时统计（开始新一轮观察前调用）。"""
+    from common.database import LOCK_STATS
+    LOCK_STATS["waits"].clear()
+    LOCK_STATS["holds"].clear()
+    LOCK_STATS["stage_timings"].clear()
+    LOCK_STATS["slow_holds"].clear()
+    return {"ok": True}
 
 
 @app.delete("/api/database")

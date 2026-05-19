@@ -161,9 +161,20 @@ class Database:
         await self._db.execute("PRAGMA busy_timeout=5000")
         # WAL 自动 checkpoint（每 1000 页 ≈ 4MB 触发一次），防止 WAL 文件无限膨胀
         await self._db.execute("PRAGMA wal_autocheckpoint=1000")
-        # 低配服务器：限制缓存 16MB（v2 用 32MB，v3 降低以适应 2GB 内存）
-        await self._db.execute("PRAGMA cache_size=-16000")
-        await self._db.execute("PRAGMA mmap_size=33554432")  # 32MB mmap
+        # ============ Tier 1 性能优化（2026-05 落地）============
+        # 1) synchronous=NORMAL：WAL 模式下安全，fsync 只在 checkpoint 时做，写延迟 -30%~50%
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        # 2) cache_size=-65536：page cache 提升到 64MB（原 16MB），减少冷查询磁盘 IO
+        await self._db.execute("PRAGMA cache_size=-65536")
+        # 3) mmap_size=256MB：内存映射读路径（原 32MB），2GB VPS 上限保留余量
+        await self._db.execute("PRAGMA mmap_size=268435456")
+        # 4) temp_store=MEMORY：临时表/排序在内存做，避免临时文件 IO
+        await self._db.execute("PRAGMA temp_store=MEMORY")
+        # 5) journal_size_limit=64MB：checkpoint 后自动 truncate WAL，回收磁盘
+        await self._db.execute("PRAGMA journal_size_limit=67108864")
+        # 6) optimize=0x10002：启动时给查询优化器一次更新统计的机会（轻量，不阻塞）
+        await self._db.execute("PRAGMA optimize=0x10002")
+        # =====================================================
         self._db.row_factory = aiosqlite.Row
         await self.init_tables()
 

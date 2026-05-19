@@ -247,16 +247,30 @@ async def _timeout_task_loop():
             except Exception:
                 pass
 
-            # 每 10 次循环（约 5 分钟）做一次被动 WAL checkpoint，防止 WAL 膨胀
+            # 每 10 次循环（约 5 分钟）做一次 TRUNCATE WAL checkpoint
+            # Tier 1 优化：PASSIVE→TRUNCATE，让 checkpoint 真正能完成并回收磁盘
+            # （PASSIVE 在 reader 持续存在时永远完不成，是 WAL 膨胀的根因）
             _wal_checkpoint_counter += 1
             if _wal_checkpoint_counter >= 10:
                 _wal_checkpoint_counter = 0
                 try:
-                    res = await db.wal_checkpoint("PASSIVE")
+                    res = await db.wal_checkpoint("TRUNCATE")
                     if res:
-                        logger.debug(f"WAL checkpoint: busy={res[0]} log={res[1]} checkpointed={res[2]}")
+                        logger.debug(f"WAL checkpoint(TRUNCATE): busy={res[0]} log={res[1]} checkpointed={res[2]}")
                 except Exception as e:
                     logger.warning(f"WAL checkpoint 失败: {e}")
+                # WAL 大小监控（参考 CSDN 文章建议，分两档告警）
+                try:
+                    wal_path = config.DB_PATH + "-wal"
+                    if os.path.exists(wal_path):
+                        wal_size = os.path.getsize(wal_path)
+                        wal_mb = wal_size / 1024 / 1024
+                        if wal_size > 500 * 1024 * 1024:
+                            logger.error(f"WAL 文件过大: {wal_mb:.0f}MB（>500MB，疑似 checkpoint 被 reader 阻塞）")
+                        elif wal_size > 200 * 1024 * 1024:
+                            logger.warning(f"WAL 文件偏大: {wal_mb:.0f}MB（>200MB）")
+                except Exception:
+                    pass
 
             # 兜底扫描：把 DB 中到期可重试的 callback 重新入队
             # （服务重启、内存队列丢失、_completion_watcher 漏检测 等场景的安全网）

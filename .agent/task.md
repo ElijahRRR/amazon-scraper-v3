@@ -1,15 +1,15 @@
 # Task Definition
 
 - Mode: review
-- Task: Review the full codebase for correctness bugs, cross-module contract mismatches, and coverage gaps
+- Task: Review the full current codebase after the March 18 task-lifecycle changes
 - Constraints:
-  - Focus on behavior-affecting issues in the current codebase, not style.
-  - Prefer reproduced findings with concrete file/line references.
-  - Keep the review centered on `worker/`, `server/`, and `common/` runtime flows.
+  - Focus on correctness regressions, state-machine holes, API contract mismatches, and missing coverage.
+  - Prefer reproduced findings with file/line references over speculation.
+  - Treat the current `main` branch as the review target, not the earlier remote-runtime monitoring task.
 - Acceptance Criteria:
-  - Run a baseline verification pass.
-  - Inspect the end-to-end flow across worker task pulling, server coordination, database persistence, screenshot handling, and export.
+  - Run baseline verification for the current codebase.
+  - Re-review the task lifecycle across `worker/engine.py`, `server/app.py`, and `common/database.py`.
   - Record active findings and evidence in `.agent/review_list.json` and `.agent/evidence/`.
-  - Produce a concise findings-first review for the user.
+  - Produce a findings-first review for the user.
 - Out of Scope:
   - Implementing fixes unless the user explicitly asks for remediation.

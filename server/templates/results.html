@@ -98,9 +98,12 @@
                         <th style="width:30px;"><input type="checkbox" id="selectAll" onchange="toggleSelectAll(this)"></th>
                         <th>ASIN</th>
                         <th>标题</th>
+                        <th>评分</th>
+                        <th>评论数</th>
                         <th>当前价格</th>
                         <th>BuyBox</th>
                         <th>品牌</th>
+                        <th>卖家店铺</th>
                         <th>库存</th>
                         <th>FBA</th>
                         <th>配送</th>
@@ -313,7 +316,7 @@ function loadPrev() {
 function renderResults(items) {
     const tbody = document.getElementById('resultBody');
     if (!items || items.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="11" class="text-center text-secondary p-4">暂无数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="14" class="text-center text-secondary p-4">暂无数据</td></tr>';
         updateSelectUI();
         return;
     }
@@ -325,6 +328,10 @@ function renderResults(items) {
         const price = esc(r.current_price || 'N/A');
         const buybox = esc(r.buybox_price || 'N/A');
         const brand = esc(r.brand || 'N/A');
+        const rating = esc(r.rating || 'N/A');
+        const reviewCount = esc(r.review_count || 'N/A');
+        const sellerName = esc(r.seller_name || 'N/A');
+        const sellerId = esc(r.seller_id || '');
         const stock = esc(r.stock_count || '0');
         const stockStatus = esc(r.stock_status || '');
         const fba = esc(r.is_fba || 'N/A');
@@ -338,13 +345,23 @@ function renderResults(items) {
                 ? '<span class="badge-status badge-pending">FBM</span>'
                 : esc(fba);
 
+        // 卖家：显示店名，hover 显示 ID；Amazon 自营特殊标记
+        const sellerCell = (sellerId && sellerId !== 'N/A')
+            ? (sellerId === 'AMAZON'
+                ? '<span class="badge-status badge-done">Amazon</span>'
+                : `<span title="${sellerId}">${sellerName}</span>`)
+            : (sellerName !== 'N/A' ? sellerName : '-');
+
         html += `<tr>
             <td><input type="checkbox" class="row-check" value="${asin}" onchange="updateSelectUI()"></td>
             <td><a href="https://www.amazon.com/dp/${asin}" target="_blank" class="text-accent">${asin}</a></td>
             <td title="${esc(r.title || '')}">${title}</td>
+            <td>${rating !== 'N/A' ? `<span title="${rating} / 5">${rating} ★</span>` : '-'}</td>
+            <td>${reviewCount}</td>
             <td>${price}</td>
             <td>${buybox}</td>
             <td>${brand}</td>
+            <td>${sellerCell}</td>
             <td>${stock}</td>
             <td>${fbaCell}</td>
             <td>${delivery}</td>

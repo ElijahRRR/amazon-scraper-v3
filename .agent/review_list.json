@@ -1,95 +1,76 @@
 [
   {
-    "id": "R-100",
+    "id": "R-200",
     "priority": "P3",
     "dimension": "baseline",
-    "check": "Run repository baseline tests before the code review",
+    "check": "Run lightweight baseline verification on the current codebase",
     "status": "passed",
     "evidence": [
-      "python3 -m unittest"
+      "python3 -m py_compile common/config.py common/database.py common/models.py server/app.py worker/adaptive.py worker/engine.py worker/metrics.py worker/parser.py worker/proxy.py worker/screenshot.py worker/session.py run_server.py run_worker.py"
     ],
     "finding": "",
-    "last_checked_at": "2026-03-17T09:42:33Z"
+    "last_checked_at": "2026-03-18T11:20:00+08:00"
   },
   {
-    "id": "R-101",
+    "id": "R-201",
     "priority": "P1",
     "dimension": "correctness",
-    "check": "Verify screenshot-disabled workers cannot pull screenshot tasks",
+    "check": "Verify stale workers cannot still mutate screenshot state after lease rejection",
     "status": "finding",
     "evidence": [
-      ".agent/evidence/review-full-codebase-20260317.md",
-      "worker/engine.py:733",
-      "worker/engine.py:736",
-      "server/app.py:482",
-      "server/app.py:487",
-      "server/app.py:490"
+      ".agent/evidence/review-full-codebase-20260318.md",
+      "worker/engine.py:1135",
+      "server/app.py:585",
+      "server/app.py:649",
+      "common/database.py:1045"
     ],
-    "finding": "The worker sends `enable_screenshot=0` when polling for work, but the server only reads `needs_screenshot`. Until the later heartbeat updates the registry, a `--no-screenshot` worker is registered as screenshot-capable and can pull screenshot tasks. Reproduced via ASGI request: `/api/tasks/pull?worker_id=no-shot-worker&count=1&enable_screenshot=0` returned a task with `needs_screenshot=True`, which can leave screenshot rows stuck pending because that worker never enqueues HTML.",
-    "last_checked_at": "2026-03-17T09:45:27Z"
+    "finding": "The new `lease_epoch` fence protects `/api/tasks/result`, but screenshots are still written without any lease or worker ownership check. I reproduced a stale success submission that returned `{'ok': False, 'stale': True}`, followed by a `200 OK` screenshot upload for the same task. That means stale workers can still overwrite screenshot files and `screenshot_path`, so the anti-duplicate fix does not fully fence stale side effects.",
+    "last_checked_at": "2026-03-18T11:21:07+08:00"
   },
   {
-    "id": "R-102",
-    "priority": "P1",
-    "dimension": "correctness",
-    "check": "Verify server-issued global quotas are actually applied by workers",
-    "status": "finding",
-    "evidence": [
-      ".agent/evidence/review-full-codebase-20260317.md",
-      "server/app.py:230",
-      "server/app.py:233",
-      "server/app.py:625",
-      "worker/engine.py:821",
-      "worker/engine.py:834"
-    ],
-    "finding": "The coordinator publishes quota keys as `max_concurrency` and `max_qps`, but the worker reads `quota.get('concurrency')` and `quota.get('qps')`. As a result the distributed quota mechanism is a no-op: workers keep their local max concurrency and token-bucket rate even when the server computes tighter limits.",
-    "last_checked_at": "2026-03-17T09:45:11Z"
-  },
-  {
-    "id": "R-103",
-    "priority": "P1",
-    "dimension": "correctness",
-    "check": "Verify soft restart really resets runtime concurrency",
-    "status": "finding",
-    "evidence": [
-      ".agent/evidence/review-full-codebase-20260317.md",
-      "worker/engine.py:1397",
-      "worker/engine.py:1399"
-    ],
-    "finding": "Soft restart overwrites `self._controller._concurrency` before calling `_resize_semaphore()`, so the resize sees the same old/new value and leaves the semaphore unchanged. Reproduced with a worker whose semaphore had 21 permits: after `_soft_restart()` the public concurrency reset to 16, but the semaphore still had 21 permits, so actual request parallelism stayed above the intended recovery limit.",
-    "last_checked_at": "2026-03-17T09:45:10Z"
-  },
-  {
-    "id": "R-104",
+    "id": "R-202",
     "priority": "P2",
     "dimension": "correctness",
-    "check": "Verify soft restart preserves the stats structure used during shutdown",
+    "check": "Verify batch-scoped result search still works when combined with change filters",
     "status": "finding",
     "evidence": [
-      ".agent/evidence/review-full-codebase-20260317.md",
-      "worker/engine.py:1402",
-      "worker/engine.py:1408",
-      "worker/engine.py:1477",
-      "worker/engine.py:1488"
+      ".agent/evidence/review-full-codebase-20260318.md",
+      "common/database.py:892",
+      "common/database.py:898",
+      "common/database.py:913",
+      "common/database.py:983"
     ],
-    "finding": "Soft restart replaces `_stats` with a partial dict containing only `success`, `failed`, and `total`. The shutdown path later assumes `start_time` and `blocked` still exist; reproduced by calling `_soft_restart()` and then `_print_stats()`, which raises `KeyError: 'start_time'`.",
-    "last_checked_at": "2026-03-17T09:46:13Z"
+    "finding": "The `iter_results()` export bug was fixed, but `get_results()` still appends search parameters before the extra `batch_id` placeholders introduced by change-filter joins. With `batch_id + search + change_filter='price_stock'`, SQLite binds the wrong values and returns an empty result set. Reproduced on a temp DB where the matching row existed but `get_results(..., search='Target', change_filter='price_stock')` returned `total=0` and `items=[]`.",
+    "last_checked_at": "2026-03-18T11:21:07+08:00"
   },
   {
-    "id": "R-105",
+    "id": "R-203",
     "priority": "P2",
-    "dimension": "correctness",
-    "check": "Verify batch-scoped change exports return the expected rows",
+    "dimension": "compatibility",
+    "check": "Verify the advertised old-format `/api/tasks/release` compatibility path still works",
     "status": "finding",
     "evidence": [
-      ".agent/evidence/review-full-codebase-20260317.md",
-      "common/database.py:990",
-      "common/database.py:997",
-      "common/database.py:1017",
-      "server/app.py:786",
-      "server/app.py:808"
+      ".agent/evidence/review-full-codebase-20260318.md",
+      "server/app.py:573",
+      "server/app.py:579",
+      "common/database.py:539"
     ],
-    "finding": "In `iter_results()`, the `last_id` cursor is inserted into `params` before the extra `batch_id` placeholders added by change-filter joins. For batch-scoped exports such as `change_filter='price_stock'`, SQLite binds the cursor value into the subquery's `batch_id=?` slot, so filtered exports come back empty. Reproduced on a temp DB where `change_filter='all'` returned `['B000000001']` but `change_filter='price_stock'` returned `[]` for the same batch.",
-    "last_checked_at": "2026-03-17T09:45:00Z"
+    "finding": "The compatibility branch for `POST /api/tasks/release` converts legacy `task_ids` into `(task_id, lease_epoch=0)` tuples but supplies an empty `worker_id`. `db.release_tasks()` now requires both `worker_id` and `lease_epoch`, so the fallback never releases anything. Reproduced via the API: it returned `{'ok': True, 'released': 0}` while the task row stayed `status='processing'` for `worker-a`.",
+    "last_checked_at": "2026-03-18T11:21:07+08:00"
+  },
+  {
+    "id": "R-204",
+    "priority": "P3",
+    "dimension": "correctness",
+    "check": "Verify `create_tasks()` reports the number of task rows inserted",
+    "status": "passed",
+    "evidence": [
+      ".agent/evidence/review-full-codebase-20260318.md",
+      "common/database.py:363",
+      "common/database.py:390",
+      "server/app.py:391"
+    ],
+    "finding": "",
+    "last_checked_at": "2026-03-18T11:37:07+08:00"
   }
 ]

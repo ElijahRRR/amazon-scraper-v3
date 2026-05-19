@@ -7,11 +7,48 @@ TPS 模式（每次请求换 IP）：
 """
 import asyncio
 import logging
+import socket
+from urllib.parse import urlparse, urlunparse
 from typing import Optional, Dict, Tuple
 
 from common import config
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_proxy_hostname(proxy_url: str) -> str:
+    """
+    预解析代理 URL 中的域名为 IP 地址。
+
+    curl_cffi 内置的 c-ares DNS 解析器不走系统 DNS (getaddrinfo)，
+    在 Surge/Clash 等代理工具的增强模式下会解析失败。
+    用 Python socket.getaddrinfo() 预解析后，传 IP 给 curl_cffi 即可绕过。
+    """
+    if not proxy_url:
+        return proxy_url
+    parsed = urlparse(proxy_url)
+    hostname = parsed.hostname
+    if not hostname:
+        return proxy_url
+    # 已经是 IP 地址则跳过
+    try:
+        socket.inet_aton(hostname)
+        return proxy_url
+    except socket.error:
+        pass
+    # 用系统 DNS 解析域名
+    try:
+        infos = socket.getaddrinfo(hostname, parsed.port or 80, socket.AF_INET)
+        if infos:
+            resolved_ip = infos[0][4][0]
+            # 替换 URL 中的域名为 IP
+            new_netloc = parsed.netloc.replace(hostname, resolved_ip)
+            resolved = urlunparse(parsed._replace(netloc=new_netloc))
+            logger.info(f"代理域名预解析: {hostname} -> {resolved_ip}")
+            return resolved
+    except socket.gaierror as e:
+        logger.warning(f"代理域名预解析失败: {hostname} -> {e}，使用原始 URL")
+    return proxy_url
 
 
 class ProxyManager:
@@ -21,7 +58,8 @@ class ProxyManager:
     """
 
     def __init__(self):
-        self._proxy_url: str = config.PROXY_URL or ""
+        raw_url: str = config.PROXY_URL or ""
+        self._proxy_url: str = _resolve_proxy_hostname(raw_url)
         self._total_blocked = 0
         self._total_requests = 0
 

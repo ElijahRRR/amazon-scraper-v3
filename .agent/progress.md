@@ -1,3 +1,41 @@
+### Session: 2026-04-30T08:47:28Z
+- Target item id: F-009
+- Objective: Add seller-storefront scraping (按三方卖家 Seller 采集店内商品)
+- Baseline status: feature did not exist; system was pure ASIN-only
+- Work performed:
+  - Added F-009 to .agent/feature_list.json
+  - Schema migrations in `common/database.py`: batches.batch_type/discover_mode, tasks.task_type/task_meta, new seller_discoveries table + indexes
+  - New DB methods: create_seller_batch, accept_seller_discovery_result, get_seller_batch_progress; pull_tasks now returns task_type/task_meta/discover_mode
+  - Worker `worker/session.py`: fetch_seller_listing_page (reuses proxy/headers/UA infra)
+  - Worker `worker/parser.py`: parse_seller_listing (selectolax + lxml fallback, captcha-aware, has_next detection)
+  - Worker `worker/engine.py`: task_type branch in _worker_loop, new _process_seller_task with internal pagination loop (MAX_PAGES=75), new _submit_seller_result direct-POST helper
+  - Server `server/app.py`: POST /api/upload-sellers (mixed seller-id/URL extractor), POST /api/tasks/seller-result, GET /api/seller-batches/{id}/progress, GET /api/seller-batches/{id}/discoveries
+  - UI `server/templates/tasks.html`: new 按卖家店铺采集 card with discover_mode select + screenshot toggle, JS submit handler
+- Verification commands:
+  - `python3 -m unittest test_f009_seller_discovery -v`
+  - `python3 -c "from server import app; from worker import engine, parser, session; from common import database"`
+  - `python3 -m py_compile common/database.py server/app.py worker/engine.py worker/parser.py worker/session.py`
+- Verification result:
+  - 12 tests pass (Ran 12 tests in 0.258s, OK)
+  - imports OK
+  - py_compile OK across all touched files
+- Evidence paths:
+  - test_f009_seller_discovery.py
+  - .claude/plans/stateless-launching-narwhal.md (approved plan)
+- Files changed:
+  - common/database.py
+  - worker/session.py
+  - worker/parser.py
+  - worker/engine.py
+  - server/app.py
+  - server/templates/tasks.html
+  - .agent/feature_list.json
+  - test_f009_seller_discovery.py (new)
+- Blockers:
+  - none for code path; live end-to-end against Amazon not run (would need real seller_id + clean proxy session). User can do that next session by uploading 1-2 small sellers.
+- Next action:
+  - Live small-batch validation: upload a real seller URL to /api/upload-sellers in `discover_only` mode first, watch /api/seller-batches/{id}/progress, then try `with_detail`.
+
 ### Session: 2026-03-16T03:51:37Z
 - Target item id: INIT
 - Objective: Initialize infinite-run harness artifacts
@@ -93,6 +131,189 @@
   - `python3 - <<'PY' ... synthetic process tree ... await worker._stop_screenshot_process() ... print({'before_count': ..., 'after_count': ...}) ... PY`
 - Verification result:
   - pass (`py_compile`)
+
+### Session: 2026-03-17T15:11:30Z
+- Target item id: F-008
+- Objective: Attribute current local CPU usage while the remote batch monitor is running
+- Baseline status: user observed CPU idle dropping from roughly 30%-40% to near-saturated while the remote `317all` batch was still in flight
+- Work performed:
+  - Captured a system-wide CPU ranking via `ps` and `top`.
+  - Isolated scraper-related processes to distinguish worker CPU from unrelated desktop applications.
+  - Confirmed the remote batch was still active, so the local workers were not idle/spinning after completion.
+  - Verified there were no active `worker/screenshot.py` child processes on this host during the sample.
+- Verification commands:
+  - `ps -Ao pid,ppid,pgid,%cpu,%mem,etime,command | sort -k4 -nr | head -n 25`
+  - `top -l 1 -o cpu -stats pid,command,cpu,mem,threads,time | head -n 35`
+  - `pgrep -fal 'run_worker.py|worker/screenshot.py|run_server.py|batch_runtime_monitor.py|Chromium|Google Chrome|chrome|playwright'`
+  - `python3 - <<'PY' ... GET http://64.186.239.11:8899/api/progress ... GET http://64.186.239.11:8899/api/workers ... PY`
+- Verification result:
+  - pass
+- Evidence paths:
+  - .agent/runtime_logs/f008_remote_317all/
+  - .agent/monitor/f008_state.json
+  - .agent/monitor/f008_snapshots.jsonl
+- Files changed:
+  - .agent/progress.md
+  - .agent/handoff.md
+- Blockers:
+  - none
+- Next action:
+  - Continue minute-level monitoring until the remote batch completes, then summarize runtime stability in the final F-008 report
+
+### Session: 2026-03-17T18:23:00Z
+- Target item id: F-008
+- Objective: Diagnose why the remote batch throughput has become slow during the late-stage run
+- Baseline status: remote batch `317all` remained active at roughly 92% completion (`done=270273`, `pending=23015`, `processing=987`), but the user observed noticeably slower advancement
+- Work performed:
+  - Queried live `/api/progress`, `/api/workers`, and `/api/batches` from `http://64.186.239.11:8899`.
+  - Compared minute-level monitor snapshots to quantify how throughput changed over time.
+  - Ran a direct 30-second throughput sample against the remote API to separate perceived slowness from actual slowness.
+  - Inspected the latest worker log tails and error bursts across `mac1`-`mac4`.
+  - Counted recent `429`, timeout, TLS, session-init failure, batch-submit timeout, concurrency-downshift, and session-rotation events.
+- Verification commands:
+  - `python3 - <<'PY' ... GET /api/progress ... GET /api/workers ... GET /api/batches ... PY`
+  - `python3 - <<'PY' ... parse .agent/monitor/f008_snapshots.jsonl and compute hourly checkpoint rates ... PY`
+  - `python3 - <<'PY' ... 30-second live throughput sample via /api/progress and /api/workers ... PY`
+  - `tail -n 120 .agent/runtime_logs/f008_remote_317all/worker_stage{1,2,3,4}_*.log`
+  - `python3 - <<'PY' ... count recent 429/timeout/TLS/OK/session-init-failed events in worker logs ... PY`
+  - `rg -n '并发调整|Session 主动轮换|Session 轮换成功|批量提交异常|CONNECT tunnel failed|请求超时' .agent/runtime_logs/f008_remote_317all/worker_stage*.log | tail -n 80`
+- Verification result:
+  - pass
+- Evidence paths:
+  - .agent/monitor/f008_snapshots.jsonl
+  - .agent/monitor/f008_state.json
+  - .agent/runtime_logs/f008_remote_317all/worker_stage1_mac1.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage2_mac2.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage3_mac3.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage4_mac4.log
+- Files changed:
+  - .agent/feature_list.json
+  - .agent/progress.md
+  - .agent/handoff.md
+- Blockers:
+  - none
+- Next action:
+  - Keep the workers and minute-level monitor running, and fold the confirmed long-tail slowdown causes into the final F-008 runtime report
+
+### Session: 2026-03-17T18:50:00Z
+- Target item id: F-008
+- Objective: Verify whether the slow run is primarily caused by duplicate ASIN collection and identify the code path that allows it
+- Baseline status: user reported that cumulative worker pull volume far exceeded submitted task count and asked to analyze the run from repeated-ASIN evidence rather than from proxy noise alone
+- Work performed:
+  - Counted repeated `OK` and failure occurrences per ASIN across all four worker logs.
+  - Quantified cross-worker overlap to determine whether the same ASINs were being recollected on multiple workers.
+  - Pulled representative duplicate-ASIN timelines showing the same ASIN succeeding across all four workers dozens of times.
+  - Re-read batch upload / task creation code to rule out same-batch import duplication in the current code path.
+  - Re-read task pull, timeout reset, queue prefetch, result batching, and batch-submit retry logic to explain how the same task can be re-issued before the original worker finishes.
+- Verification commands:
+  - `python3 - <<'PY' ... count OK/fail duplicates per ASIN across .agent/runtime_logs/f008_remote_317all/worker_stage*_mac*.log ... PY`
+  - `python3 - <<'PY' ... count ASINs whose OK logs appear in multiple worker logs and summarize overlap combinations ... PY`
+  - `python3 - <<'PY' ... print representative duplicate ASIN timelines with first/last OK entries ... PY`
+  - `sed -n '340,420p' server/app.py`
+  - `nl -ba common/database.py | sed -n '331,380p'`
+  - `nl -ba common/database.py | sed -n '383,470p'`
+  - `nl -ba worker/engine.py | sed -n '268,325p'`
+  - `nl -ba worker/engine.py | sed -n '1188,1278p'`
+  - `nl -ba server/app.py | sed -n '165,170p'`
+- Verification result:
+  - pass
+- Evidence paths:
+  - .agent/runtime_logs/f008_remote_317all/worker_stage1_mac1.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage2_mac2.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage3_mac3.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage4_mac4.log
+  - .agent/monitor/f008_snapshots.jsonl
+- Files changed:
+  - .agent/feature_list.json
+  - .agent/progress.md
+  - .agent/handoff.md
+- Blockers:
+  - none
+- Next action:
+  - If requested, implement the lease/heartbeat/idempotency fixes in the worker/server task lifecycle instead of only tuning proxy parameters
+
+### Session: 2026-03-18T00:10:00Z
+- Target item id: F-008
+- Objective: Explain why the dashboard `processing` count can spike into the thousands even though each worker only runs tens of concurrent requests
+- Baseline status: user compared local feeder math against the dashboard and pointed out that the visible `processing` count sometimes reaches `3000`, which cannot be explained by HTTP inflight alone
+- Work performed:
+  - Re-checked the worker feeder and queue-size math to bound local prefetched tasks.
+  - Re-checked the task state machine to see when `tasks.status` flips to `processing`.
+  - Re-checked the result batching path to identify states where a task stays `processing` after local scraping is already finished.
+  - Re-checked the dashboard template to confirm the `processing` card reads the global `/api/progress` API rather than a narrower local metric.
+- Verification commands:
+  - `nl -ba worker/engine.py | sed -n '268,325p'`
+  - `nl -ba common/database.py | sed -n '383,470p'`
+  - `nl -ba worker/engine.py | sed -n '1188,1278p'`
+  - `nl -ba server/app.py | sed -n '151,170p'`
+  - `sed -n '120,190p' server/templates/dashboard.html`
+- Verification result:
+  - pass
+- Evidence paths:
+  - .agent/runtime_logs/f008_remote_317all/worker_stage1_mac1.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage2_mac2.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage3_mac3.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage4_mac4.log
+- Files changed:
+  - .agent/progress.md
+  - .agent/handoff.md
+- Blockers:
+  - none
+- Next action:
+  - If requested, implement a lease/heartbeat redesign and adjust the dashboard wording so `processing` no longer implies live in-flight HTTP concurrency
+
+### Session: 2026-03-18T00:22:00Z
+- Target item id: F-008
+- Objective: Evaluate the proposed heartbeat-aware reclaim plan and identify any correctness gaps before implementation
+- Baseline status: the user proposed moving reclaim to the 30s background loop, reclaiming only dead-worker tasks plus a hard timeout fallback, lowering fetch count to `concurrency * 1`, and adding `WHERE status='processing'` to `complete_task`
+- Work performed:
+  - Verified that current write-side completion/failure paths are unconditional and do not fence on worker ownership or dispatch attempt.
+  - Verified that `save_result()` runs before `complete_task()` / `fail_task()` in the API handler, so a stale late result can still mutate `asin_data` before task-state fencing unless the flow is reordered.
+  - Evaluated the proposed `5 minute` hard timeout against the current unbounded `_result_queue` and batch-submit retry path.
+- Verification commands:
+  - `nl -ba common/database.py | sed -n '466,520p'`
+  - `nl -ba common/database.py | sed -n '520,620p'`
+  - `nl -ba server/app.py | sed -n '570,613p'`
+  - `nl -ba worker/engine.py | sed -n '1188,1278p'`
+- Verification result:
+  - pass
+- Evidence paths:
+  - .agent/runtime_logs/f008_remote_317all/worker_stage2_mac2.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage3_mac3.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage4_mac4.log
+- Files changed:
+  - .agent/progress.md
+  - .agent/handoff.md
+- Blockers:
+  - none
+- Next action:
+  - If requested, turn the heartbeat-aware reclaim concept into a concrete patch plan with dispatch token / stale-write fencing
+
+### Session: 2026-03-18T00:34:00Z
+- Target item id: F-008
+- Objective: Validate the refined 17-point plan and identify any last-mile implementation gaps
+- Baseline status: the user refined the plan with `lease_epoch`, direct terminal failure for server-side parse mismatch, grouped `release_tasks` updates, and aggregate `accepted/stale/failed` batch semantics
+- Work performed:
+  - Re-checked worker-side stats and submitter behavior against the proposed stale semantics.
+  - Verified that current `_stats["success"]` / `_stats["failed"]` are incremented before server acceptance, not after batch response handling.
+  - Verified that current `_submit_batch()` treats any HTTP 200 as success and discards the JSON body, so accepted/stale/failed counters would otherwise be invisible to the worker.
+- Verification commands:
+  - `nl -ba worker/engine.py | sed -n '980,1165p'`
+  - `nl -ba worker/engine.py | sed -n '1248,1288p'`
+- Verification result:
+  - pass
+- Evidence paths:
+  - .agent/runtime_logs/f008_remote_317all/worker_stage1_mac1.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage2_mac2.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage3_mac3.log
+  - .agent/runtime_logs/f008_remote_317all/worker_stage4_mac4.log
+- Files changed:
+  - .agent/progress.md
+  - .agent/handoff.md
+- Blockers:
+  - none
+- Next action:
+  - If requested, convert the refined plan into a concrete implementation order and code patch set
   - pass (`before_count: 2`, `after_count: 0`)
 - Evidence paths:
   - `.agent/evidence/f002-screenshot-process-cleanup.md`
@@ -470,3 +691,126 @@
   - none
 - Next action:
   - If the user asks for fixes, start with the cross-module contract mismatches in `worker/engine.py` and `server/app.py`, then repair `worker._soft_restart()` and `common/database.iter_results()`.
+
+### Session: 2026-03-17T11:29:49Z
+- Target item id: F-008
+- Objective: Start four local workers against the remote server, attach minute-level monitoring, and persist a completion-time runtime report
+- Baseline status: remote server `http://64.186.239.11:8899` was reachable via API and exposed one pending batch `317all` (`batch_id=1`, `total_tasks=294291`, `completed=0`, `failed=0`, `pending=294291`, `processing=0`) with no workers yet online
+- Work performed:
+  - Recovered local process state and confirmed there were no leftover `mac1`-`mac4` worker or remote-monitor processes from the interrupted turn.
+  - Reviewed the existing `.agent/monitor/batch_runtime_monitor.py` script for reuse against the remote server.
+  - Updated `.agent/task.md` and `.agent/feature_list.json` to register the new runtime-monitoring objective.
+- Verification commands:
+  - `ps -Ao pid,ppid,pgid,etime,command | rg 'run_worker.py --server http://64.186.239.11:8899|batch_runtime_monitor.py.*64.186.239.11:8899|mac1|mac2|mac3|mac4' || true`
+  - `python3 - <<'PY' ... GET http://64.186.239.11:8899/api/workers ... GET http://64.186.239.11:8899/api/batches ... PY`
+- Verification result:
+  - pass (no leftover local worker/monitor processes)
+  - pass (remote server reachable; target batch identified)
+- Evidence paths:
+  - `.agent/feature_list.json`
+  - `.agent/task.md`
+- Blockers:
+  - none
+- Next action:
+  - Launch `mac1`-`mac4` and the minute-level remote monitor with durable log capture.
+
+### Session: 2026-03-17T11:35:25Z
+- Target item id: F-008
+- Objective: Confirm the remote workers and minute-level monitor are live after launch
+- Baseline status: `mac1`-`mac4` and the monitor process had been started locally, but I still needed to verify that the workers were visible on the remote server and that snapshots were being written
+- Work performed:
+  - Switched from fragile background `nohup` launches to durable PTY-backed worker sessions with `tee` log capture.
+  - Brought up `mac1`/`mac2` with screenshots enabled and `mac3`/`mac4` with `--no-screenshot`.
+  - Started `.agent/monitor/batch_runtime_monitor.py` against `http://64.186.239.11:8899` for batch `317all` (`batch_id=1`).
+  - Verified the monitor produced an initial successful snapshot at `2026-03-17T11:34:17Z`.
+  - Released the two one-off probe tasks (`481`, `482`) used to confirm the remote pull endpoint still handed out tasks.
+  - Terminated a stale local orphan `worker/screenshot.py http://64.186.239.11:8899 1 4` process so it would not contaminate runtime observations.
+- Verification commands:
+  - `python3 - <<'PY' ... GET http://64.186.239.11:8899/api/workers ... GET http://64.186.239.11:8899/api/progress ... PY`
+  - `ls -l .agent/monitor/f008_snapshots.jsonl`
+  - `tail -n 2 .agent/monitor/f008_snapshots.jsonl`
+  - `python3 - <<'PY' ... POST http://64.186.239.11:8899/api/tasks/release {'task_ids':[481,482]} ... PY`
+  - `kill -TERM 94663`
+- Verification result:
+  - pass (all 4 requested workers online and submitting results)
+  - pass (minute-level monitor writing snapshots and state)
+  - note (early runtime signal): the first successful snapshot recorded `206` proxy `429` / timeout events and `49` task-failure log events during startup, so the run is already showing heavy proxy-side instability
+- Evidence paths:
+  - `.agent/runtime_logs/f008_remote_317all/`
+  - `.agent/monitor/f008_snapshots.jsonl`
+  - `.agent/monitor/f008_state.json`
+- Blockers:
+  - none
+- Next action:
+  - Leave the four workers and the monitor running to batch completion, then summarize `.agent/evidence/f008-remote-runtime-report.md` for the user.
+
+### Session: 2026-03-18T03:24:00Z
+- Target item id: R-201/R-202/R-203/R-204
+- Objective: Review the full current codebase after the March 18 task-lifecycle changes and persist verified findings
+- Baseline status:
+  - Recovered the repository in a dirty state with existing `.agent` monitoring artifacts from the earlier F-008 runtime task, then repointed `.agent/task.md` into `review` mode for this full-codebase audit.
+  - There are currently no discoverable unit tests in the repository: both `python3 -m unittest` and `python3 -m unittest discover -s . -p 'test*.py' -v` reported `Ran 0 tests`.
+  - Lightweight syntax baseline passed via `python3 -m py_compile common/config.py common/database.py common/models.py server/app.py worker/adaptive.py worker/engine.py worker/metrics.py worker/parser.py worker/proxy.py worker/screenshot.py worker/session.py run_server.py run_worker.py`.
+- Work performed:
+  - Re-audited the task lease, result submission, screenshot upload, release, and result-query code paths across `server/app.py`, `worker/engine.py`, and `common/database.py`.
+  - Verified that the earlier `iter_results()` batch export parameter-order bug is fixed now, then continued variant analysis on `get_results()` and the release/screenshot compatibility paths.
+  - Reproduced four active correctness/compatibility findings and refreshed `.agent/review_list.json`, `.agent/task.md`, `.agent/handoff.md`, and `.agent/evidence/review-full-codebase-20260318.md`.
+- Verification commands:
+  - `python3 -m unittest`
+  - `python3 -m unittest discover -s . -p 'test*.py' -v`
+  - `python3 -m py_compile common/config.py common/database.py common/models.py server/app.py worker/adaptive.py worker/engine.py worker/metrics.py worker/parser.py worker/proxy.py worker/screenshot.py worker/session.py run_server.py run_worker.py`
+  - `python3 - <<'PY' ... async for item in db.iter_results(batch_id=batch_id, change_filter='price_stock', batch_size=10) ... PY`
+  - `python3 - <<'PY' ... stale result -> POST /api/tasks/result ... stale screenshot -> POST /api/tasks/screenshot ... PY`
+  - `python3 - <<'PY' ... await db.get_results(batch_id=batch_id, search='Target', change_filter='price_stock', limit=10) ... PY`
+  - `python3 - <<'PY' ... POST /api/tasks/release {'task_ids':[task_id]} ... PY`
+  - `python3 - <<'PY' ... inserted = await db.create_tasks(batch_id, ['B000000001','B000000002'], needs_screenshot=True) ... PY`
+- Verification result:
+  - pass: syntax baseline succeeded
+  - note: no automated tests are currently discoverable in the repository
+  - pass: `iter_results(... change_filter='price_stock')` returned the expected row, confirming the previously reported export bug is fixed
+  - finding reproduced: stale `/api/tasks/result` submissions are rejected, but the same stale worker can still upload a screenshot and mutate `screenshot_path`
+  - finding reproduced: `get_results(batch_id + search + change_filter)` still misbinds SQL params and returns an empty result set
+  - finding reproduced: legacy `POST /api/tasks/release` compatibility input returns `released: 0` and leaves the task leased
+  - finding reproduced: `create_tasks()` overstates inserted task count by including related `batch_asins` / `screenshots` writes in `total_changes`
+- Evidence paths:
+  - `.agent/evidence/review-full-codebase-20260318.md`
+  - `.agent/review_list.json`
+- Files changed:
+  - `.agent/task.md`
+  - `.agent/review_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+  - `.agent/evidence/review-full-codebase-20260318.md`
+- Blockers:
+  - none
+- Next action:
+  - If the user wants remediation, fix the stale screenshot fencing first, then repair `common/database.get_results()` parameter ordering, then either remove or correctly support the legacy `/api/tasks/release` payload, and finally make `create_tasks()` return the actual task-row insert count.
+
+### Session: 2026-03-18T03:37:07Z
+- Target item id: R-204
+- Objective: Verify the reported `create_tasks()` inserted-count bug after the user's fix
+- Baseline status:
+  - `R-204` was previously an active P3 finding because `create_tasks()` returned `6` for a two-ASIN screenshot batch while only `2` task rows were created.
+  - The latest local branch tip is `36479ed fix: 4 bugs from code review (P1-P3)`.
+- Work performed:
+  - Inspected the current `create_tasks()` implementation in `common/database.py` and confirmed the task insert delta is now measured immediately around the `tasks` insert step.
+  - Re-ran the original two-ASIN screenshot-batch reproduction against a temporary SQLite database using the current code.
+- Verification commands:
+  - `python3 -m py_compile common/database.py`
+  - `python3 - <<'PY' ... inserted = await db.create_tasks(batch_id, ['B000000001', 'B000000002'], needs_screenshot=True) ... PY`
+- Verification result:
+  - pass: `py_compile` succeeded for `common/database.py`
+  - pass: reproduction now returns `{'inserted_returned': 2, 'tasks': 2, 'batch_asins': 2, 'screenshots': 2}`
+  - pass: `R-204` no longer reproduces on the current code
+- Evidence paths:
+  - `.agent/evidence/review-full-codebase-20260318.md`
+  - `.agent/review_list.json`
+- Files changed:
+  - `.agent/review_list.json`
+  - `.agent/progress.md`
+  - `.agent/handoff.md`
+  - `.agent/evidence/review-full-codebase-20260318.md`
+- Blockers:
+  - none
+- Next action:
+  - If the user wants more verification, continue with the remaining active findings `R-201`, `R-202`, and `R-203`.

@@ -132,7 +132,9 @@ class AdaptiveController:
         logger.info(f"自适应控制器启动 | 初始并发={self._concurrency} | 范围=[{self._min}, {self._max}]")
 
     async def stop(self):
-        """停止控制器"""
+        """停止控制器（幂等：可重复调用）"""
+        if not self._running and self._task is None:
+            return
         self._running = False
         if self._drain_task and not self._drain_task.done():
             self._drain_task.cancel()
@@ -142,6 +144,7 @@ class AdaptiveController:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
 
     async def _adjust_loop(self):
         """后台循环：每 ADJUST_INTERVAL_S 秒评估一次"""

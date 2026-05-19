@@ -195,6 +195,15 @@ class AmazonParser:
         result["root_category_id"], result["category_ids"], result["category_tree"] = \
             self._slx_parse_categories(tree)
 
+        # 评分 + 评论数（JSON-LD 优先，CSS 兜底）
+        result["rating"] = self._slx_parse_rating(tree, jsonld)
+        result["review_count"] = self._slx_parse_review_count(tree, jsonld)
+
+        # 卖家店铺 ID + 名（buybox 卖家档案链接）
+        seller_id, seller_name = self._slx_parse_seller(tree, html_text)
+        result["seller_id"] = seller_id
+        result["seller_name"] = seller_name
+
         return result
 
     # ---- selectolax 辅助 ----
@@ -250,7 +259,7 @@ class AmazonParser:
 
     def _slx_parse_brand(self, tree) -> str:
         try:
-            # 多选择器覆盖不同页面布局
+            # 1) 文本形式的 byline / brand 链接（最常见）
             for sel in ['a#bylineInfo', 'a#brand', 'span#bylineInfo',
                         '#bylineInfo_feature_div a', '#brand-snapshot-link']:
                 node = tree.css_first(sel)
@@ -262,6 +271,49 @@ class AmazonParser:
                     ).strip()
                     if brand and len(brand) <= 80:
                         return brand
+
+            # 2) Premium 品牌以 logo 图片形式呈现时（byline 文本为空）
+            #    <img id="brandLogoHiResByline" alt="Yaheetech" title="Visit the Yaheetech Store">
+            for sel in ['img#brandLogoHiResByline', 'img.premium-logoByLine-brand-logo',
+                        'img#brand-logo']:
+                node = tree.css_first(sel)
+                if node:
+                    alt = (node.attributes.get('alt') or '').strip()
+                    title_attr = (node.attributes.get('title') or '').strip()
+                    for candidate in (alt, title_attr):
+                        if not candidate:
+                            continue
+                        brand = re.sub(
+                            r'Visit the |Brand:\s*| Store$', '', candidate,
+                            flags=re.IGNORECASE
+                        ).strip()
+                        if brand and len(brand) <= 80:
+                            return brand
+
+            # 3) "Visit the X Store" 链接（覆盖 brand 仅以图片呈现的兜底）
+            for sel in ['a#visitStoreDesktopUrl', '#bylineInfo_feature_div a[href*="/stores/"]']:
+                node = tree.css_first(sel)
+                if node:
+                    link_text = node.text(strip=True)
+                    brand = re.sub(
+                        r'Visit the |Brand:\s*| Store$', '', link_text,
+                        flags=re.IGNORECASE
+                    ).strip()
+                    if brand and len(brand) <= 80:
+                        return brand
+                    # 退而求其次从 href 解析 /stores/{Brand}/page/...
+                    href = (node.attributes.get('href') or '').strip()
+                    m = re.search(r'/stores/([^/]+)/', href)
+                    if m:
+                        brand = m.group(1).replace('+', ' ').strip()
+                        # URL 里可能是百分号转义的品牌名
+                        try:
+                            from urllib.parse import unquote
+                            brand = unquote(brand)
+                        except Exception:
+                            pass
+                        if brand and len(brand) <= 80 and brand.lower() not in ("page", "search"):
+                            return brand
         except Exception:
             pass
         return "N/A"
@@ -530,20 +582,34 @@ class AmazonParser:
         return "N/A", "N/A"
 
     def _slx_parse_customization(self, tree) -> str:
+        """检测商品是否需要定制（Yes/No）。
+        老实现遍历整页 ~5 万 DOM 节点，每个节点都调 .text() 取子树文本，O(N²) 复杂度，
+        99% 非定制商品每次都走完整遍历，单条解析烧 1-3s CPU。
+        新实现：只在 buybox 等定制按钮可能出现的容器里取一次文本做子串查找。
+        """
         try:
-            # 遍历所有文本节点查找 "customize now"
-            for node in tree.css('*'):
-                text = node.text(strip=True)
-                if text and "customize now" in text.lower():
+            # 只扫定制按钮可能出现的容器（按命中频率排序）
+            for sel in [
+                'div#customization-feature',          # 定制功能区
+                'div#customizationFeature_div',
+                'div#customization_feature_div',
+                'div#rightCol',                       # buybox 右栏
+                'div#tabular-buybox',                 # 现代 buybox 布局
+                'div#partialStateBuyBox',
+                'div#desktop_buybox',
+                'div#buybox',
+            ]:
+                container = tree.css_first(sel)
+                if not container:
+                    continue
+                # 取一次容器内全部文本，做 O(L) 子串查找（L ≈ 几 KB）
+                blob = container.text(strip=True).lower()
+                if not blob:
+                    continue
+                if ("customize now" in blob
+                        or "needs to be customized" in blob
+                        or "customization required" in blob):
                     return "Yes"
-            # 查找右列和 buybox 中的定制文本
-            for sel in ['div#rightCol *', 'div#tabular-buybox *']:
-                for n in tree.css(sel):
-                    text = n.text(strip=True)
-                    if text:
-                        t = text.lower()
-                        if "needs to be customized" in t or "customization required" in t:
-                            return "Yes"
         except Exception:
             pass
         return "No"
@@ -622,7 +688,9 @@ class AmazonParser:
                 if text and "colorImages" in text:
                     urls = re.findall(r'"hiRes":"(https://[^"]+)"', text) or \
                            re.findall(r'"large":"(https://[^"]+)"', text)
-                    img_urls = list(set(urls))
+                    # 保序去重：dict.fromkeys 在 Python 3.7+ 保留插入顺序，
+                    # 这样首图（亚马逊页面第 1 张）始终排在结果第 1 位
+                    img_urls = list(dict.fromkeys(urls))
                     break
             if not img_urls:
                 img_node = tree.css_first('div#imgTagWrapperId img')
@@ -670,15 +738,24 @@ class AmazonParser:
         """selectolax 版全页扫描：提取 Product Information 表格内容"""
         d = {}
         try:
-            # 扫描表格行
+            # 扫描表格行 — 包含两种布局：
+            #   A) 经典 Product Information 表格：<th>Key</th><td>Value</td>
+            #   B) 现代 Product Overview 表格：<td><span>Key</span></td><td><span>Value</span></td>
             for row in tree.css('tr'):
                 try:
                     th = row.css_first('th')
-                    td = row.css_first('td')
-                    if th and td:
+                    tds = row.css('td')
+                    if th and tds:
                         k = th.text(strip=True)
-                        v = td.text(strip=True)
+                        v = tds[0].text(strip=True)
                         if k and v:
+                            self._map_detail(d, k, v)
+                    elif len(tds) >= 2:
+                        # 两列 td 布局：第一列通常是加粗的 key（a-text-bold）
+                        key_span = tds[0].css_first('span.a-text-bold') or tds[0]
+                        k = key_span.text(strip=True)
+                        v = tds[1].text(strip=True)
+                        if k and v and len(k) <= 50:
                             self._map_detail(d, k, v)
                 except Exception:
                     continue
@@ -908,6 +985,132 @@ class AmazonParser:
             return brand
 
         return "N/A"
+
+    # ==================== 评分 + 评论数 ====================
+
+    def _slx_parse_rating(self, tree, jsonld: dict) -> str:
+        """评分（如 "4.4"）。JSON-LD aggregateRating.ratingValue 优先；CSS 兜底。"""
+        # 1) JSON-LD（最稳，浏览器/服务端响应一致）
+        try:
+            jr = jsonld.get("_rating") if jsonld else None
+            if jr:
+                jr = str(jr).strip()
+                # 标准化："4.4 out of 5 stars" → "4.4"
+                m = re.match(r"^([0-9](?:\.[0-9]+)?)", jr)
+                if m:
+                    return m.group(1)
+                return jr
+        except Exception:
+            pass
+        # 2) CSS：#acrPopover[title="4.4 out of 5 stars"]
+        try:
+            node = tree.css_first('span#acrPopover')
+            if node:
+                title_attr = (node.attributes.get('title') or '').strip()
+                m = re.match(r"^([0-9](?:\.[0-9]+)?)", title_attr)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+        # 3) CSS：#averageCustomerReviews .a-icon-alt
+        try:
+            node = tree.css_first('#averageCustomerReviews .a-icon-alt')
+            if node:
+                txt = node.text(strip=True)
+                m = re.match(r"^([0-9](?:\.[0-9]+)?)", txt)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+        return "N/A"
+
+    def _slx_parse_review_count(self, tree, jsonld: dict) -> str:
+        """评论数（纯数字字符串，如 "323"）。JSON-LD reviewCount 优先；CSS 兜底。"""
+        # 1) JSON-LD
+        try:
+            rc = jsonld.get("_review_count") if jsonld else None
+            if rc:
+                rc_s = str(rc).strip().replace(",", "")
+                if rc_s.isdigit():
+                    return rc_s
+        except Exception:
+            pass
+        # 2) CSS：#acrCustomerReviewText "1,234 ratings" 或 "(323)"
+        try:
+            node = tree.css_first('#acrCustomerReviewText')
+            if node:
+                txt = node.text(strip=True)
+                m = re.search(r"[\d,]+", txt)
+                if m:
+                    digits = m.group(0).replace(",", "")
+                    if digits.isdigit():
+                        return digits
+        except Exception:
+            pass
+        return "N/A"
+
+    # ==================== 卖家店铺 ID + 名 ====================
+
+    def _slx_parse_seller(self, tree, html_text: str = "") -> Tuple[str, str]:
+        """返回 (seller_id, seller_name)。
+        - 第三方卖家：从 <a id="sellerProfileTriggerId" href="...seller=XXX">Name</a> 提取
+        - Amazon 自营：sellerProfileTriggerId 不存在，但页面有 "Sold by Amazon.com" → 返回 ("AMAZON", "Amazon.com")
+        - 其他无法识别：返回 ("N/A", "N/A")
+        """
+        # 1) 标准路径：buybox 卖家档案链接
+        try:
+            node = tree.css_first('a#sellerProfileTriggerId')
+            if node:
+                name = node.text(strip=True)
+                href = node.attributes.get('href', '') or ''
+                m = re.search(r"seller=([A-Z0-9]+)", href)
+                seller_id = m.group(1) if m else ""
+                if seller_id and name:
+                    return seller_id, name
+                if name:  # 拿到名字但没拿到 ID（极罕见）
+                    return "N/A", name
+        except Exception:
+            pass
+
+        # 2) 备选：任意带 seller= 的链接（href 路径变化时兜底）
+        try:
+            for sel in ['#merchant-info a[href*="seller="]',
+                        '#tabular-buybox a[href*="seller="]',
+                        'a[href*="seller="]']:
+                node = tree.css_first(sel)
+                if not node:
+                    continue
+                href = node.attributes.get('href', '') or ''
+                m = re.search(r"seller=([A-Z0-9]+)", href)
+                if not m:
+                    continue
+                name = node.text(strip=True) or ""
+                if m.group(1):
+                    return m.group(1), (name or "N/A")
+        except Exception:
+            pass
+
+        # 3) Amazon 自营：检测 #merchant-info 或 #tabular-buybox 文本
+        try:
+            for sel in ['#merchant-info', '#tabular-buybox', '#offerDisplay_feature_div']:
+                node = tree.css_first(sel)
+                if not node:
+                    continue
+                blob = node.text(strip=True).lower()
+                if "sold by amazon.com" in blob or "ships from amazon.com" in blob:
+                    return "AMAZON", "Amazon.com"
+        except Exception:
+            pass
+
+        # 4) HTML 文本最后兜底（脚本数据里偶尔有 merchantID）
+        try:
+            m = re.search(r'"merchantID"\s*:\s*"([A-Z0-9]+)"', html_text or "")
+            if m and m.group(1):
+                return m.group(1), "N/A"
+        except Exception:
+            pass
+
+        return "N/A", "N/A"
 
     def _slx_parse_price_enhanced(self, tree, jsonld: dict, sp_data: dict) -> str:
         """增强价格解析：CSS → JSON-LD → JS脚本数据"""
@@ -1658,7 +1861,8 @@ class AmazonParser:
                 script = scripts[0]
                 urls = re.findall(r'"hiRes":"(https://[^"]+)"', script) or \
                        re.findall(r'"large":"(https://[^"]+)"', script)
-                img_urls = list(set(urls))
+                # 保序去重：保持亚马逊页面图片原始顺序，主图排在第 1 位
+                img_urls = list(dict.fromkeys(urls))
             else:
                 img_urls = tree.xpath('//div[@id="imgTagWrapperId"]/img/@src')
             return "\n".join(img_urls)
@@ -1723,3 +1927,112 @@ class AmazonParser:
 
 # 全局解析器实例
 parser = AmazonParser()
+
+
+# ==================== 卖家店铺列表页解析（F-009）====================
+
+_ASIN_RE = re.compile(r'^B[0-9A-Z]{9}$')
+
+
+def parse_seller_listing(html_text: str) -> Dict[str, Any]:
+    """解析三方卖家列表页 /s?me={seller_id}&page=N。
+
+    Returns:
+        {
+          "items":   [{"asin","title","price","image"}, ...],
+          "asins":   [...],
+          "has_next": bool,
+          "page_info": str,  # 'No results' / 'CAPTCHA' / 'OK' 等，便于诊断
+        }
+    """
+    out = {"items": [], "asins": [], "has_next": False, "page_info": ""}
+    if not html_text:
+        out["page_info"] = "empty_html"
+        return out
+
+    # 验证码 / 拦截快速侦测（与 _parse_with_selectolax 对齐）
+    low = html_text[:4096].lower()
+    if "validateCaptcha" in html_text or "/errors/validateCaptcha" in html_text:
+        out["page_info"] = "captcha"
+        return out
+    if "robot check" in low or "to discuss automated access" in low:
+        out["page_info"] = "blocked"
+        return out
+
+    items = []
+    seen = set()
+
+    if _USE_SELECTOLAX:
+        try:
+            tree = SlxParser(html_text)
+        except Exception as e:
+            out["page_info"] = f"parse_error:{type(e).__name__}"
+            return out
+
+        # 主结果容器：data-asin 是首选锚点
+        for node in tree.css('div.s-result-item[data-asin]'):
+            asin = (node.attributes.get('data-asin') or '').strip().upper()
+            if not asin or not _ASIN_RE.match(asin) or asin in seen:
+                continue
+            seen.add(asin)
+
+            title = ""
+            t_node = node.css_first('h2 span') or node.css_first('h2 a span')
+            if t_node:
+                title = (t_node.text() or "").strip()
+
+            price = ""
+            p_off = node.css_first('span.a-price[data-a-color="base"] span.a-offscreen') \
+                or node.css_first('span.a-price span.a-offscreen')
+            if p_off:
+                price = (p_off.text() or "").strip()
+
+            image = ""
+            img = node.css_first('img.s-image')
+            if img:
+                image = (img.attributes.get('src') or '').strip()
+
+            items.append({"asin": asin, "title": title, "price": price, "image": image})
+
+        # 翻页：a.s-pagination-next 存在且不带 disabled 类
+        next_node = tree.css_first('a.s-pagination-next')
+        has_next = bool(next_node)
+        if next_node:
+            cls = (next_node.attributes.get('class') or '')
+            if 's-pagination-disabled' in cls:
+                has_next = False
+        out["has_next"] = has_next
+
+    elif lxml_html is not None:
+        try:
+            tree = lxml_html.fromstring(html_text)
+        except Exception as e:
+            out["page_info"] = f"parse_error:{type(e).__name__}"
+            return out
+        for node in tree.xpath('//div[@data-asin and contains(@class, "s-result-item")]'):
+            asin = (node.get('data-asin') or '').strip().upper()
+            if not asin or not _ASIN_RE.match(asin) or asin in seen:
+                continue
+            seen.add(asin)
+            title_nodes = node.xpath('.//h2//span/text()')
+            title = (title_nodes[0].strip() if title_nodes else "")
+            price_nodes = node.xpath('.//span[contains(@class,"a-price")]//span[contains(@class,"a-offscreen")]/text()')
+            price = (price_nodes[0].strip() if price_nodes else "")
+            img_nodes = node.xpath('.//img[contains(@class,"s-image")]/@src')
+            image = (img_nodes[0].strip() if img_nodes else "")
+            items.append({"asin": asin, "title": title, "price": price, "image": image})
+
+        next_nodes = tree.xpath('//a[contains(@class,"s-pagination-next")]')
+        has_next = False
+        if next_nodes:
+            cls = next_nodes[0].get('class') or ''
+            has_next = 's-pagination-disabled' not in cls
+        out["has_next"] = has_next
+    else:
+        out["page_info"] = "no_parser"
+        return out
+
+    out["items"] = items
+    out["asins"] = [it["asin"] for it in items]
+    out["page_info"] = "ok" if items else "no_results"
+    return out

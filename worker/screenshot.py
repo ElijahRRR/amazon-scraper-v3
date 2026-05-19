@@ -94,15 +94,23 @@ class ScreenshotWorker:
                 signal.signal(sig, lambda *_args, _sig=sig: self.request_stop(_sig.name))
         logger.info(f"截图进程启动（并发: {self._concurrency}, 监控: {self.html_dir}）")
 
+        _last_completion_check = 0.0
+        _completion_check_interval = 10.0  # 最多每 10 秒检查一次批次完成情况
         try:
             while self._running:
                 pending = self._scan_pending()
+                now = time.time()
                 if not pending:
-                    await self._check_batch_completion()
+                    # 空闲时才检查完成度，且有 10s 最小间隔，避免高频轮询服务端
+                    if now - _last_completion_check >= _completion_check_interval:
+                        await self._check_batch_completion()
+                        _last_completion_check = now
                     await asyncio.sleep(1)
                     continue
                 await self._process_batch(pending)
-                await self._check_batch_completion()
+                if now - _last_completion_check >= _completion_check_interval:
+                    await self._check_batch_completion()
+                    _last_completion_check = now
         except KeyboardInterrupt:
             pass
         finally:
@@ -214,12 +222,15 @@ class ScreenshotWorker:
         if png_bytes and len(png_bytes) > 0:
             ok = await self._upload(batch_name, asin, png_bytes)
             logger.info(f"截图上传结果: {asin} ok={ok}")
-            if ok:
+            if ok is True:
                 logger.info(f"截图完成: {asin} ({len(png_bytes)//1024}KB)")
                 try:
                     os.remove(processing_path)
                 except OSError:
                     pass
+            elif ok == "batch_gone":
+                # 批次/任务在服务端已不存在：清理整个本地批次目录，中止对该批次的后续处理
+                self._purge_stale_batch(batch_name)
             else:
                 logger.warning(f"上传失败: {asin}")
                 self._restore_inflight_file(processing_path)
@@ -321,7 +332,12 @@ class ScreenshotWorker:
 
     # ==================== 上传 ====================
 
-    async def _upload(self, batch_name: str, asin: str, png_bytes: bytes) -> bool:
+    async def _upload(self, batch_name: str, asin: str, png_bytes: bytes):
+        """返回:
+          True           上传成功
+          "batch_gone"   服务端批次不存在/任务不存在（永久失败，不可重试）
+          False          其他可重试错误
+        """
         fname = f"{asin}.png"
         for attempt in range(3):
             try:
@@ -332,12 +348,35 @@ class ScreenshotWorker:
                 )
                 if resp.status_code == 200:
                     return True
+                # 400 批次不存在 / 404 截图任务不存在 / 409 worker 已离线：永久错误，不重试
+                if resp.status_code in (400, 404, 409):
+                    try:
+                        detail = resp.json().get("detail", "")
+                    except Exception:
+                        detail = resp.text[:200]
+                    logger.warning(
+                        f"上传永久失败 {asin}: HTTP {resp.status_code} ({detail}) — 批次/任务已失效"
+                    )
+                    return "batch_gone"
                 logger.warning(f"上传失败 {asin}: HTTP {resp.status_code} ({attempt+1}/3)")
             except Exception as e:
                 logger.error(f"上传异常 {asin}: {e} ({attempt+1}/3)")
             if attempt < 2:
                 await asyncio.sleep(1)
         return False
+
+    def _purge_stale_batch(self, batch_name: str):
+        """服务端已不存在的批次：删除本地目录 + 写 uploaded marker，防止下轮再被扫描。"""
+        batch_dir = os.path.join(self.html_dir, batch_name)
+        if os.path.isdir(batch_dir):
+            shutil.rmtree(batch_dir, ignore_errors=True)
+            logger.warning(f"已清理过期批次目录: {batch_name}")
+        marker = os.path.join(self.base_dir, f"_uploaded_{batch_name}")
+        try:
+            with open(marker, "w") as f:
+                f.write(f"purged:{time.time()}")
+        except OSError:
+            pass
 
     # ==================== 批次完成 ====================
 
@@ -358,20 +397,31 @@ class ScreenshotWorker:
             if remaining:
                 continue
             progress = await self._get_screenshot_progress(batch_name)
+            # 服务端批次已删除 → 直接清理本地残留
+            if progress.get("_batch_gone"):
+                logger.warning(f"批次 {batch_name} 在服务端已不存在，清理本地残留")
+                self._purge_stale_batch(batch_name)
+                continue
             total = progress.get("total", 0)
             finished = progress.get("done", 0) + progress.get("failed", 0)
-            if total <= 0 or finished < total:
-                logger.warning(
-                    f"批次 {batch_name} 本地无待处理 HTML，但服务端截图未完成: "
+            # 本 worker 的 HTML 已清空（无 .html/.processing），无论服务端整体是否完成，
+            # 本 worker 对此批次的贡献都结束了——写 uploaded marker 并清理本地目录。
+            # 剩余的服务端 pending 由其他 worker 完成或由服务端超时机制兜底失败。
+            if total > 0 and finished < total:
+                logger.info(
+                    f"批次 {batch_name} 本地已完成，等待其他 worker: "
                     f"done={progress.get('done', 0)} failed={progress.get('failed', 0)} total={total}"
                 )
-                continue
-            with open(uploaded_marker, "w") as f:
-                f.write(str(time.time()))
-            logger.info(
-                f"批次完成: {batch_name} "
-                f"(done={progress.get('done', 0)} failed={progress.get('failed', 0)} total={total})"
-            )
+            else:
+                logger.info(
+                    f"批次完成: {batch_name} "
+                    f"(done={progress.get('done', 0)} failed={progress.get('failed', 0)} total={total})"
+                )
+            try:
+                with open(uploaded_marker, "w") as f:
+                    f.write(str(time.time()))
+            except OSError:
+                pass
             shutil.rmtree(batch_dir, ignore_errors=True)
 
     async def _get_screenshot_progress(self, batch_name: str) -> dict:
@@ -382,6 +432,10 @@ class ScreenshotWorker:
             )
             if resp.status_code == 200:
                 return resp.json()
+            if resp.status_code == 404:
+                # 服务端批次已删除，调用方应清理本地残留
+                return {"_batch_gone": True, "pending": 0, "processing": 0,
+                        "done": 0, "failed": 0, "total": 0}
         except Exception:
             pass
         return {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0}

@@ -46,6 +46,54 @@
     </div>
 </div>
 
+<!-- F-009: 按卖家店铺采集 -->
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-shop"></i> 按卖家店铺采集 <small class="text-secondary">（三方 Seller，自动翻页发现店内 ASIN）</small></div>
+    <div class="card-body">
+        <form id="sellerUploadForm" enctype="multipart/form-data">
+            <div class="row g-3 mb-3">
+                <div class="col-md-3">
+                    <label class="form-label">批次名称（可选）</label>
+                    <input type="text" class="form-control" name="batch_name" placeholder="自动生成 sellers_xxx">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">配送邮编</label>
+                    <input type="text" class="form-control" name="zip_code"
+                           value="{{ default_zip_code }}" placeholder="10001">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">采集深度</label>
+                    <select class="form-select" name="discover_mode" id="discoverMode">
+                        <option value="with_detail" selected>发现 ASIN + 抓详情</option>
+                        <option value="discover_only">仅发现 ASIN（不抓详情）</option>
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">卖家列表文件</label>
+                    <input type="file" class="form-control" name="file" accept=".xlsx,.xls,.csv,.txt" required>
+                </div>
+            </div>
+            <div class="d-flex justify-content-between align-items-center">
+                <div class="d-flex align-items-center gap-3">
+                    <small class="text-secondary">
+                        支持裸 Seller ID（如 <code>A2L77EE7U53NWQ</code>）或店铺 URL（含 <code>?me=...</code> / <code>?seller=...</code>），每行一个
+                    </small>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" name="needs_screenshot" id="sellerScreenshotSwitch">
+                        <label class="form-check-label small" for="sellerScreenshotSwitch">
+                            <i class="bi bi-camera"></i> 详情阶段开启截图
+                        </label>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-accent" id="sellerUploadBtn">
+                    <i class="bi bi-shop"></i> 开始发现
+                </button>
+            </div>
+        </form>
+        <div id="sellerUploadResult" class="mt-3" style="display:none;"></div>
+    </div>
+</div>
+
 <!-- 批次列表 -->
 <div class="card">
     <div class="card-header"><i class="bi bi-collection"></i> 历史批次</div>
@@ -178,6 +226,53 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
     }
     btn.disabled = false;
     btn.innerHTML = '<i class="bi bi-upload"></i> 上传';
+});
+
+// F-009: 按卖家店铺采集
+document.getElementById('sellerUploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('sellerUploadBtn');
+    const resultDiv = document.getElementById('sellerUploadResult');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 发现中...';
+
+    const formData = new FormData(e.target);
+    const screenshotChecked = document.getElementById('sellerScreenshotSwitch').checked;
+    formData.set('needs_screenshot', screenshotChecked ? 'true' : 'false');
+
+    try {
+        const resp = await fetch('/api/upload-sellers', { method: 'POST', body: formData });
+        const data = await resp.json();
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '';
+        if (resp.ok) {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-success';
+            const modeLabel = data.discover_mode === 'with_detail' ? '发现+抓详情' : '仅发现';
+            const batchSpan = document.createElement('strong');
+            batchSpan.textContent = data.batch_name;
+            alertDiv.append(
+                '✅ 已创建卖家批次: ', batchSpan,
+                `，模式: ${modeLabel}，识别到 ${parseInt(data.total_sellers)} 个 seller，插入 ${parseInt(data.inserted_tasks)} 个发现任务`
+            );
+            resultDiv.appendChild(alertDiv);
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = 'alert alert-danger';
+            alertDiv.textContent = '❌ ' + (data.detail || '上传失败');
+            resultDiv.appendChild(alertDiv);
+        }
+    } catch(err) {
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = '';
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert alert-danger';
+        alertDiv.textContent = '❌ 网络错误: ' + err.message;
+        resultDiv.appendChild(alertDiv);
+    }
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-shop"></i> 开始发现';
 });
 
 async function retryBatch(name) {

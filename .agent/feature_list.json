@@ -139,5 +139,48 @@
     ],
     "notes": "The analysis concluded that the bursts are mainly caused by false-positive session readiness, no product-page canary, immediate 16-way cold-start traffic, and the fact that degraded parse failures do not currently invalidate the session. Recommended fix order: strict init verification + canary, cold-start probation, rotate on degraded-page clusters, then improve 200-level block telemetry/detection.",
     "last_verified_at": "2026-03-17T08:46:20Z"
+  },
+  {
+    "id": "F-008",
+    "priority": "P1",
+    "category": "operations",
+    "description": "Run 4 local workers (`mac1`-`mac4`) against the remote server `http://64.186.239.11:8899`, monitor the batch to completion, and generate a runtime stability report.",
+    "steps": [
+      "Recover any leftover monitoring or worker processes and confirm the remote batch state",
+      "Start four durable local workers with the requested screenshot split",
+      "Run a minute-level monitor that records remote API progress, local worker/process state, and worker log anomalies until completion",
+      "Write a final evidence report under `.agent/evidence/`"
+    ],
+    "passes": false,
+    "evidence": [
+      ".agent/monitor/f008_snapshots.jsonl",
+      ".agent/monitor/f008_state.json",
+      ".agent/evidence/f008-remote-runtime-report.md"
+    ],
+    "notes": "Live runtime is active against remote batch `317all` on `http://64.186.239.11:8899`. Worker split is `mac1`/`mac2` screenshot enabled and `mac3`/`mac4` screenshot disabled. Minute-level snapshots are being written; the final report path is `.agent/evidence/f008-remote-runtime-report.md`. Early observation from the first successful snapshot: all four workers came online and immediately hit a heavy startup burst of proxy `429` / timeout noise before settling into successful result submissions. Latest slowdown diagnosis near 92% completion: effective throughput has fallen to roughly `105 items/min` from earlier `600-1200 items/min`, driven by repeated proxy `429` / timeout / TLS bursts, session-init failures, batch-submit `ReadTimeout`, and adaptive concurrency downshifts during the long tail. The batch has `needs_screenshot=0`, so screenshot processing is not part of the current slowdown. Duplicate-collection analysis now points to lease expiry and re-dispatch as the primary root cause: runtime logs show `82,744` ASINs with `OK` entries in at least two worker logs, `9,655` ASINs in all four worker logs, and top ASINs repeated `28-31` times; the current upload path already deduplicates ASINs before task creation, so this is not explained by file import duplication.",
+    "last_verified_at": "2026-03-17T18:50:00Z"
+  },
+  {
+    "id": "F-009",
+    "priority": "P1",
+    "category": "functional",
+    "description": "Add seller-storefront scraping: upload third-party seller IDs/URLs and discover all ASINs in their store, optionally piping discovered ASINs into the existing detail-scrape pipeline.",
+    "steps": [
+      "Extend schema: add batches.batch_type/discover_mode, tasks.task_type/task_meta, new seller_discoveries table",
+      "Add db.create_seller_batch, accept_seller_discovery_result, get_seller_batch_progress and update pull_tasks to return task_type",
+      "Add fetch_seller_listing_page in worker/session.py and parse_seller_listing in worker/parser.py",
+      "Branch on task_type in worker/engine.py: discover_seller paginates listings and submits ASIN list",
+      "Add POST /api/upload-sellers in server/app.py with discover_only/with_detail mode",
+      "Add 按卖家采集 tab in dashboard template with file upload, mode toggle, zip, screenshot",
+      "Verify: parse a saved seller-listing HTML fixture, then end-to-end small-seller batch in both modes"
+    ],
+    "passes": true,
+    "evidence": [
+      "test_f009_seller_discovery.py",
+      "python3 -m unittest test_f009_seller_discovery (12 tests, OK)",
+      "python3 -c 'from server import app; from worker import engine, parser, session; from common import database' (imports OK)"
+    ],
+    "notes": "User-requested feature. Reuses existing task lease/retry/proxy/screenshot infra. Out of scope: brand stores (/stores/...), recurring rediscovery, seller metadata extraction. MAX_PAGES=75 cap for paginated listings (Amazon ?me= ceiling). End-to-end live verification against Amazon was not run (would require real seller ID + non-blocked proxy traffic); mocked DB-layer + parser tests confirm the contract. Legacy ASIN flow regression test included.",
+    "last_verified_at": "2026-04-30T08:47:28Z"
   }
 ]

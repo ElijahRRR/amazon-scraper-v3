@@ -187,11 +187,17 @@ HEADER_MAP = {
     "long_description": "长描述",
     "product_type": "商品类型",
     "total_price": "总价",
+    "rating": "商品评分",
+    "review_count": "评论数",
+    "seller_id": "卖家店铺ID",
+    "seller_name": "卖家店铺名",
 }
 
 EXPORT_COLUMN_ORDER = [
     "ASIN (商品ID)", "产品链接", "商品标题", "品牌",
+    "商品评分", "评论数",
     "商品原价", "当前价格", "BuyBox 价格", "BuyBox 运费", "总价", "是否 FBA 发货",
+    "卖家店铺名", "卖家店铺ID",
     "库存数量", "库存状态", "配送到达时间", "配送时长",
     "商品图片链接", "五点描述", "长描述", "是否为定制产品",
     "UPC 列表", "类目路径树",

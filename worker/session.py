@@ -247,6 +247,50 @@ class AmazonSession:
             logger.error(f"📍 邮编验证异常: {e}")
             return False
 
+    async def change_zip_code(self, new_zip: str, verify: bool = True) -> bool:
+        """在已初始化的 session 上原地切换邮编（保留代理 IP + cookies）。
+
+        相比重建整个 session（约 5-10s），换 zip 只是一次 POST + 一次 GET 验证（~1-2s）。
+        失败时回滚 self.zip_code 到原值，并返回 False；调用方可决定是否换 session。
+
+        Args:
+            new_zip: 目标邮编（5 位数字字符串）。
+            verify:  是否做页面级验证（默认 True；快速链路场景可设为 False）。
+        Returns:
+            True 切换成功，False 切换失败（已回滚）。
+        """
+        if not new_zip or new_zip == self.zip_code:
+            return True
+        if not self._initialized or self._session is None:
+            # session 还没就绪 → 只更新内存属性，等 initialize() 时使用新值
+            self.zip_code = new_zip
+            return True
+        old_zip = self.zip_code
+        self.zip_code = new_zip
+        # 1) POST 设置邮编
+        if not await self._set_zip_code():
+            logger.warning(f"📍 切换邮编失败（POST 阶段）: {old_zip} → {new_zip}，已回滚")
+            self.zip_code = old_zip
+            return False
+        # 2) 可选：验证页面是否生效
+        if verify:
+            try:
+                ok = await self._verify_zip_code()
+            except Exception as e:
+                logger.warning(f"📍 切换邮编验证异常: {e}")
+                ok = False
+            if not ok:
+                logger.warning(f"📍 切换邮编未通过验证: {old_zip} → {new_zip}，已回滚")
+                # 尽力把邮编改回去（best-effort）
+                self.zip_code = old_zip
+                try:
+                    await self._set_zip_code()
+                except Exception:
+                    pass
+                return False
+        logger.info(f"📍 邮编切换成功: {old_zip} → {new_zip}")
+        return True
+
     def _build_headers(self, referer: str = None) -> Dict[str, str]:
         """构建反指纹请求头"""
         headers = {
@@ -316,6 +360,40 @@ class AmazonSession:
             return resp
         except Exception as e:
             logger.debug(f"辅助请求失败: {e}")
+            return None
+
+    async def fetch_seller_listing_page(self, seller_id: str, page: int = 1,
+                                         max_recv_speed: int = 0) -> Optional[Response]:
+        """采集 Amazon 三方卖家店内列表页（F-009）。
+
+        URL 形如 /s?me={seller_id}&page=N，每页约 16 商品。
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        if self._session is None:
+            logger.warning(f"⚠️ Session 未就绪，跳过 seller={seller_id} page={page}")
+            return None
+
+        url = f"{self.AMAZON_BASE}/s?me={seller_id}&page={page}"
+        referer = self._last_url or f"{self.AMAZON_BASE}/"
+        headers = self._build_headers(referer=referer)
+
+        try:
+            resp = await self._session.get(
+                url,
+                headers=headers,
+                max_recv_speed=max_recv_speed,
+            )
+            self._last_url = url
+            self._request_count += 1
+
+            if resp.status_code == 200 and len(resp.content) < 1000:
+                logger.warning(f"⚠️ seller={seller_id} page={page} 响应体过短 ({len(resp.content)} bytes)，视为空页")
+                return None
+            return resp
+        except Exception as e:
+            logger.error(f"❌ 卖家列表请求失败 seller={seller_id} page={page}: {e}")
             return None
 
     def is_ready(self) -> bool:

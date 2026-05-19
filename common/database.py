@@ -8,6 +8,7 @@ Amazon ASIN 采集系统 v3 - 数据库模块
 """
 import os
 import re
+import json
 import hashlib
 import aiosqlite
 import asyncio
@@ -140,6 +141,8 @@ ASIN_DATA_FIELDS = [
     "package_weight", "item_dimensions", "item_weight", "product_url",
     "site", "zip_code", "crawl_time", "screenshot_path",
     "content_hash", "title_bullets_hash",
+    # 评分 + 卖家信息（v3 后期新增）
+    "rating", "review_count", "seller_id", "seller_name",
 ]
 
 
@@ -156,6 +159,8 @@ class Database:
         self._db = await aiosqlite.connect(self.db_path, isolation_level=None)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA busy_timeout=5000")
+        # WAL 自动 checkpoint（每 1000 页 ≈ 4MB 触发一次），防止 WAL 文件无限膨胀
+        await self._db.execute("PRAGMA wal_autocheckpoint=1000")
         # 低配服务器：限制缓存 16MB（v2 用 32MB，v3 降低以适应 2GB 内存）
         await self._db.execute("PRAGMA cache_size=-16000")
         await self._db.execute("PRAGMA mmap_size=33554432")  # 32MB mmap
@@ -167,14 +172,40 @@ class Database:
             await self._db.close()
             self._db = None
 
+    async def wal_checkpoint(self, mode: str = "PASSIVE") -> Optional[tuple]:
+        """显式触发 WAL checkpoint。mode: PASSIVE / FULL / RESTART / TRUNCATE。
+        返回 (busy, log, checkpointed) 三元组；出错返回 None。"""
+        if not self._db:
+            return None
+        try:
+            async with self._db.execute(f"PRAGMA wal_checkpoint({mode})") as c:
+                row = await c.fetchone()
+            return tuple(row) if row else None
+        except Exception as e:
+            logger.warning(f"wal_checkpoint 异常: {e}")
+            return None
+
     async def init_tables(self):
         await self._db.executescript("""
-            -- 批次表
+            -- 批次表（注：callback 相关索引在 ALTER TABLE 加列之后再单独创建，
+            -- 避免老表升级时 CREATE INDEX 引用不存在的列）
             CREATE TABLE IF NOT EXISTS batches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 needs_screenshot BOOLEAN DEFAULT 0,
                 is_auto BOOLEAN DEFAULT 0,
+                -- 状态机：running / completed / failed
+                status TEXT DEFAULT 'running',
+                completed_at TIMESTAMP,
+                -- 调用方原样回传字段
+                external_id TEXT,
+                -- 完成时回调通知
+                callback_url TEXT,
+                callback_status TEXT,                 -- pending / sent / failed / disabled
+                callback_attempts INTEGER DEFAULT 0,
+                callback_next_retry_at TIMESTAMP,
+                callback_last_error TEXT,
+                callback_sent_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -238,6 +269,10 @@ class Database:
                 baseline_stock_status TEXT,
                 baseline_title_bullets_hash TEXT,
                 baseline_updated_at TEXT,
+                rating TEXT,
+                review_count TEXT,
+                seller_id TEXT,
+                seller_name TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -269,6 +304,7 @@ class Database:
                 worker_id TEXT,
                 lease_epoch INTEGER DEFAULT 0,
                 retry_count INTEGER DEFAULT 0,
+                auto_retry_count INTEGER DEFAULT 0,
                 error_type TEXT,
                 error_detail TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -279,6 +315,7 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks(batch_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority DESC);
             CREATE INDEX IF NOT EXISTS idx_tasks_status_worker ON tasks(status, worker_id, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at);
 
             -- 截图任务表（独立追踪，可靠重试）
             CREATE TABLE IF NOT EXISTS screenshots (
@@ -295,6 +332,22 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_screenshots_status ON screenshots(status);
             CREATE INDEX IF NOT EXISTS idx_screenshots_batch ON screenshots(batch_id);
+
+            -- 卖家店铺发现结果表（F-009：seller storefront 模式）
+            -- 每行 = 某 batch 在某 seller 店内发现的一个 ASIN
+            CREATE TABLE IF NOT EXISTS seller_discoveries (
+                batch_id   INTEGER NOT NULL,
+                seller_id  TEXT NOT NULL,
+                asin       TEXT NOT NULL,
+                list_title TEXT,
+                list_price TEXT,
+                list_image TEXT,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (batch_id, seller_id, asin)
+            );
+            CREATE INDEX IF NOT EXISTS idx_seller_disc_seller ON seller_discoveries(seller_id);
+            CREATE INDEX IF NOT EXISTS idx_seller_disc_asin ON seller_discoveries(asin);
+            CREATE INDEX IF NOT EXISTS idx_seller_disc_batch ON seller_discoveries(batch_id);
         """)
 
         # 迁移：为已有 tasks 表添加 lease_epoch 列（CREATE TABLE IF NOT EXISTS 不修改已有表）
@@ -303,9 +356,20 @@ class Database:
             logger.info("数据库迁移: tasks 表新增 lease_epoch 列")
         except Exception:
             pass  # 列已存在
+        # 迁移：自动重试轮数（失败任务由后台自动重入队的次数）
+        try:
+            await self._db.execute("ALTER TABLE tasks ADD COLUMN auto_retry_count INTEGER DEFAULT 0")
+            logger.info("数据库迁移: tasks 表新增 auto_retry_count 列")
+        except Exception:
+            pass  # 列已存在
         try:
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_status_worker ON tasks(status, worker_id, updated_at)")
+        except Exception:
+            pass
+        try:
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at)")
         except Exception:
             pass
 
@@ -314,6 +378,33 @@ class Database:
             try:
                 await self._db.execute(f"ALTER TABLE batches ADD COLUMN {col} BOOLEAN DEFAULT {default}")
                 logger.info(f"数据库迁移: batches 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # 迁移：F-009 seller-storefront 采集
+        # batches.batch_type: 'asin' (现有) | 'seller_discovery'
+        # batches.discover_mode: NULL | 'discover_only' | 'with_detail'
+        for col_def in [
+            ("batch_type", "TEXT NOT NULL DEFAULT 'asin'"),
+            ("discover_mode", "TEXT"),
+        ]:
+            col, ddl = col_def
+            try:
+                await self._db.execute(f"ALTER TABLE batches ADD COLUMN {col} {ddl}")
+                logger.info(f"数据库迁移: batches 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # tasks.task_type: 'asin' (现有) | 'discover_seller'
+        # tasks.task_meta: JSON, 仅 discover 任务用
+        for col_def in [
+            ("task_type", "TEXT NOT NULL DEFAULT 'asin'"),
+            ("task_meta", "TEXT"),
+        ]:
+            col, ddl = col_def
+            try:
+                await self._db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+                logger.info(f"数据库迁移: tasks 表新增 {col} 列")
             except Exception:
                 pass
 
@@ -326,16 +417,87 @@ class Database:
             except Exception:
                 pass
 
+        # 迁移：asin_data 表添加评分 + 卖家字段
+        for col in ["rating", "review_count", "seller_id", "seller_name"]:
+            try:
+                await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
+                logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # 迁移：batches 表添加 callback / 状态字段
+        for col_ddl in [
+            ("status", "TEXT DEFAULT 'running'"),
+            ("completed_at", "TIMESTAMP"),
+            ("external_id", "TEXT"),
+            ("callback_url", "TEXT"),
+            ("callback_status", "TEXT"),
+            ("callback_attempts", "INTEGER DEFAULT 0"),
+            ("callback_next_retry_at", "TIMESTAMP"),
+            ("callback_last_error", "TEXT"),
+            ("callback_sent_at", "TIMESTAMP"),
+        ]:
+            col, ddl = col_ddl
+            try:
+                await self._db.execute(f"ALTER TABLE batches ADD COLUMN {col} {ddl}")
+                logger.info(f"数据库迁移: batches 表新增 {col} 列")
+            except Exception:
+                pass
+        # callback 相关索引（IF NOT EXISTS 幂等）
+        try:
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_batches_callback_pending "
+                "ON batches(callback_status, callback_next_retry_at)")
+        except Exception:
+            pass
+
+        # 一次性 backfill：老批次（迁移前没有 status 字段，迁移后默认 running）
+        # 如果它们的 task + screenshot 都已经终态，直接标记 completed + 禁用回调
+        # 这样新启动的 _completion_watcher 不会把这些老批次拉起来检测
+        try:
+            cursor = await self._db.execute(
+                """UPDATE batches
+                   SET status='completed',
+                       completed_at=COALESCE(updated_at, created_at),
+                       callback_status='disabled'
+                   WHERE COALESCE(status,'running')='running'
+                     AND callback_status IS NULL
+                     AND id NOT IN (
+                       SELECT DISTINCT batch_id FROM tasks
+                       WHERE status NOT IN ('done','failed')
+                     )
+                     AND id NOT IN (
+                       SELECT DISTINCT batch_id FROM screenshots
+                       WHERE status NOT IN ('done','failed')
+                     )
+                """
+            )
+            if cursor.rowcount > 0:
+                logger.info(f"数据库迁移: 回填 {cursor.rowcount} 个老批次为 completed")
+        except Exception as e:
+            logger.warning(f"老批次 backfill 异常: {e}")
+
     # ==================== 批次操作 ====================
 
     async def create_batch(self, name: str, needs_screenshot: bool = False,
-                           is_auto: bool = False) -> int:
-        """创建批次，返回 batch_id"""
+                           is_auto: bool = False,
+                           external_id: Optional[str] = None,
+                           callback_url: Optional[str] = None) -> int:
+        """创建批次，返回 batch_id。
+
+        external_id: 调用方自己的批次 ID（原样回传，便于追踪）。
+        callback_url: 采集完成时 POST 通知到此 URL。空表示不通知。
+        """
+        callback_status = "pending" if callback_url else None
         async with self._write_lock:
             await self._db.execute("BEGIN")
             await self._db.execute(
-                "INSERT OR IGNORE INTO batches (name, needs_screenshot, is_auto) VALUES (?, ?, ?)",
-                (name, 1 if needs_screenshot else 0, 1 if is_auto else 0)
+                "INSERT OR IGNORE INTO batches "
+                "(name, needs_screenshot, is_auto, status, external_id, "
+                " callback_url, callback_status) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+                (name, 1 if needs_screenshot else 0, 1 if is_auto else 0,
+                 external_id, callback_url, callback_status)
             )
             await self._db.execute("COMMIT")
             async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name,)) as c:
@@ -365,11 +527,196 @@ class Database:
             row = await c.fetchone()
             return dict(row) if row else None
 
+    # ==================== 批次完成检测 + 回调 ====================
+
+    async def get_batch_completion_status(self, batch_id: int) -> Dict[str, Any]:
+        """返回批次完成度统计 + 是否已全部终态。
+
+        完成判定：所有 task ∈ {done, failed} AND 所有 screenshot ∈ {done, failed}
+        """
+        async with self._db.execute(
+            """SELECT
+                   SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status NOT IN ('done','failed') THEN 1 ELSE 0 END) AS open_,
+                   COUNT(*) AS total
+               FROM tasks WHERE batch_id=?""",
+            (batch_id,)
+        ) as c:
+            t = await c.fetchone()
+        async with self._db.execute(
+            """SELECT
+                   SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN status NOT IN ('done','failed') THEN 1 ELSE 0 END) AS open_,
+                   COUNT(*) AS total
+               FROM screenshots WHERE batch_id=?""",
+            (batch_id,)
+        ) as c:
+            s = await c.fetchone()
+
+        t_done = (t["done"] or 0) if t else 0
+        t_failed = (t["failed"] or 0) if t else 0
+        t_open = (t["open_"] or 0) if t else 0
+        t_total = (t["total"] or 0) if t else 0
+        s_done = (s["done"] or 0) if s else 0
+        s_failed = (s["failed"] or 0) if s else 0
+        s_open = (s["open_"] or 0) if s else 0
+        s_total = (s["total"] or 0) if s else 0
+
+        all_done = (t_total > 0 and t_open == 0 and s_open == 0)
+        return {
+            "tasks": {"total": t_total, "done": t_done, "failed": t_failed, "open": t_open},
+            "screenshots": {"total": s_total, "done": s_done, "failed": s_failed, "open": s_open},
+            "all_terminal": all_done,
+        }
+
+    async def mark_batch_completed(self, batch_id: int) -> bool:
+        """标记批次为 completed（仅 running → completed 转移有效，幂等）。
+        返回 True 表示本次确实做了状态转移，调用方可以触发回调入队。
+        False 表示批次已经是 completed/failed/其他状态，不重复处理。
+        """
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        async with self._write_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self._db.execute(
+                    """UPDATE batches
+                       SET status='completed',
+                           completed_at=?,
+                           updated_at=?
+                       WHERE id=? AND status='running'""",
+                    (now, now, batch_id)
+                )
+                changed = cursor.rowcount > 0
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return changed
+
+    async def list_callback_due(self, now_str: str, limit: int = 50) -> List[Dict]:
+        """查询所有需要立刻发送/重试的 callback。
+        条件：
+        - callback_status='pending'（待发送）
+        - callback_url 非空
+        - status='completed'（必须真正完成，避免在 _completion_watcher 跑完之前抢跑）
+        - next_retry_at <= 当前时间（NULL 视为立即）
+        """
+        async with self._db.execute(
+            """SELECT id, name, external_id, callback_url, callback_attempts,
+                      completed_at, status
+               FROM batches
+               WHERE callback_status='pending'
+                 AND callback_url IS NOT NULL
+                 AND status='completed'
+                 AND (callback_next_retry_at IS NULL OR callback_next_retry_at <= ?)
+               ORDER BY id ASC LIMIT ?""",
+            (now_str, limit)
+        ) as c:
+            rows = await c.fetchall()
+        return [dict(r) for r in rows]
+
+    async def mark_callback_attempt(self, batch_id: int, success: bool,
+                                     error: Optional[str] = None,
+                                     next_retry_at: Optional[str] = None,
+                                     max_attempts: int = 5) -> Dict[str, Any]:
+        """记录一次回调尝试。
+        success=True:  callback_status='sent', sent_at=now
+        success=False: attempts+1；若达到 max_attempts 则 status='failed'，
+                       否则更新 next_retry_at 等下次扫描
+        """
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        async with self._write_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if success:
+                    await self._db.execute(
+                        """UPDATE batches
+                           SET callback_status='sent',
+                               callback_sent_at=?,
+                               callback_last_error=NULL,
+                               updated_at=?
+                           WHERE id=?""",
+                        (now, now, batch_id)
+                    )
+                    await self._db.execute("COMMIT")
+                    return {"final_status": "sent"}
+                # 失败：判断是否达到上限
+                async with self._db.execute(
+                    "SELECT callback_attempts FROM batches WHERE id=?", (batch_id,)
+                ) as c:
+                    row = await c.fetchone()
+                attempts = (row["callback_attempts"] or 0) + 1 if row else 1
+                if attempts >= max_attempts:
+                    await self._db.execute(
+                        """UPDATE batches
+                           SET callback_attempts=?,
+                               callback_status='failed',
+                               callback_last_error=?,
+                               updated_at=?
+                           WHERE id=?""",
+                        (attempts, (error or "")[:500], now, batch_id)
+                    )
+                    final = "failed"
+                else:
+                    await self._db.execute(
+                        """UPDATE batches
+                           SET callback_attempts=?,
+                               callback_next_retry_at=?,
+                               callback_last_error=?,
+                               updated_at=?
+                           WHERE id=?""",
+                        (attempts, next_retry_at, (error or "")[:500], now, batch_id)
+                    )
+                    final = "pending"
+                await self._db.execute("COMMIT")
+                return {"final_status": final, "attempts": attempts}
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    async def reset_callback_for_retry(self, batch_id: int) -> bool:
+        """运维手动触发：把已经 failed 或 sent 的回调重置回 pending 立即重试。"""
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        async with self._write_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self._db.execute(
+                    """UPDATE batches
+                       SET callback_status='pending',
+                           callback_attempts=0,
+                           callback_next_retry_at=NULL,
+                           callback_last_error=NULL,
+                           updated_at=?
+                       WHERE id=? AND callback_url IS NOT NULL""",
+                    (now, batch_id)
+                )
+                changed = cursor.rowcount > 0
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return changed
+
     # ==================== 任务操作 ====================
 
     async def create_tasks(self, batch_id: int, asins: List[str], zip_code: str = "10001",
-                           needs_screenshot: bool = False) -> int:
-        """批量创建采集任务，同时维护 batch_asins 关联"""
+                           needs_screenshot: bool = False,
+                           per_asin_zip: Dict[str, str] = None) -> int:
+        """批量创建采集任务，同时维护 batch_asins 关联。
+
+        per_asin_zip: 可选 {asin: zip} 映射；某个 asin 在其中则用该 zip，否则回落到 zip_code。
+        """
         clean_asins = []
         seen = set()
         ss_val = 1 if needs_screenshot else 0
@@ -382,14 +729,17 @@ class Database:
         if not clean_asins:
             return 0
 
+        per_asin_zip = per_asin_zip or {}
+
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
-                # 插入任务
+                # 插入任务（每个 asin 用各自指定的 zip，未指定则用批次默认）
                 before_tasks = self._db.total_changes
                 await self._db.executemany(
                     "INSERT OR IGNORE INTO tasks (batch_id, asin, zip_code, needs_screenshot) VALUES (?, ?, ?, ?)",
-                    [(batch_id, asin, zip_code, ss_val) for asin in clean_asins]
+                    [(batch_id, asin, per_asin_zip.get(asin) or zip_code, ss_val)
+                     for asin in clean_asins]
                 )
                 task_inserted = self._db.total_changes - before_tasks
 
@@ -420,8 +770,14 @@ class Database:
         return inserted
 
     async def pull_tasks(self, worker_id: str, count: int = 10,
-                         needs_screenshot=None) -> List[Dict]:
-        """Worker 拉取待处理任务（原子操作，不再内联超时回收）"""
+                         needs_screenshot=None,
+                         prefer_zip: Optional[str] = None) -> List[Dict]:
+        """Worker 拉取待处理任务（原子操作，不再内联超时回收）。
+
+        prefer_zip: worker 当前 session 的邮编。若指定，server 优先返回相同 zip 的任务，
+        从而最大化复用同一 session（避免每个任务都切换邮编）。多 worker 不同 prefer_zip
+        时各自被分到对应邮编池，自然分流。
+        """
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         tasks = []
 
@@ -441,16 +797,29 @@ class Database:
                     row = await cur.fetchone()
                     top_priority = row[0] if row and row[0] is not None else 0
 
+                # 排序策略：
+                #   1. prefer_zip 匹配优先（同 zip 任务先派发，节省 session 切换）
+                #   2. 同 zip 内按 id 升序（FIFO，先入先出）
+                if prefer_zip:
+                    order_clause = ("ORDER BY CASE WHEN t.zip_code = ? THEN 0 ELSE 1 END, "
+                                    "t.zip_code, t.id ASC")
+                    extra_params = [prefer_zip]
+                else:
+                    # 无偏好时按 zip_code 分组，同 zip 仍尽量连续派发
+                    order_clause = "ORDER BY t.zip_code, t.id ASC"
+                    extra_params = []
+
                 async with self._db.execute(
                     f"""SELECT t.id, t.batch_id, t.asin, t.zip_code, t.retry_count,
                                t.priority, t.needs_screenshot, t.lease_epoch,
-                               b.name as batch_name
+                               t.task_type, t.task_meta,
+                               b.name as batch_name, b.discover_mode
                         FROM tasks t
                         JOIN batches b ON b.id = t.batch_id
                         WHERE t.status = 'pending' AND t.priority = ?{ss_filter}
-                        ORDER BY t.id ASC
+                        {order_clause}
                         LIMIT ?""",
-                    (top_priority, *ss_params, count)
+                    (top_priority, *ss_params, *extra_params, count)
                 ) as cursor:
                     rows = await cursor.fetchall()
 
@@ -470,6 +839,9 @@ class Database:
                         "priority": row["priority"],
                         "needs_screenshot": bool(row["needs_screenshot"]),
                         "lease_epoch": row["lease_epoch"],
+                        "task_type": row["task_type"] or "asin",
+                        "task_meta": row["task_meta"],
+                        "discover_mode": row["discover_mode"],
                     }
                     tasks.append(task)
                     ids.append(row["id"])
@@ -526,6 +898,44 @@ class Database:
             logger.info(f"回收 {reclaimed} 个任务 (dead_workers={len(dead_worker_ids)}, hard_cutoff={hard_cutoff})")
         return reclaimed
 
+    async def auto_retry_failed_tasks(self, max_auto_cycles: int = 2,
+                                       delay_minutes: int = 5) -> int:
+        """自动重试终态失败的任务：重置为 pending、重置 retry_count、bump epoch、bump auto_retry_count。
+
+        一个任务达到 MAX_RETRIES (默认 3) 后变为 failed 终态。本方法把这些
+        失败任务重新入队，让它们再走一遍最多 3 次重试。最多允许 max_auto_cycles 轮。
+        总体尝试次数上限 ≈ MAX_RETRIES * (1 + max_auto_cycles)。
+        每次自动重试前，任务的 updated_at 至少要早于 delay_minutes 分钟（避免刚失败就立刻再跑）。
+        """
+        if max_auto_cycles <= 0:
+            return 0
+        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        cutoff = (datetime.utcnow() - timedelta(minutes=delay_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+        async with self._write_lock:
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE tasks SET status='pending', worker_id=NULL, retry_count=0, "
+                    "lease_epoch=lease_epoch+1, "
+                    "auto_retry_count=COALESCE(auto_retry_count,0)+1, "
+                    "updated_at=? "
+                    "WHERE status='failed' "
+                    "AND COALESCE(auto_retry_count,0) < ? "
+                    "AND updated_at < ?",
+                    (now_str, max_auto_cycles, cutoff)
+                )
+                retried = cursor.rowcount
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        if retried > 0:
+            logger.info(f"自动重试 {retried} 个失败任务 (delay={delay_minutes}min, max_cycles={max_auto_cycles})")
+        return retried
+
     async def fail_task(self, task_id: int, worker_id: str, lease_epoch: int,
                         error_type: str = "", error_detail: str = "") -> dict:
         """标记任务失败（校验 worker_id + lease_epoch）
@@ -534,31 +944,44 @@ class Database:
         """
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         async with self._write_lock:
-            async with self._db.execute(
-                "SELECT retry_count FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
-                (task_id, worker_id, lease_epoch)
-            ) as c:
-                row = await c.fetchone()
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                # 在同一事务内 SELECT + UPDATE，避免 TOCTOU（与 reclaim 循环并发时旧代码会静默失配）
+                async with self._db.execute(
+                    "SELECT retry_count FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                    (task_id, worker_id, lease_epoch)
+                ) as c:
+                    row = await c.fetchone()
                 if not row:
+                    await self._db.execute("ROLLBACK")
                     return {"accepted": False, "stale": True}
                 retry_count = row[0] + 1
 
-            await self._db.execute("BEGIN")
-            if retry_count >= config.MAX_RETRIES:
-                await self._db.execute(
-                    "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
-                    "WHERE id=? AND worker_id=? AND lease_epoch=?",
-                    (retry_count, error_type, error_detail, now, task_id, worker_id, lease_epoch)
-                )
-            else:
-                # 回 pending + bump epoch
-                await self._db.execute(
-                    "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, "
-                    "worker_id=NULL, lease_epoch=lease_epoch+1, updated_at=? "
-                    "WHERE id=? AND worker_id=? AND lease_epoch=?",
-                    (retry_count, error_type, error_detail, now, task_id, worker_id, lease_epoch)
-                )
-            await self._db.execute("COMMIT")
+                if retry_count >= config.MAX_RETRIES:
+                    cursor = await self._db.execute(
+                        "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
+                        "WHERE id=? AND worker_id=? AND lease_epoch=?",
+                        (retry_count, error_type, error_detail, now, task_id, worker_id, lease_epoch)
+                    )
+                else:
+                    # 回 pending + bump epoch
+                    cursor = await self._db.execute(
+                        "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, "
+                        "worker_id=NULL, lease_epoch=lease_epoch+1, updated_at=? "
+                        "WHERE id=? AND worker_id=? AND lease_epoch=?",
+                        (retry_count, error_type, error_detail, now, task_id, worker_id, lease_epoch)
+                    )
+                if cursor.rowcount == 0:
+                    # 极罕见：事务内 SELECT 成功但 UPDATE 失配（例如被 TRIGGER 拦截），按 stale 处理
+                    await self._db.execute("ROLLBACK")
+                    return {"accepted": False, "stale": True}
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         return {"accepted": True, "stale": False}
 
     async def release_tasks(self, worker_id: str, tasks: List[Dict]):
@@ -618,6 +1041,217 @@ class Database:
         stats["completion_rate"] = round(stats["done"] / stats["total"] * 100, 1) if stats["total"] else 0
         stats["success_rate"] = round(stats["done"] / finished * 100, 1) if finished else 0
         return stats
+
+    # ==================== 卖家店铺采集（F-009）====================
+
+    async def create_seller_batch(self, name: str, seller_ids: List[str],
+                                   discover_mode: str = "with_detail",
+                                   zip_code: str = "10001",
+                                   needs_screenshot: bool = False) -> Tuple[int, int]:
+        """创建一个 seller_discovery 类型的批次，并为每个 seller_id 插入一个 discover_seller 任务。
+
+        - 衍生的 ASIN 详情任务在 discover 任务完成时由 accept_seller_discovery_result 动态插入。
+        - 截图开关 needs_screenshot 应用于衍生的详情任务，discover 任务本身不截图。
+
+        Returns: (batch_id, inserted_seller_task_count)
+        """
+        if discover_mode not in ("discover_only", "with_detail"):
+            raise ValueError(f"非法 discover_mode: {discover_mode}")
+
+        clean_ids = []
+        seen = set()
+        for sid in seller_ids:
+            sid = (sid or "").strip().upper()
+            if sid and sid not in seen:
+                clean_ids.append(sid)
+                seen.add(sid)
+        if not clean_ids:
+            return (0, 0)
+
+        ss_val = 1 if needs_screenshot else 0
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO batches (name, needs_screenshot, is_auto, batch_type, discover_mode) "
+                    "VALUES (?, ?, 0, 'seller_discovery', ?)",
+                    (name, ss_val, discover_mode)
+                )
+                async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name,)) as c:
+                    row = await c.fetchone()
+                    batch_id = row[0] if row else 0
+                if not batch_id:
+                    await self._db.execute("ROLLBACK")
+                    return (0, 0)
+
+                before = self._db.total_changes
+                await self._db.executemany(
+                    "INSERT OR IGNORE INTO tasks "
+                    "(batch_id, asin, zip_code, needs_screenshot, task_type) "
+                    "VALUES (?, ?, ?, 0, 'discover_seller')",
+                    [(batch_id, sid, zip_code) for sid in clean_ids]
+                )
+                inserted = self._db.total_changes - before
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return (batch_id, inserted)
+
+    async def accept_seller_discovery_result(self, task_id: int, worker_id: str,
+                                              lease_epoch: int, batch_id: int,
+                                              seller_id: str,
+                                              items: List[Dict],
+                                              meta: Optional[Dict] = None) -> Dict:
+        """接受 discover_seller 任务结果。
+
+        items: [{"asin","title","price","image"}, ...]
+        meta:  {"pages_scanned": N, "truncated": bool}
+
+        副作用：
+          1. 写入 seller_discoveries
+          2. 若 batch.discover_mode='with_detail'，插入对应的 ASIN 详情任务（task_type='asin'）
+          3. 标记 discover 任务为 done（校验 worker_id + lease_epoch）
+
+        Returns: {"accepted":bool,"stale":bool,"discovered":int,"new_asins":int,"detail_tasks_created":int}
+        """
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                # Step 1: 校验 lease 并标 done
+                meta_json = json.dumps(meta) if meta else None
+                cursor = await self._db.execute(
+                    "UPDATE tasks SET status='done', updated_at=?, task_meta=? "
+                    "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
+                    (now, meta_json, task_id, worker_id, lease_epoch)
+                )
+                if cursor.rowcount == 0:
+                    await self._db.execute("ROLLBACK")
+                    return {"accepted": False, "stale": True,
+                            "discovered": 0, "new_asins": 0, "detail_tasks_created": 0}
+
+                # Step 2: 读 batch 元信息
+                async with self._db.execute(
+                    "SELECT discover_mode, needs_screenshot, name FROM batches WHERE id=?",
+                    (batch_id,)
+                ) as c:
+                    brow = await c.fetchone()
+                discover_mode = brow["discover_mode"] if brow else None
+                needs_screenshot = bool(brow["needs_screenshot"]) if brow else False
+                ss_val = 1 if needs_screenshot else 0
+
+                # Step 3: 写 seller_discoveries（去重靠 PK）
+                disc_rows = []
+                seen_asins = set()
+                for it in items or []:
+                    asin = (it.get("asin") or "").strip().upper()
+                    if not asin or asin in seen_asins:
+                        continue
+                    seen_asins.add(asin)
+                    disc_rows.append((
+                        batch_id, seller_id, asin,
+                        (it.get("title") or "")[:1000],
+                        (it.get("price") or "")[:64],
+                        (it.get("image") or "")[:1000],
+                    ))
+                if disc_rows:
+                    await self._db.executemany(
+                        "INSERT OR IGNORE INTO seller_discoveries "
+                        "(batch_id, seller_id, asin, list_title, list_price, list_image) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        disc_rows
+                    )
+
+                # Step 4: 若 with_detail，为每个 ASIN 插入详情任务（同 batch_id）
+                detail_inserted = 0
+                if discover_mode == "with_detail" and seen_asins:
+                    # 取该 task 的 zip_code 复用
+                    async with self._db.execute(
+                        "SELECT zip_code FROM tasks WHERE id=?", (task_id,)
+                    ) as c:
+                        zrow = await c.fetchone()
+                    zip_code = zrow["zip_code"] if zrow else "10001"
+
+                    before = self._db.total_changes
+                    await self._db.executemany(
+                        "INSERT OR IGNORE INTO tasks "
+                        "(batch_id, asin, zip_code, needs_screenshot, task_type) "
+                        "VALUES (?, ?, ?, ?, 'asin')",
+                        [(batch_id, a, zip_code, ss_val) for a in seen_asins]
+                    )
+                    detail_inserted = self._db.total_changes - before
+
+                    # 维护 batch_asins 关联（is_new 判定参考 create_tasks）
+                    for a in seen_asins:
+                        async with self._db.execute(
+                            "SELECT 1 FROM asin_data WHERE asin=?", (a,)
+                        ) as c:
+                            exists = await c.fetchone()
+                        await self._db.execute(
+                            "INSERT OR IGNORE INTO batch_asins (batch_id, asin, is_new) VALUES (?, ?, ?)",
+                            (batch_id, a, 0 if exists else 1)
+                        )
+
+                    if needs_screenshot:
+                        await self._db.executemany(
+                            "INSERT OR IGNORE INTO screenshots (asin, batch_id) VALUES (?, ?)",
+                            [(a, batch_id) for a in seen_asins]
+                        )
+
+                await self._db.execute("COMMIT")
+            except Exception:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+        return {
+            "accepted": True, "stale": False,
+            "discovered": len(seen_asins),
+            "new_asins": len(seen_asins),  # 旧 batch 的 PK 冲突会被 INSERT OR IGNORE 吞掉，这里返回本次提交的去重总数
+            "detail_tasks_created": detail_inserted,
+        }
+
+    async def get_seller_batch_progress(self, batch_id: int) -> Dict:
+        """seller_discovery 批次的混合进度：discover 任务 + 衍生的 detail 任务 + 发现总数。"""
+        out = {
+            "batch_id": batch_id,
+            "discover": {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0},
+            "detail":   {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0},
+            "discovered_asins": 0,
+            "discover_mode": None,
+        }
+        async with self._db.execute(
+            "SELECT discover_mode FROM batches WHERE id=?", (batch_id,)
+        ) as c:
+            row = await c.fetchone()
+            if row:
+                out["discover_mode"] = row["discover_mode"]
+
+        async with self._db.execute(
+            "SELECT task_type, status, COUNT(*) as cnt FROM tasks "
+            "WHERE batch_id=? GROUP BY task_type, status",
+            (batch_id,)
+        ) as c:
+            async for row in c:
+                tt = row["task_type"] or "asin"
+                bucket = out["discover"] if tt == "discover_seller" else out["detail"]
+                bucket[row["status"]] = row["cnt"]
+
+        for bucket in (out["discover"], out["detail"]):
+            bucket["total"] = sum(bucket[k] for k in ("pending", "processing", "done", "failed"))
+
+        async with self._db.execute(
+            "SELECT COUNT(*) FROM seller_discoveries WHERE batch_id=?", (batch_id,)
+        ) as c:
+            row = await c.fetchone()
+            out["discovered_asins"] = row[0] if row else 0
+        return out
 
     # ==================== 结果操作（含变动检测）====================
 
@@ -744,13 +1378,14 @@ class Database:
                                 "WHERE id=?",
                                 (retry_count, error_type, error_detail, now, task_id)
                             )
+                            failed += 1
                         else:
                             await self._db.execute(
                                 "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, "
                                 "worker_id=NULL, lease_epoch=lease_epoch+1, updated_at=? WHERE id=?",
                                 (retry_count, error_type, error_detail, now, task_id)
                             )
-                        accepted += 1
+                            # 重新入队不计入 accepted；若后续需要单独统计可在此累加 requeued
 
                 await self._db.execute("COMMIT")
             except Exception:
@@ -793,8 +1428,12 @@ class Database:
 
         resolved_screenshot_path = await self._get_done_screenshot_path(asin, batch_id)
 
+        # 只查变动检测和更新路径实际用到的列，减少 I/O 与反序列化开销（原先 SELECT *，40+ 列）
         async with self._db.execute(
-            "SELECT * FROM asin_data WHERE asin = ?", (asin,)
+            "SELECT screenshot_path, title, "
+            "baseline_price, baseline_buybox_price, baseline_stock_count, "
+            "baseline_stock_status, baseline_title_bullets_hash "
+            "FROM asin_data WHERE asin = ?", (asin,)
         ) as c:
             existing = await c.fetchone()
 
@@ -1091,9 +1730,11 @@ class Database:
                 join_parts.append(sub)
                 count_join_parts.append(sub)
 
-        # 搜索（支持逗号分隔的批量搜索）
+        # 搜索（支持逗号分隔的批量搜索）—— 限长防 DoS
         if search:
-            terms = [t.strip() for t in search.split(",") if t.strip()]
+            # 单个请求最多 500 字符、最多 10 个关键词，每个关键词截断到 100 字符
+            search = str(search)[:500]
+            terms = [t.strip()[:100] for t in search.split(",") if t.strip()][:10]
             if len(terms) == 1:
                 where_parts.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
                 where_params.extend([f"%{terms[0]}%", f"%{terms[0]}%", f"%{terms[0]}%"])

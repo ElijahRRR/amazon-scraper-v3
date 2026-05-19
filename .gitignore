@@ -14,3 +14,7 @@ runtime_settings.json
 .venv/
 .agent/runtime_logs/
 .agent/evidence/
+
+# Runtime monitor artifacts
+.agent/monitor/*.jsonl
+.agent/monitor/*_state.json

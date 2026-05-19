@@ -70,6 +70,11 @@ class AsinData:
     crawl_time: str = ""
     screenshot_path: str = ""
     content_hash: str = ""
+    # 评分 + 卖家信息（v3 后期新增）
+    rating: str = ""
+    review_count: str = ""
+    seller_id: str = ""
+    seller_name: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -85,6 +90,18 @@ class Batch:
     completed_tasks: int = 0
     failed_tasks: int = 0
     needs_screenshot: bool = False
+    # 状态机 + 完成时间
+    status: str = "running"          # running / completed / failed
+    completed_at: str = ""
+    # 调用方原样回传
+    external_id: str = ""
+    # 完成通知
+    callback_url: str = ""
+    callback_status: str = ""        # pending / sent / failed / disabled / ""(无回调)
+    callback_attempts: int = 0
+    callback_next_retry_at: str = ""
+    callback_last_error: str = ""
+    callback_sent_at: str = ""
     created_at: str = ""
     updated_at: str = ""
 

@@ -44,12 +44,22 @@ class Worker:
     """流水线异步采集 Worker"""
 
     def __init__(self, server_url: str, worker_id: str = None, concurrency: int = None,
-                 zip_code: str = None, enable_screenshot: bool = True, api_key: str = None):
+                 zip_code: str = None, enable_screenshot: bool = True,
+                 api_key: str = None, auto_restart_hours: float = 0):
         self.server_url = server_url.rstrip("/")
         self._api_key = api_key or os.environ.get("WORKER_API_KEY", "")
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.zip_code = zip_code or config.DEFAULT_ZIP_CODE
         self._enable_screenshot = enable_screenshot
+        # 定时自动重启（小时）：防止长跑引发的 Playwright 泄漏 / session 状态累积
+        self._auto_restart_hours = auto_restart_hours or 0
+        self._wants_restart = False  # 由定时协程置位；main() 关停后检查决定是否 os.execv
+        # 启动健康检查：跟踪 settings 是否成功同步过、是否处理过任务
+        self._has_synced_once = False
+        # 启动健康超时（秒）：启动后此时长内若无任务也无心跳成功，则触发自动重启
+        self._startup_grace_seconds = 60
+        # session 初始化硬上限（秒）：超时即触发重启，避免 execv 后陷入死等
+        self._init_timeout_seconds = 90
 
         # 组件
         self.proxy_manager = get_proxy_manager()
@@ -67,6 +77,11 @@ class Worker:
             max_c=max_c,
             metrics=self._metrics,
         )
+
+        # per-ASIN 邮编切换：多 worker 共享同一个 session，切 zip 时必须确保
+        # 没有在飞请求（避免 in-flight 请求"用错 zip 收回响应"）。
+        # _zip_switch_lock 串行化切换；切换前 drain 等所有在飞请求落地。
+        self._zip_switch_lock = asyncio.Lock()
 
         # 任务队列（优先级队列：首次请求 priority=0 优先处理，重试请求 priority=1 低优先级）
         self._task_queue: asyncio.PriorityQueue = None
@@ -136,6 +151,9 @@ class Worker:
         self._screenshot_gate = asyncio.Event()
         self._screenshot_gate.set()
 
+        # 优雅关停：用于让长 wait_for / 重试循环立即解锁，避免 stop 后 5 分钟才退出
+        self._shutdown_event = asyncio.Event()
+
         # 设置同步
         self._settings_version = 0
 
@@ -173,6 +191,13 @@ class Worker:
         # 初始化 session（此时 proxy_url 已从 Server 同步）
         await self._init_session()
 
+        # 初始化阶段已触发重启意图（超时） → 跳过协程启动，让上层 cleanup + execv
+        if self._wants_restart and not self._running:
+            logger.warning("⚠️ 初始化阶段触发重启信号，跳过协程启动直接进入清理")
+            await self._cleanup()
+            logger.info(f"🛑 Worker [{self.worker_id}] 已停止")
+            return
+
         # 启动自适应控制器
         await self._controller.start()
 
@@ -185,7 +210,10 @@ class Worker:
                 self._screenshot_gate_monitor(),  # 4. 截图完成监控（检查子进程标记）
                 self._settings_sync(),       # 5. 定期同步服务端设置
                 self._standby_warmer(),      # 6. 热备 session 预热
+                self._startup_watchdog(),    # 7. 启动健康看门狗（60s 内必须有任务/心跳）
             ]
+            if self._auto_restart_hours and self._auto_restart_hours > 0:
+                coroutines.append(self._auto_restart_timer())
             await asyncio.gather(*coroutines)
         except asyncio.CancelledError:
             pass
@@ -197,6 +225,16 @@ class Worker:
     async def stop(self):
         """停止 Worker"""
         self._running = False
+        # 触发关停事件，让所有长 wait_for（截图门控 / standby 重试 / settings 心跳等）立即解锁
+        self._shutdown_event.set()
+        # 同时把 screenshot_gate 也 set 一下，防止 task_feeder 卡在 wait
+        self._screenshot_gate.set()
+        # 提前停掉 AIMD 控制器：它的 _adjust_loop 是独立 task，不在主 gather() 列表中
+        # 这样"指标"日志立刻停止刷屏（不必等 _cleanup() 才停）
+        try:
+            await self._controller.stop()
+        except Exception:
+            pass
         # 向任务队列放入 None 哨兵，唤醒所有等待的 worker
         # 哨兵用 priority=-1 确保最先被取出
         for _ in range(self._controller._max):
@@ -272,6 +310,9 @@ class Worker:
                     # 门控超时：最多等 5 分钟，避免子进程异常导致 Worker 永久卡死
                     try:
                         await asyncio.wait_for(self._screenshot_gate.wait(), timeout=300)
+                        if not self._running:
+                            # shutdown 触发的解锁（stop() 里 set 了 gate）
+                            break
                         logger.info("▶️ 截图批次已完成，继续拉取新任务")
                     except asyncio.TimeoutError:
                         logger.warning("⚠️ 截图门控超时（5分钟），强制放行继续拉取任务")
@@ -427,7 +468,10 @@ class Worker:
                 # 确保 AIMD 看到的 p50 延迟是真实的 HTTP 往返时间，而非含重试/等待的总任务时间。
                 self._active_task_count += 1
                 try:
-                    await self._process_task(task)
+                    if task.get("task_type") == "discover_seller":
+                        await self._process_seller_task(task)
+                    else:
+                        await self._process_task(task)
                 finally:
                     self._active_task_count = max(0, self._active_task_count - 1)
 
@@ -562,27 +606,57 @@ class Worker:
             else:
                 logger.info("⚙️ 初始设置已确认（与本地一致）")
 
+            # 启动健康检查：拉到了初始设置也算一次成功心跳
+            self._has_synced_once = True
+
         except Exception as e:
             logger.warning(f"⚠️ 拉取初始设置异常（将使用本地配置）: {e}")
 
     async def _create_session_with_retry(self, max_attempts: int = 3,
                                          delay: float = 5) -> Optional[AmazonSession]:
-        """创建并初始化 AmazonSession，失败时重试。成功返回 session，全部失败返回 None。"""
+        """创建并初始化 AmazonSession，失败时重试。成功返回 session，全部失败返回 None。
+        优雅关停感知：shutdown_event 被 set 时立即放弃重试。"""
         for attempt in range(max_attempts):
+            if self._shutdown_event.is_set():
+                return None
             session = AmazonSession(self.proxy_manager, self.zip_code)
             if await session.initialize():
                 return session
             logger.warning(f"⚠️ Session 初始化失败 (尝试 {attempt+1}/{max_attempts})")
             await session.close()
             if attempt < max_attempts - 1:
-                await asyncio.sleep(delay)
+                # 等待重试间隔时也响应 shutdown，避免关停时再卡 5-15s
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
+                    return None  # shutdown 触发
+                except asyncio.TimeoutError:
+                    pass  # 正常等待结束，继续下一次尝试
         return None
 
     async def _init_session(self):
-        """初始化 Amazon session（失败时重试，确保 _session_ready 最终被 set）"""
-        logger.info("🔧 初始化 Amazon session...")
+        """初始化 Amazon session（带硬超时兜底，超时则触发重启而非死等）。
+
+        execv 后若代理网络瞬时不通，初始化重试链可能耗 ~150s。一旦超过
+        `_init_timeout_seconds`，直接放弃当前 session、置位 _wants_restart，
+        让 run_worker.py 走 os.execv 重新拉起一个干净进程。
+        """
+        logger.info(f"🔧 初始化 Amazon session... (硬超时 {self._init_timeout_seconds}s)")
         self._session_ready.clear()
-        self._session = await self._create_session_with_retry()
+        try:
+            self._session = await asyncio.wait_for(
+                self._create_session_with_retry(),
+                timeout=self._init_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"❌ Session 初始化超过 {self._init_timeout_seconds}s 未完成，触发自动重启"
+            )
+            self._session = None
+            self._session_ready.set()
+            self._wants_restart = True
+            self._running = False
+            self._shutdown_event.set()
+            return
         self._success_since_rotate = 0
         if self._session:
             self._session_ready.set()
@@ -719,21 +793,65 @@ class Worker:
                             logger.warning("⚠️ Standby Session 初始化失败，10s 后重试")
                         self._standby_warming = False
 
-                await asyncio.sleep(5)
+                # 用 wait_for(shutdown_event) 替代 sleep，关停时立即唤醒
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=5)
+                    break  # shutdown 触发
+                except asyncio.TimeoutError:
+                    pass
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Standby warmer 异常: {e}")
                 self._standby_warming = False
-                await asyncio.sleep(10)
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=10)
+                    break
+                except asyncio.TimeoutError:
+                    pass
 
         if self._standby_session:
             await self._standby_session.close()
             self._standby_session = None
 
+    async def _switch_session_zip(self, session, target_zip: str,
+                                   drain_timeout: float = 30.0) -> bool:
+        """切换 session 邮编（多 worker 安全）。
+
+        关键不变量：切换瞬间 session 上不能有在飞请求，否则它们会"用旧 zip 发出但被服务端
+        按新 zip 处理"，造成数据错位。流程：
+          1. 取 zip_switch_lock（串行所有切换尝试）
+          2. 双重检查（lock 期间另一个 worker 可能已经切到目标 zip）
+          3. drain：等到 metrics.inflight == 0，最多等 drain_timeout 秒
+          4. 调 session.change_zip_code（一次 POST + 一次 GET 验证，约 1-2s）
+          5. 释放 lock，所有 worker 恢复用新 zip 发请求
+
+        Returns: True 切换成功（或已是目标 zip）；False 失败（drain 超时/HTTP 失败）
+        """
+        async with self._zip_switch_lock:
+            if session is not self._session:
+                # 锁等待期间 session 已被换（轮换/重启），目标也变了
+                return False
+            if session.zip_code == target_zip:
+                return True  # 别的 worker 已切好
+            # drain：等所有在飞请求结束
+            deadline = time.time() + drain_timeout
+            while self._metrics.inflight > 0:
+                if time.time() > deadline:
+                    logger.warning(
+                        f"📍 zip 切换 drain 超时 ({drain_timeout}s, 仍有 {self._metrics.inflight} 在飞)，强制切换"
+                    )
+                    break
+                await asyncio.sleep(0.05)
+            # 切换
+            ok = await session.change_zip_code(target_zip)
+            if not ok:
+                logger.warning(f"📍 切换 zip 失败: {session.zip_code} → {target_zip}")
+            return ok
+
     async def _pull_tasks(self, count: int = None):
         """
-        从服务器拉取任务
+        从服务器拉取任务（带 prefer_zip 偏好，让 server 优先返回相同邮编的任务）
 
         Returns:
             List[Dict] — 成功拉到的任务列表
@@ -746,10 +864,28 @@ class Worker:
                 "count": count or self._controller.current_concurrency,
                 "enable_screenshot": "1" if self._enable_screenshot else "0",
             }
+            # 当前 session 的 zip 作为派发偏好：server 优先派发相同 zip 的任务，
+            # 减少 worker 端 session 邮编切换次数。
+            current_zip = None
+            if self._session is not None and getattr(self._session, "zip_code", None):
+                current_zip = self._session.zip_code
+            elif self.zip_code:
+                current_zip = self.zip_code
+            if current_zip:
+                params["prefer_zip"] = current_zip
             async with httpx.AsyncClient(timeout=10, headers=self._server_headers()) as client:
                 resp = await client.get(url, params=params)
             if resp.status_code == 200:
-                return resp.json().get("tasks", [])
+                tasks = resp.json().get("tasks", [])
+                # 本地二次排序：把 prefer_zip 匹配的放最前，剩下按 zip 聚类
+                # （server 已排序，此步是双重保险，特别是任务返回时混有不同 zip 的情况）
+                if tasks and current_zip:
+                    tasks.sort(key=lambda t: (
+                        0 if (t.get("zip_code") or "") == current_zip else 1,
+                        t.get("zip_code") or "",
+                        t.get("id") or 0,
+                    ))
+                return tasks
             logger.warning(f"拉取任务失败: HTTP {resp.status_code}")
             return None  # 服务器错误，快速重试
         except Exception as e:
@@ -783,7 +919,13 @@ class Worker:
         logger.info("⚙️ 设置同步协程启动（每 30 秒）")
         while self._running:
             try:
-                await asyncio.sleep(30)
+                # 用 wait_for(shutdown_event) 替代 sleep(30)：
+                # 关停时立刻退出，无需等满 30s 才检查 _running
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=30)
+                    break  # shutdown 触发
+                except asyncio.TimeoutError:
+                    pass  # 正常 30s 周期到，继续同步
                 if not self._running:
                     break
 
@@ -829,6 +971,10 @@ class Worker:
 
                 if s is None:
                     continue
+
+                # 心跳成功 → 标记启动健康检查通过（首次必经）
+                if not self._has_synced_once:
+                    self._has_synced_once = True
 
                 # === 设置同步（版本守护）===
                 # v3: unwrap settings from sync response
@@ -964,6 +1110,18 @@ class Worker:
                     await asyncio.sleep(2)
                     continue
                 session = self._session
+
+                # === per-ASIN 邮编切换 ===
+                # 每个任务带自己的 zip_code（从上传文件的 B 列读入）；如果与 session 当前
+                # zip 不一致，需切换。多 worker 并发时用 lock 串行，切换前 drain 在飞请求。
+                target_zip = (zip_code or "").strip() or self.zip_code
+                if target_zip and session.zip_code != target_zip:
+                    if not await self._switch_session_zip(session, target_zip):
+                        # 切换失败：跳过此任务，由 server 超时回收重试（用其他 worker / 其他 session）
+                        last_error_type = "zip_switch_failed"
+                        last_error_detail = f"current={session.zip_code} target={target_zip}"
+                        attempt = max_retries  # 直接放弃，避免本地 worker 卡死
+                        break
 
                 # 令牌桶限流
                 t_token_start = time.time()
@@ -1197,6 +1355,219 @@ class Worker:
         return (False, False, resp_bytes)
 
     # ═══════════════════════════════════════════════
+    # 卖家店铺发现任务（F-009：task_type='discover_seller'）
+    # ═══════════════════════════════════════════════
+
+    SELLER_MAX_PAGES = 75  # Amazon /s?me=... 列表上限约 75 页
+
+    async def _process_seller_task(self, task: Dict):
+        """处理 discover_seller 类型任务：翻页扫描卖家所有商品并提交 ASIN 列表。
+
+        - 复用全局 session、token bucket、信号量、CAPTCHA 自解 等基础设施
+        - 失败用现有 _submit_result(success=False) 触发重试 / 终态失败
+        - 成功用 _submit_seller_result 走专用端点，触发 server 端
+          accept_seller_discovery_result：写发现表 + 按需衍生详情任务
+        """
+        from worker.parser import parse_seller_listing
+        seller_id = (task["asin"] or "").strip().upper()
+        task_id = task["id"]
+        lease_epoch = task.get("lease_epoch", 0)
+        batch_id = task.get("batch_id")
+        max_retries = self._max_retries
+
+        all_items: List[Dict] = []
+        seen_asins = set()
+        pages_scanned = 0
+        truncated = False
+        last_error_type = "network"
+        last_error_detail = ""
+
+        page = 1
+        attempt = 0
+        while page <= self.SELLER_MAX_PAGES:
+            try:
+                if not self._session_ready.is_set():
+                    try:
+                        await asyncio.wait_for(self._session_ready.wait(), timeout=30)
+                    except asyncio.TimeoutError:
+                        attempt += 1
+                        if attempt >= max_retries:
+                            last_error_type = "session_not_ready"
+                            break
+                        continue
+                if self._session is None or not self._session.is_ready():
+                    attempt += 1
+                    if attempt >= max_retries:
+                        last_error_type = "session_not_ready"
+                        break
+                    await asyncio.sleep(2)
+                    continue
+                session = self._session
+
+                if self._rate_limiter:
+                    await self._rate_limiter.acquire()
+                await self._controller.acquire()
+                await self._apply_jitter()
+                recv_speed = self._calc_recv_speed()
+                req_start = time.time()
+                try:
+                    resp = await session.fetch_seller_listing_page(
+                        seller_id, page=page, max_recv_speed=recv_speed
+                    )
+                    resp_bytes = len(resp.content) if resp and hasattr(resp, 'content') else 0
+                finally:
+                    req_elapsed = time.time() - req_start
+                    self._controller.release()
+
+                if resp is None:
+                    self._controller.record_result(req_elapsed, False, False, 0)
+                    attempt += 1
+                    if attempt >= max_retries:
+                        last_error_type = "timeout"
+                        last_error_detail = f"page={page} 多次超时"
+                        break
+                    await asyncio.sleep(2)
+                    continue
+
+                if session.is_blocked(resp):
+                    if session.is_captcha(resp):
+                        if await session.solve_captcha(resp):
+                            continue
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                    attempt += 1
+                    self._stats["blocked"] += 1
+                    last_error_type = "blocked"
+                    last_error_detail = f"page={page} HTTP {resp.status_code}"
+                    await self._rotate_session(reason="卖家列表被封")
+                    if attempt >= max_retries:
+                        break
+                    continue
+
+                if session.is_404(resp):
+                    # 404 视为该卖家没有更多页面（边界）
+                    last_error_type = ""
+                    break
+
+                parsed = parse_seller_listing(resp.text)
+                page_info = parsed.get("page_info", "")
+                if page_info in ("captcha", "blocked"):
+                    self._controller.record_result(req_elapsed, False, True, resp_bytes)
+                    attempt += 1
+                    self._stats["blocked"] += 1
+                    last_error_type = "blocked"
+                    last_error_detail = f"page={page} parse:{page_info}"
+                    await self._rotate_session(reason=f"列表页 {page_info}")
+                    if attempt >= max_retries:
+                        break
+                    continue
+
+                self._controller.record_result(req_elapsed, True, False, resp_bytes)
+                pages_scanned += 1
+
+                items = parsed.get("items", [])
+                added = 0
+                for it in items:
+                    a = it.get("asin")
+                    if a and a not in seen_asins:
+                        seen_asins.add(a)
+                        all_items.append(it)
+                        added += 1
+                logger.info(f"seller={seller_id} page={page} 抓到 {added} 个新 ASIN，累计 {len(seen_asins)}")
+
+                if not parsed.get("has_next") or not items:
+                    break
+
+                page += 1
+                attempt = 0  # 翻页成功后重置该页重试计数
+
+                # 主动轮换：每 N 页换一次 session
+                self._success_since_rotate += 1
+                if self._success_since_rotate >= self._rotate_every:
+                    await self._rotate_session(reason="卖家翻页主动轮换")
+
+            except Exception as e:
+                attempt += 1
+                err_name = type(e).__name__
+                last_error_type = "timeout" if "timeout" in err_name.lower() else "network"
+                last_error_detail = f"page={page} {err_name}: {str(e)[:200]}"
+                logger.error(f"seller={seller_id} page={page} 异常 (尝试 {attempt}/{max_retries}): {e}")
+                if attempt >= max_retries:
+                    break
+                await asyncio.sleep(2)
+
+        if page > self.SELLER_MAX_PAGES:
+            truncated = True
+
+        # 没有任何成功页 → 整个任务失败，走现有重试通道
+        if pages_scanned == 0:
+            logger.error(f"seller={seller_id} 全部失败，标记失败 [{last_error_type}]")
+            await self._submit_result(
+                task_id, None, success=False,
+                error_type=last_error_type or "discover_failed",
+                error_detail=last_error_detail or "no page scanned",
+                batch_id=batch_id, lease_epoch=lease_epoch,
+            )
+            self._stats["failed"] += 1
+            self._stats["total"] += 1
+            return
+
+        meta = {
+            "pages_scanned": pages_scanned,
+            "truncated": truncated,
+        }
+        ok = await self._submit_seller_result(
+            task_id=task_id,
+            seller_id=seller_id,
+            items=all_items,
+            meta=meta,
+            lease_epoch=lease_epoch,
+            batch_id=batch_id,
+        )
+        if ok:
+            self._stats["success"] += 1
+            logger.info(
+                f"✅ seller={seller_id} 完成: pages={pages_scanned} asins={len(all_items)} truncated={truncated}"
+            )
+        else:
+            self._stats["failed"] += 1
+            logger.error(f"seller={seller_id} 提交失败")
+        self._stats["total"] += 1
+
+    async def _submit_seller_result(self, task_id: int, seller_id: str,
+                                     items: List[Dict], meta: Dict,
+                                     lease_epoch: int, batch_id: Optional[int]) -> bool:
+        """直接 POST /api/tasks/seller-result（不走批量队列，每个 seller 任务一次提交）。"""
+        url = f"{self.server_url}/api/tasks/seller-result"
+        payload = {
+            "task_id": task_id,
+            "batch_id": batch_id,
+            "worker_id": self.worker_id,
+            "lease_epoch": lease_epoch,
+            "seller_id": seller_id,
+            "items": items,
+            "meta": meta,
+        }
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("accepted"):
+                        self._stats["accepted"] += 1
+                        return True
+                    if data.get("stale"):
+                        self._stats["stale"] += 1
+                        logger.warning(f"seller_result stale: task_id={task_id}")
+                        return False
+                logger.warning(f"seller_result HTTP {resp.status_code} (尝试 {attempt+1}/3)")
+            except Exception as e:
+                logger.error(f"seller_result 异常 (尝试 {attempt+1}/3): {type(e).__name__}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+        return False
+
+    # ═══════════════════════════════════════════════
     # 结果提交（保持不变）
     # ═══════════════════════════════════════════════
 
@@ -1350,7 +1721,16 @@ class Worker:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            self._screenshot_pgid = self._screenshot_process.pid
+            # start_new_session=True 下子进程成为新 session/pgroup leader，pgid 应等于 pid
+            try:
+                real_pgid = os.getpgid(self._screenshot_process.pid)
+                if real_pgid != self._screenshot_process.pid:
+                    logger.warning(
+                        f"📸 子进程 pgid({real_pgid}) != pid({self._screenshot_process.pid})，killpg 可能漏杀后代"
+                    )
+                self._screenshot_pgid = real_pgid
+            except Exception:
+                self._screenshot_pgid = self._screenshot_process.pid
         # 异步转发子进程日志
         self._screenshot_log_task = asyncio.create_task(
             self._forward_screenshot_logs(self._screenshot_process)
@@ -1371,24 +1751,37 @@ class Worker:
             pass
 
     async def _reap_screenshot_descendants(self, reason: str):
-        """清理截图子进程残留的浏览器后代进程。"""
+        """清理截图子进程残留的浏览器后代进程（先 killpg，再兜底 kill PID）。"""
         pgid = self._screenshot_pgid
-        if not pgid:
+        pid = self._screenshot_process.pid if self._screenshot_process else None
+        if not pgid and not pid:
             return
         try:
-            os.killpg(pgid, signal.SIGKILL)
-            logger.warning(f"📸 已强制清理截图进程组残留 (pgid={pgid}) | {reason}")
+            if pgid:
+                os.killpg(pgid, signal.SIGKILL)
+                logger.warning(f"📸 已强制清理截图进程组残留 (pgid={pgid}) | {reason}")
         except ProcessLookupError:
             pass
         except Exception as e:
             logger.warning(f"📸 清理截图进程组失败 (pgid={pgid}): {e}")
-        finally:
-            self._screenshot_pgid = None
+        # 兜底：即便 killpg 失败或 pgid 已变，仍尝试 kill 主进程自身
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+        self._screenshot_pgid = None
 
     async def _screenshot_gate_monitor(self):
         """监控截图子进程的 _uploaded 标记，完成后开门放行"""
         while self._running:
-            await asyncio.sleep(2)
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=2)
+                break  # shutdown 触发
+            except asyncio.TimeoutError:
+                pass
             if not self._screenshot_pending_batches:
                 continue
 
@@ -1421,6 +1814,57 @@ class Worker:
                 logger.info(f"📸 截图批次已上传: {completed}")
                 if not self._screenshot_pending_batches:
                     self._screenshot_gate.set()
+
+    async def _startup_watchdog(self):
+        """启动健康看门狗：worker 启动后 _startup_grace_seconds 秒内必须看到
+        至少一次成功的心跳同步或处理至少一个任务，否则视为僵死并触发自动重启。
+        防止 execv 后陷入"Python 解释器活着但所有协程都不工作"的状态。"""
+        deadline = time.time() + self._startup_grace_seconds
+        while self._running and time.time() < deadline:
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=2)
+                return  # shutdown 触发，正常退出
+            except asyncio.TimeoutError:
+                pass
+            # 任意一项达成即视为健康：处理过任务 OR 完成首次心跳同步
+            if self._stats.get("total", 0) > 0 or self._has_synced_once:
+                logger.info("✅ 启动健康检查通过（首次心跳/任务已就位）")
+                return
+        if not self._running:
+            return
+        # 超过宽限期仍无活动迹象 → 僵死
+        logger.error(
+            f"❌ 启动后 {self._startup_grace_seconds}s 仍无心跳/任务活动，触发自动重启"
+        )
+        self._wants_restart = True
+        await self.stop()
+
+    async def _auto_restart_timer(self):
+        """定时触发进程级自动重启（全新 Python 解释器 + 全新 Playwright）。
+        主用途：防止长跑后 Playwright/Chromium 状态累积、内存膨胀、孤儿进程。
+        ±10% 随机抖动避免多 worker 同时重启。
+        """
+        hours = float(self._auto_restart_hours or 0)
+        if hours <= 0:
+            return
+        base_sec = hours * 3600
+        jitter = random.uniform(-0.10, 0.10) * base_sec
+        delay = max(60, base_sec + jitter)
+        restart_at = time.time() + delay
+        logger.info(
+            f"⏰ 自动重启已开启：{hours:.2f}h 后重启 (实际延迟含抖动={delay:.0f}s, "
+            f"预计时间戳={restart_at:.0f})"
+        )
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if not self._running:
+            return
+        logger.info("⏰ 到达自动重启时间，开始优雅关停并重启进程...")
+        self._wants_restart = True
+        # 走正常 stop 路径：会触发主 start() 内的清理链（session/截图子进程/结果刷盘）
+        await self.stop()
 
     async def _soft_restart(self):
         """软重启：重建 session（新指纹、新 cookies），不停止采集协程"""
@@ -1641,7 +2085,17 @@ def main():
     arg_parser.add_argument("--zip-code", default=None, help=f"邮编（默认 {config.DEFAULT_ZIP_CODE}）")
     arg_parser.add_argument("--no-screenshot", action="store_true", help="禁用截图功能（仅采集数据）")
     arg_parser.add_argument("--api-key", default=None, help="ERP Server Worker API Key（也可通过 WORKER_API_KEY 环境变量设置）")
+    arg_parser.add_argument("--auto-restart-hours", type=float, default=None,
+                            help="定时自动重启的小时数（0=关闭；也可用环境变量 WORKER_AUTO_RESTART_HOURS）")
     args = arg_parser.parse_args()
+
+    # CLI 优先，回落到环境变量
+    auto_restart_hours = args.auto_restart_hours
+    if auto_restart_hours is None:
+        try:
+            auto_restart_hours = float(os.environ.get("WORKER_AUTO_RESTART_HOURS", "0") or 0)
+        except ValueError:
+            auto_restart_hours = 0
 
     worker = Worker(
         server_url=args.server,
@@ -1650,6 +2104,7 @@ def main():
         zip_code=args.zip_code,
         enable_screenshot=not args.no_screenshot,
         api_key=args.api_key,
+        auto_restart_hours=auto_restart_hours,
     )
 
     # 优雅退出
@@ -1666,6 +2121,13 @@ def main():
         loop.run_until_complete(worker.start())
     finally:
         loop.close()
+
+    # 如果 worker 是因为定时器触发的重启退出，则 os.execv 重启进程
+    if getattr(worker, "_wants_restart", False):
+        logger.info(f"🔁 自动重启：execv 重新加载 {sys.executable} {' '.join(sys.argv)}")
+        # 短暂停顿，让日志落盘
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 if __name__ == "__main__":

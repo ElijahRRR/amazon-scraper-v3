@@ -83,6 +83,11 @@ class AmazonParser:
             result["title"] = block_status
             return result
 
+        # variant 偏移检测：提取页面当前 active ASIN 供上层校验
+        # 多属性产品偶发 default variant 偏移，写到 result["_page_asin"]
+        # 不在此处直接拒绝，由 worker._process_task 比对后处理
+        result["_page_asin"] = self._extract_page_asin(tree, html_text)
+
         # v3: 提取 JS 脚本数据（额外 fallback 层）
         sp_data = self._extract_sp_data(html_text)
 
@@ -803,6 +808,9 @@ class AmazonParser:
             result["title"] = block_status
             return result
 
+        # variant 偏移检测（同 selectolax 路径）：从 HTML 提取页面当前 active ASIN
+        result["_page_asin"] = self._extract_page_asin(None, html_text)
+
         # 全页预扫描 — 提取 Product Information 表格
         page_details = self._parse_all_details(tree, html_text)
 
@@ -1299,6 +1307,9 @@ class AmazonParser:
             "site": "US",
             "zip_code": zip_code,
             "product_url": f"https://www.amazon.com/dp/{asin}",
+            # 内部字段（下划线前缀，server 端 _save_result_inner_unlocked
+            # 只写 ASIN_DATA_FIELDS 中的字段，不会落库）
+            "_page_asin": None,  # variant 偏移检测用
             "title": "N/A",
             "brand": "N/A",
             "product_type": "N/A",
@@ -1341,6 +1352,62 @@ class AmazonParser:
         # 仅短页面（< 20KB）中出现才算封锁；正常商品页（50KB+）可能包含此邮箱
         if "api-services-support@amazon.com" in html_text and len(html_text) < 20000:
             return "[API封锁]"
+        return None
+
+    def _extract_page_asin(self, tree, html_text: str) -> Optional[str]:
+        """
+        提取页面当前展示的 active variant ASIN。
+        多属性产品（如 B0G6KPHQ4G）偶发出现"variant 偏移"：
+        - worker 请求 /dp/B0G6KPHQ4G?th=1&psc=1
+        - Amazon 因 A/B test / 库存 / cookie 状态等原因返回兄弟 variant 的页面
+        - parser 直接读 #productTitle 会拿到错误 variant 的 title
+        - 调用方比对返回值 vs task.asin，不一致即"variant_offset"，拒绝写入主表
+        信号源（按可靠度排序）：
+            1. <input id="ASIN" value="..."> 隐藏字段（最可靠，几乎所有 PDP 都有）
+            2. <link rel="canonical" href=".../dp/ASIN">
+            3. JS 中 "currentAsin":"ASIN"
+        """
+        ASIN_RE = r'B[0-9A-Z]{9}'
+
+        # 1. selectolax 直接读 #ASIN 隐藏字段
+        if _USE_SELECTOLAX and tree is not None:
+            try:
+                node = tree.css_first('input#ASIN')
+                if node is not None:
+                    val = (node.attributes.get('value') or '').strip().upper()
+                    if re.fullmatch(ASIN_RE, val):
+                        return val
+            except Exception:
+                pass
+
+        # 2. regex 兜底（兼容 lxml 路径 + selectolax 拿不到时）
+        # input id="ASIN" value="B..."（属性顺序可能反过来）
+        m = re.search(
+            r'<input[^>]*\bid="ASIN"[^>]*\bvalue="(' + ASIN_RE + r')"',
+            html_text
+        )
+        if m:
+            return m.group(1).upper()
+        m = re.search(
+            r'<input[^>]*\bvalue="(' + ASIN_RE + r')"[^>]*\bid="ASIN"',
+            html_text
+        )
+        if m:
+            return m.group(1).upper()
+
+        # 3. canonical link
+        m = re.search(
+            r'<link[^>]+rel="canonical"[^>]+href="[^"]*?/dp/(' + ASIN_RE + r')',
+            html_text
+        )
+        if m:
+            return m.group(1).upper()
+
+        # 4. JS currentAsin（部分 PDP 页有）
+        m = re.search(r'"currentAsin"\s*:\s*"(' + ASIN_RE + r')"', html_text)
+        if m:
+            return m.group(1).upper()
+
         return None
 
     def _extract_jsonld(self, html_text: str) -> Dict[str, Any]:

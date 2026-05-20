@@ -1256,6 +1256,23 @@ class Worker:
                     await self._wait_for_rotation_before_retry(asin, reason="标题为空")
                     continue
 
+                # variant 偏移检测：多属性产品偶发返回兄弟 variant 的页面
+                # （如 B0G6KPHQ4G 请求时实际拿到了 B0GXF5LWC6 的内容）
+                # 信号源：页面 <input id="ASIN" value="..."> / canonical link / JS currentAsin
+                page_asin = result_data.get("_page_asin")
+                if page_asin and page_asin.upper() != asin.upper():
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
+                    attempt += 1
+                    last_error_type = "variant_offset"
+                    last_error_detail = f"page={page_asin} requested={asin}"
+                    logger.warning(
+                        f"⚠️ ASIN {asin} variant 偏移：页面实际是 {page_asin} "
+                        f"(尝试 {attempt}/{max_retries})"
+                    )
+                    # 偏移大概率与 session/cookie 状态相关，rotate 后再试可能修复
+                    await self._rotate_session(reason="variant_offset")
+                    continue
+
                 # 邮编/货币校验：检测是否采集到了非美国地区的数据
                 price = result_data.get("current_price", "")
                 if price and price not in ["N/A", "不可售", "See price in cart", "No Featured Offer"]:

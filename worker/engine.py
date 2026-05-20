@@ -1259,19 +1259,27 @@ class Worker:
                 # variant 偏移检测：多属性产品偶发返回兄弟 variant 的页面
                 # （如 B0G6KPHQ4G 请求时实际拿到了 B0GXF5LWC6 的内容）
                 # 信号源：页面 <input id="ASIN" value="..."> / canonical link / JS currentAsin
+                #
+                # 处理策略修正（2026-05-20 复盘）：
+                #   早期版本会 _rotate_session 后本地重试，导致两个问题：
+                #     1. variant 偏移通常不是 session/cookie 状态引起的，多由 Amazon
+                #        A/B test、地域缓存、库存差异引起，rotate 后重试**结果一样**；
+                #     2. 大量 rotation 会瞬间打爆隧道代理 5 QPS 限额 → CONNECT 429
+                #        → Session 初始化失败 → 全局吞吐崩溃。
+                #   新策略：检测到偏移直接失败任务，不轮换 session、不本地重试。
+                #   失败结果回传 server，server 端的 retry_count 机制会让其他 worker
+                #   / 其他时间重试（自然更换 IP/cookie/缓存），治本不治标。
                 page_asin = result_data.get("_page_asin")
                 if page_asin and page_asin.upper() != asin.upper():
                     self._controller.record_result(req_elapsed, False, False, resp_bytes)
-                    attempt += 1
                     last_error_type = "variant_offset"
                     last_error_detail = f"page={page_asin} requested={asin}"
                     logger.warning(
-                        f"⚠️ ASIN {asin} variant 偏移：页面实际是 {page_asin} "
-                        f"(尝试 {attempt}/{max_retries})"
+                        f"⚠️ ASIN {asin} variant 偏移：页面实际是 {page_asin}（不轮换不重试，交给 server 调度）"
                     )
-                    # 偏移大概率与 session/cookie 状态相关，rotate 后再试可能修复
-                    await self._rotate_session(reason="variant_offset")
-                    continue
+                    # 直接跳出 retry 循环，让外层走"任务失败"路径
+                    attempt = max_retries
+                    break
 
                 # 邮编/货币校验：检测是否采集到了非美国地区的数据
                 price = result_data.get("current_price", "")

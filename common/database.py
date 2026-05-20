@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# 不进入任何重试循环的 error_type 白名单
+# 用于 fail_task / accept_results_batch / auto_retry_failed_tasks
+#
+# 这些失败不是 transient 网络/封锁问题，而是产品/页面层面的事实，
+# 重试只会重复同样结果，浪费配额，所以一律 final-failed 不再重试。
+# - variant_offset：亚马逊返回了同 parent 下的兄弟变体（A/B test / 库存 / 缓存）
+#   不同 worker / 不同时间结果一样；如确需复采，可手动重置 status。
+# ============================================================
+NO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
+
+
+# ============================================================
 # 锁竞争 / 阶段耗时 侦查仪表（recon 阶段使用，可随时删除）
 #
 # 使用方式：
@@ -1082,11 +1094,20 @@ class Database:
         失败任务重新入队，让它们再走一遍最多 3 次重试。最多允许 max_auto_cycles 轮。
         总体尝试次数上限 ≈ MAX_RETRIES * (1 + max_auto_cycles)。
         每次自动重试前，任务的 updated_at 至少要早于 delay_minutes 分钟（避免刚失败就立刻再跑）。
+
+        排除：NO_RETRY_ERROR_TYPES 中的失败（如 variant_offset）—— 这些是产品/页面层
+        事实，不是 transient 问题，自动重试只会重复失败浪费配额。
         """
         if max_auto_cycles <= 0:
             return 0
         now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         cutoff = (datetime.utcnow() - timedelta(minutes=delay_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+
+        # 动态构造 NOT IN (...) 子句（NO_RETRY_ERROR_TYPES 在 import 时确定，只有 1-2 项）
+        no_retry_list = sorted(NO_RETRY_ERROR_TYPES)
+        no_retry_placeholders = ",".join("?" * len(no_retry_list))
+        excl_clause = f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders}) " if no_retry_list else ""
+
         async with self._write_lock:
             await self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -1097,8 +1118,9 @@ class Database:
                     "updated_at=? "
                     "WHERE status='failed' "
                     "AND COALESCE(auto_retry_count,0) < ? "
-                    "AND updated_at < ?",
-                    (now_str, max_auto_cycles, cutoff)
+                    "AND updated_at < ? "
+                    f"{excl_clause}",
+                    (now_str, max_auto_cycles, cutoff, *no_retry_list)
                 )
                 retried = cursor.rowcount
                 await self._db.execute("COMMIT")
@@ -1133,7 +1155,9 @@ class Database:
                     return {"accepted": False, "stale": True}
                 retry_count = row[0] + 1
 
-                if retry_count >= config.MAX_RETRIES:
+                # variant_offset 等"不可重试错误"直接终态，不回 pending
+                no_retry = error_type in NO_RETRY_ERROR_TYPES
+                if retry_count >= config.MAX_RETRIES or no_retry:
                     cursor = await self._db.execute(
                         "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
                         "WHERE id=? AND worker_id=? AND lease_epoch=?",
@@ -1556,7 +1580,9 @@ class Database:
                             stale += 1
                             continue
                         retry_count = row[0] + 1
-                        if retry_count >= config.MAX_RETRIES:
+                        # variant_offset 等"不可重试错误"直接终态，跳过回 pending 分支
+                        no_retry = error_type in NO_RETRY_ERROR_TYPES
+                        if retry_count >= config.MAX_RETRIES or no_retry:
                             await self._db.execute(
                                 "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
                                 "WHERE id=?",

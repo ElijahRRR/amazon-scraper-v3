@@ -24,15 +24,37 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 不进入任何重试循环的 error_type 白名单
-# 用于 fail_task / accept_results_batch / auto_retry_failed_tasks
+# error_type → 失败次数上限映射
+# 用于 fail_task / accept_results_batch
 #
-# 这些失败不是 transient 网络/封锁问题，而是产品/页面层面的事实，
-# 重试只会重复同样结果，浪费配额，所以一律 final-failed 不再重试。
-# - variant_offset：亚马逊返回了同 parent 下的兄弟变体（A/B test / 库存 / 缓存）
-#   不同 worker / 不同时间结果一样；如确需复采，可手动重置 status。
+# 当任务的 retry_count >= cap 时直接 status='failed' 终态。
+# 不在 dict 中的 error_type 默认用 config.MAX_RETRIES（=3）。
+#
+# - variant_offset: 给 1 次重试机会（cap=2）
+#   理由：偶发性偏移（临时 A/B test / 缓存）有机会救回；
+#   稳定的 Amazon 侧问题第 2 次失败立即终态，不浪费配额。
 # ============================================================
-NO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
+LIMITED_RETRY_ERROR_TYPES = {
+    "variant_offset": 2,   # 最多失败 2 次（= 1 次原始失败 + 1 次重试）
+}
+
+# ============================================================
+# 不进入"循环类"重试的 error_type 集合
+# 用于 auto_retry_failed_tasks / api_retry_batch（默认）
+#
+# 进入此集合的失败，即使 layer 2 已给过有限次重试机会，
+# 也不再被 server 周期任务或用户手动按钮重新激活。
+# 用户如确需重采，可 Shift+点击"重试"按钮（force=true 强制覆盖）。
+# ============================================================
+NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
+
+# 向后兼容：之前一些地方引用了 NO_RETRY_ERROR_TYPES
+NO_RETRY_ERROR_TYPES = NO_AUTO_RETRY_ERROR_TYPES
+
+
+def _fail_cap(error_type: str) -> int:
+    """返回该 error_type 的失败上限（达到即终态，不回 pending）。"""
+    return LIMITED_RETRY_ERROR_TYPES.get(error_type or "", config.MAX_RETRIES)
 
 
 # ============================================================
@@ -1095,16 +1117,17 @@ class Database:
         总体尝试次数上限 ≈ MAX_RETRIES * (1 + max_auto_cycles)。
         每次自动重试前，任务的 updated_at 至少要早于 delay_minutes 分钟（避免刚失败就立刻再跑）。
 
-        排除：NO_RETRY_ERROR_TYPES 中的失败（如 variant_offset）—— 这些是产品/页面层
-        事实，不是 transient 问题，自动重试只会重复失败浪费配额。
+        排除：NO_AUTO_RETRY_ERROR_TYPES 中的失败（如 variant_offset）。
+        这些类型已经在 fail_task / accept_results_batch 里给过有限次重试机会，
+        如果仍失败说明是产品/页面层稳定问题，再循环重试浪费配额。
         """
         if max_auto_cycles <= 0:
             return 0
         now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         cutoff = (datetime.utcnow() - timedelta(minutes=delay_minutes)).strftime('%Y-%m-%d %H:%M:%S')
 
-        # 动态构造 NOT IN (...) 子句（NO_RETRY_ERROR_TYPES 在 import 时确定，只有 1-2 项）
-        no_retry_list = sorted(NO_RETRY_ERROR_TYPES)
+        # 动态构造 NOT IN (...) 子句
+        no_retry_list = sorted(NO_AUTO_RETRY_ERROR_TYPES)
         no_retry_placeholders = ",".join("?" * len(no_retry_list))
         excl_clause = f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders}) " if no_retry_list else ""
 
@@ -1155,9 +1178,11 @@ class Database:
                     return {"accepted": False, "stale": True}
                 retry_count = row[0] + 1
 
-                # variant_offset 等"不可重试错误"直接终态，不回 pending
-                no_retry = error_type in NO_RETRY_ERROR_TYPES
-                if retry_count >= config.MAX_RETRIES or no_retry:
+                # 按 error_type 决定该任务的失败上限：
+                # - variant_offset: cap=2（给 1 次重试机会）
+                # - 其他: cap=MAX_RETRIES（=3）
+                cap = _fail_cap(error_type)
+                if retry_count >= cap:
                     cursor = await self._db.execute(
                         "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
                         "WHERE id=? AND worker_id=? AND lease_epoch=?",
@@ -1580,9 +1605,10 @@ class Database:
                             stale += 1
                             continue
                         retry_count = row[0] + 1
-                        # variant_offset 等"不可重试错误"直接终态，跳过回 pending 分支
-                        no_retry = error_type in NO_RETRY_ERROR_TYPES
-                        if retry_count >= config.MAX_RETRIES or no_retry:
+                        # 按 error_type 决定该任务的失败上限
+                        # （variant_offset 给 1 次重试机会，其他用 MAX_RETRIES）
+                        cap = _fail_cap(error_type)
+                        if retry_count >= cap:
                             await self._db.execute(
                                 "UPDATE tasks SET status='failed', retry_count=?, error_type=?, error_detail=?, updated_at=? "
                                 "WHERE id=?",

@@ -1128,18 +1128,18 @@ async def api_prioritize(batch_id: int):
 async def api_retry_batch(batch_name: str, force: bool = False):
     """重试失败任务
 
-    默认跳过 NO_RETRY_ERROR_TYPES（如 variant_offset），因为这类是产品/页面
-    层事实，重试也是同样结果，纯浪费配额。
-    如确需强制重试这些任务，可加 ?force=true 显式覆盖。
+    默认跳过 NO_AUTO_RETRY_ERROR_TYPES（如 variant_offset），因为这些类型
+    已经在 layer 2 给过有限次重试机会，仍失败说明是 Amazon 侧稳定问题。
+    如确需强制重试，可加 ?force=true（前端按住 Shift 点击）。
     返回 retried/skipped_no_retry 数量，前端可展示。
     """
-    from common.database import NO_RETRY_ERROR_TYPES
+    from common.database import NO_AUTO_RETRY_ERROR_TYPES
     batch = await db.get_batch_by_name(batch_name)
     if not batch:
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
 
-    no_retry_list = sorted(NO_RETRY_ERROR_TYPES)
+    no_retry_list = sorted(NO_AUTO_RETRY_ERROR_TYPES)
     no_retry_placeholders = ",".join("?" * len(no_retry_list))
 
     async with db._write_lock:

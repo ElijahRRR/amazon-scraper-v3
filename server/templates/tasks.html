@@ -147,7 +147,7 @@
                             <button class="btn btn-outline-danger" onclick="prioritizeBatch({{ b.id }}, '{{ b.name }}')" title="优先采集">
                                 <i class="bi bi-lightning-charge"></i>
                             </button>
-                            <button class="btn btn-outline-accent" onclick="retryBatch('{{ b.name }}')" title="重试失败">
+                            <button class="btn btn-outline-accent" onclick="retryBatch(event, '{{ b.name }}')" title="重试失败任务（按住 Shift 强制重试含 variant_offset）">
                                 <i class="bi bi-arrow-clockwise"></i>
                             </button>
                             <button class="btn btn-outline-danger" onclick="deleteBatch('{{ b.name }}')" title="删除">
@@ -275,9 +275,27 @@ document.getElementById('sellerUploadForm').addEventListener('submit', async (e)
     btn.innerHTML = '<i class="bi bi-shop"></i> 开始发现';
 });
 
-async function retryBatch(name) {
-    if (!confirm(`确定重试批次 "${name}" 中所有失败的任务？`)) return;
-    await fetch(`/api/batches/${encodeURIComponent(name)}/retry`, { method: 'POST' });
+async function retryBatch(ev, name) {
+    // 按住 Shift 强制重试所有失败（含 variant_offset）；默认跳过 variant_offset
+    const force = !!(ev && ev.shiftKey);
+    const promptMsg = force
+        ? `⚠️ 强制重试模式（含 variant_offset）：\n\n确定重试批次 "${name}" 中【所有】失败任务？\n包括 variant_offset 类型，会浪费配额。`
+        : `确定重试批次 "${name}" 中失败的任务？\n\n注：variant_offset (变体偏移) 类失败默认不参与重试，因这类问题重试无意义。\n如需强制全部重试，请按住 Shift 再点击。`;
+    if (!confirm(promptMsg)) return;
+    const resp = await fetch(`/api/batches/${encodeURIComponent(name)}/retry?force=${force}`, { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    if (data.ok) {
+        let msg;
+        if (data.forced) {
+            msg = `已强制重新入队 ${data.retried || 0} 个失败任务（含 variant_offset）`;
+        } else {
+            msg = `已重新入队 ${data.retried || 0} 个失败任务`;
+            if (data.skipped_no_retry > 0) {
+                msg += `\n跳过 ${data.skipped_no_retry} 个不可重试类型：${(data.no_retry_types || []).join('、')}`;
+            }
+        }
+        alert(msg);
+    }
     location.reload();
 }
 

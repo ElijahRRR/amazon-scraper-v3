@@ -1125,20 +1125,59 @@ async def api_prioritize(batch_id: int):
 
 
 @app.post("/api/batches/{batch_name}/retry")
-async def api_retry_batch(batch_name: str):
-    """重试失败任务"""
+async def api_retry_batch(batch_name: str, force: bool = False):
+    """重试失败任务
+
+    默认跳过 NO_RETRY_ERROR_TYPES（如 variant_offset），因为这类是产品/页面
+    层事实，重试也是同样结果，纯浪费配额。
+    如确需强制重试这些任务，可加 ?force=true 显式覆盖。
+    返回 retried/skipped_no_retry 数量，前端可展示。
+    """
+    from common.database import NO_RETRY_ERROR_TYPES
     batch = await db.get_batch_by_name(batch_name)
     if not batch:
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
+
+    no_retry_list = sorted(NO_RETRY_ERROR_TYPES)
+    no_retry_placeholders = ",".join("?" * len(no_retry_list))
+
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        await db._db.execute(
-            "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL WHERE batch_id=? AND status='failed'",
-            (batch_id,)
-        )
+        # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
+        skipped = 0
+        if not force and no_retry_list:
+            async with db._db.execute(
+                f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
+                f"AND COALESCE(error_type, '') IN ({no_retry_placeholders})",
+                [batch_id] + no_retry_list
+            ) as c:
+                row = await c.fetchone()
+                skipped = row[0] if row else 0
+
+        # 实际重试 SQL：默认排除 NO_RETRY；force=true 时全部重试
+        if force or not no_retry_list:
+            cursor = await db._db.execute(
+                "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                "WHERE batch_id=? AND status='failed'",
+                (batch_id,)
+            )
+        else:
+            cursor = await db._db.execute(
+                f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                f"WHERE batch_id=? AND status='failed' "
+                f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders})",
+                [batch_id] + no_retry_list
+            )
+        retried = cursor.rowcount
         await db._db.execute("COMMIT")
-    return {"ok": True}
+    return {
+        "ok": True,
+        "retried": retried,
+        "skipped_no_retry": skipped,
+        "no_retry_types": no_retry_list,
+        "forced": force,
+    }
 
 
 @app.delete("/api/batches/{batch_name}")

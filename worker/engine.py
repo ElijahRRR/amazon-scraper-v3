@@ -108,6 +108,10 @@ class Worker:
         self._batch_submitter_task: Optional[asyncio.Task] = None
         self._batch_size = 10
         self._batch_interval = 2.0  # 秒
+        # 并行 batch_submitter 数量：单 submitter HTTP retry 时会卡 30+ 秒，
+        # 期间 result_queue 持续填充，10 worker × 500 queue = 5000 卡住
+        # 多协程共用同一个 _result_queue，一个 stuck 不影响其他
+        self._submitter_count = 3
 
         # 实例级运行参数（不污染全局 config）
         self._max_retries = config.MAX_RETRIES
@@ -206,7 +210,9 @@ class Worker:
             coroutines = [
                 self._task_feeder(),         # 1. 持续从 Server 拉任务
                 self._worker_pool(),         # 2. 工人池：自适应并发
-                self._batch_submitter(),     # 3. 批量回传结果
+                # 3. N 个并行 batch_submitter（共用 _result_queue）
+                # 单个 submitter HTTP retry 卡住时，其他继续工作，避免 result_queue 堆积
+                *[self._batch_submitter() for _ in range(self._submitter_count)],
                 self._screenshot_gate_monitor(),  # 4. 截图完成监控（检查子进程标记）
                 self._settings_sync(),       # 5. 定期同步服务端设置
                 self._standby_warmer(),      # 6. 热备 session 预热
@@ -1651,11 +1657,18 @@ class Worker:
             await self._submit_batch(batch)
 
     async def _submit_batch(self, batch: List[Dict], retry: int = 3):
-        """批量 POST 提交结果到服务器（含重试 + stale 统计）"""
+        """批量 POST 提交结果到服务器（含重试 + stale 统计）
+
+        v3 优化（针对 result_queue 堆积问题）：
+        - timeout 15s → 8s（server p99=94ms，8s 足够覆盖正常波动）
+        - backoff 2^attempt → 0.5*2^attempt（1s/2s/4s → 0.5s/1s/2s）
+        - 最坏耗时 52s → 27.5s，减少单 submitter 卡住时长
+        - 配合 self._submitter_count=3 多协程并行，单点卡住不阻塞队列消化
+        """
         url = f"{self.server_url}/api/tasks/result/batch"
         for attempt in range(retry):
             try:
-                async with httpx.AsyncClient(timeout=15, headers=self._server_headers()) as client:
+                async with httpx.AsyncClient(timeout=8, headers=self._server_headers()) as client:
                     resp = await client.post(url, json={"results": batch})
                 if resp.status_code == 200:
                     data = resp.json()
@@ -1670,28 +1683,40 @@ class Worker:
             except Exception as e:
                 logger.error(f"批量提交异常 (尝试 {attempt+1}/{retry}): {type(e).__name__}: {e}")
             if attempt < retry - 1:
-                await asyncio.sleep(2 ** attempt)
-        # 全部重试失败，回退逐条提交
-        logger.error("批量提交多次失败，回退逐条提交")
+                # 0.5s / 1s / 2s 线性指数退避（原 1s/2s/4s 太保守）
+                await asyncio.sleep(0.5 * (2 ** attempt))
+        # 全部重试失败，回退并发提交
+        logger.error("批量提交多次失败，回退并发逐条提交")
         await self._submit_batch_fallback(batch)
 
     async def _submit_batch_fallback(self, batch: List[Dict]):
-        """逐条提交 fallback（批量接口不可用时）"""
+        """fallback：并发逐条提交（批量接口不可用时）
+
+        原本串行提交 10 条 × 10s timeout = 最坏 100s（一直卡住 submitter）。
+        改成 asyncio.gather 并发 10 条 → 最坏 ~10s，吞吐 10×。
+        """
         url = f"{self.server_url}/api/tasks/result"
-        async with httpx.AsyncClient(timeout=10, headers=self._server_headers()) as client:
-            for payload in batch:
-                try:
-                    resp = await client.post(url, json=payload)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get("stale"):
-                            self._stats["stale"] += 1
-                        elif data.get("ok"):
-                            self._stats["accepted"] += 1
-                    elif resp.status_code != 200:
-                        logger.warning(f"逐条提交失败: task_id={payload.get('task_id')} HTTP {resp.status_code}")
-                except Exception as e:
-                    logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {e}")
+
+        async def _post_one(client: httpx.AsyncClient, payload: Dict):
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("stale"):
+                        self._stats["stale"] += 1
+                    elif data.get("ok"):
+                        self._stats["accepted"] += 1
+                else:
+                    logger.warning(f"逐条提交失败: task_id={payload.get('task_id')} HTTP {resp.status_code}")
+            except Exception as e:
+                logger.error(f"逐条提交异常: task_id={payload.get('task_id')} {type(e).__name__}: {e}")
+
+        # 共用一个 client 连接池，并发执行所有提交
+        async with httpx.AsyncClient(timeout=8, headers=self._server_headers()) as client:
+            await asyncio.gather(
+                *[_post_one(client, p) for p in batch],
+                return_exceptions=True,
+            )
 
     # ═══════════════════════════════════════════════
     # 截图：独立子进程架构

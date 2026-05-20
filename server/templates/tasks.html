@@ -167,7 +167,7 @@
 
 <!-- 错误详情弹窗 -->
 <div class="modal fade" id="errorModal" tabindex="-1">
-    <div class="modal-dialog modal-lg">
+    <div class="modal-dialog modal-xl modal-dialog-scrollable">
         <div class="modal-content" style="background:var(--card-bg); border:1px solid var(--border);">
             <div class="modal-header" style="border-color:var(--border);">
                 <h5 class="modal-title" id="errorModalTitle">错误详情</h5>
@@ -298,46 +298,145 @@ async function deleteBatch(name) {
     location.reload();
 }
 
-const ERROR_LABELS = {
-    blocked: '被封锁', captcha: '验证码', timeout: '超时',
-    parse_error: '解析失败', network: '网络异常', unknown: '未知'
+// 错误类型 → 中文标签 + Bootstrap 颜色级别
+// 覆盖 worker engine.py 中所有可能产生的 error_type
+const ERROR_TYPES = {
+    blocked:             { label: '被封锁',        color: 'danger',  desc: '亚马逊检测到爬虫，IP/Session 被拦截' },
+    captcha:             { label: '验证码拦截',    color: 'warning', desc: '页面返回验证码（Robot Check）' },
+    timeout:             { label: '请求超时',      color: 'warning', desc: '网络请求超时未响应' },
+    network:             { label: '网络异常',      color: 'warning', desc: '网络连接问题或代理异常' },
+    parse_error:         { label: '解析失败',      color: 'secondary', desc: '页面 HTML 异常或关键字段缺失' },
+    variant_offset:      { label: 'Variant 偏移',  color: 'info',    desc: '亚马逊返回了同一商品下的兄弟变体页面' },
+    zip_switch_failed:   { label: '邮编切换失败',  color: 'secondary', desc: 'Session 切换到目标邮编时失败' },
+    server_reject:       { label: '服务端拒绝',    color: 'secondary', desc: '服务端检测到结果为空或不合格' },
+    session_not_ready:   { label: 'Session 未就绪', color: 'warning', desc: '采集 Session 还在初始化中' },
+    discover_failed:     { label: '卖家发现失败',  color: 'secondary', desc: '从卖家店铺发现 ASIN 失败' },
+    unknown:             { label: '未知',          color: 'secondary', desc: '未分类错误' },
 };
+
+function getErrorInfo(etype) {
+    return ERROR_TYPES[etype] || { label: etype || '未知', color: 'secondary', desc: '' };
+}
+
+// 把 worker 产生的英文 error_detail 翻译成更易读的中文
+function localizeErrorDetail(etype, detail) {
+    if (!detail) return '-';
+    const d = String(detail);
+
+    // 完全匹配的固定值
+    const FIXED = {
+        'validateCaptcha / Robot Check': '亚马逊验证码 / Robot Check 拦截',
+        'api-services-support@amazon.com': '亚马逊 API 封锁页面',
+        'parse_failure_on_server': '服务端检测到采集结果为空或字段缺失',
+        '[页面为空]': '采集到空页面',
+        '[HTML解析失败]': 'HTML 解析失败',
+        '[验证码拦截]': '验证码拦截',
+        '[API封锁]': 'API 封锁',
+        '标题为空': '标题字段为空（疑似软拦截/降级页面）',
+    };
+    if (FIXED[d]) return FIXED[d];
+
+    // 模式匹配（带参数的 detail）
+    let m;
+    // variant 偏移："page=B0XXX requested=B0YYY"
+    m = d.match(/^page=(B[0-9A-Z]{9})\s+requested=(B[0-9A-Z]{9})$/);
+    if (m) {
+        return `实际页面 ASIN：<code>${m[1]}</code>，请求的是：<code>${m[2]}</code>（亚马逊返回了同 parent 下的兄弟变体）`;
+    }
+    // zip_switch："current=10001 target=90210"（保险起见 esc）
+    m = d.match(/^current=(\S*)\s+target=(\S+)$/);
+    if (m) {
+        return `当前 Session 邮编：<code>${esc(m[1]) || '未知'}</code>，目标邮编：<code>${esc(m[2])}</code>`;
+    }
+    // 兜底：原始 detail 必须 esc 后返回避免 XSS；超长截断 300 字符 + tooltip 看全文
+    if (d.length > 300) {
+        return `<span title="${esc(d)}">${esc(d.slice(0, 300))}…</span>`;
+    }
+    return esc(d);
+}
 
 async function showErrors(batchName) {
     const body = document.getElementById('errorModalBody');
     document.getElementById('errorModalTitle').textContent = `错误详情 — ${batchName}`;
-    body.innerHTML = '<div class="text-center py-3"><span class="spinner-border spinner-border-sm"></span> 加载中...</div>';
+    body.innerHTML = '<div class="text-center py-4"><span class="spinner-border spinner-border-sm"></span> 加载中...</div>';
     new bootstrap.Modal(document.getElementById('errorModal')).show();
 
     try {
         const resp = await fetch(`/api/batches/${encodeURIComponent(batchName)}/errors`);
         const data = await resp.json();
+        const totalFailed = (data.error_summary || []).reduce((s, i) => s + (i.cnt || 0), 0);
 
-        let html = '<h6 style="color:var(--accent-light);">错误类型分布</h6>';
-        html += '<div class="row g-2 mb-3">';
-        for (const item of (data.error_summary || [])) { const etype = item.error_type; const count = item.cnt;
-            const label = ERROR_LABELS[etype] || etype;
-            html += `<div class="col-auto"><span class="badge bg-danger bg-opacity-75 px-3 py-2">${esc(label)} <strong>${count}</strong></span></div>`;
+        let html = '';
+
+        // 顶部摘要
+        if (totalFailed > 0) {
+            html += `<div class="mb-3 small text-secondary">共 <strong style="color:var(--danger);">${totalFailed}</strong> 个失败任务，按类型分布如下：</div>`;
+        } else {
+            html += `<div class="alert alert-success mb-3 mb-0">🎉 没有失败任务</div>`;
+            body.innerHTML = html;
+            return;
+        }
+
+        // 错误类型分布（彩色 badge + 占比 + 鼠标悬停看说明）
+        html += '<div class="d-flex flex-wrap gap-2 mb-3">';
+        for (const item of (data.error_summary || [])) {
+            const info = getErrorInfo(item.error_type);
+            const pct = totalFailed > 0 ? Math.round(item.cnt * 100 / totalFailed) : 0;
+            const safeDesc = esc(info.desc + (item.error_type ? `（${item.error_type}）` : ''));
+            html += `<span class="badge bg-${info.color} bg-opacity-75 px-3 py-2"
+                            title="${safeDesc}" style="cursor:help;font-size:0.85rem;">
+                       ${esc(info.label)}
+                       <strong class="ms-1">${item.cnt}</strong>
+                       <small class="ms-1 opacity-75">(${pct}%)</small>
+                     </span>`;
         }
         html += '</div>';
 
+        // 失败任务明细表
         if (data.failed_tasks && data.failed_tasks.length > 0) {
-            html += '<h6 style="color:var(--accent-light);">失败任务列表</h6>';
-            html += '<div class="table-responsive"><table class="table table-sm table-hover mb-0"><thead><tr>';
-            html += '<th>ASIN</th><th>错误类型</th><th>详情</th><th>重试</th><th>时间</th></tr></thead><tbody>';
+            html += `<h6 style="color:var(--accent-light);" class="mt-3 mb-2">
+                       失败任务明细 <small class="text-secondary">(最近 ${data.failed_tasks.length} 条)</small>
+                     </h6>`;
+            html += '<div class="table-responsive">';
+            html += '<table class="table table-sm table-hover align-top mb-0"><thead><tr>';
+            html += '<th style="width:110px;">ASIN</th>';
+            html += '<th style="width:130px;">错误类型</th>';
+            html += '<th>错误详情</th>';
+            html += '<th style="width:80px;" class="text-center">重试</th>';
+            html += '<th style="width:90px;">Worker</th>';
+            html += '<th style="width:160px;">时间</th>';
+            html += '</tr></thead><tbody>';
+
             for (const t of data.failed_tasks) {
-                const label = ERROR_LABELS[t.error_type] || t.error_type || '未知';
+                const info = getErrorInfo(t.error_type);
+                const detailHtml = localizeErrorDetail(t.error_type, t.error_detail);
                 html += `<tr>
-                    <td><a href="https://www.amazon.com/dp/${encodeURIComponent(t.asin)}" target="_blank"
-                           style="color:var(--info)">${esc(t.asin)}</a></td>
-                    <td><span class="badge bg-secondary">${esc(label)}</span></td>
-                    <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
-                        title="${esc(t.error_detail || '')}">${esc(t.error_detail || '-')}</td>
-                    <td>${t.retry_count || 0}</td>
+                    <td>
+                        <a href="https://www.amazon.com/dp/${encodeURIComponent(t.asin)}?th=1&psc=1"
+                           target="_blank" rel="noopener"
+                           style="color:var(--info);font-family:var(--mono,monospace);">${esc(t.asin)}</a>
+                    </td>
+                    <td>
+                        <span class="badge bg-${info.color} bg-opacity-75"
+                              title="${esc(info.desc)}" style="cursor:help;">
+                            ${esc(info.label)}
+                        </span>
+                    </td>
+                    <td style="word-break:break-word;white-space:normal;line-height:1.4;">
+                        <span class="text-light">${detailHtml}</span>
+                    </td>
+                    <td class="text-center">
+                        <span class="badge bg-secondary bg-opacity-50">${t.retry_count || 0}</span>
+                    </td>
+                    <td><small class="text-secondary">${esc(t.worker_id || '-')}</small></td>
                     <td><small class="text-secondary">${esc(t.updated_at || '')}</small></td>
                 </tr>`;
             }
             html += '</tbody></table></div>';
+            html += `<div class="mt-2 text-secondary small">
+                       💡 提示：点击 ASIN 链接可直接打开亚马逊页面验证。
+                       Variant 偏移类错误一般是亚马逊返回了同 parent 下的兄弟变体页，可重试或检查代理。
+                     </div>`;
         }
 
         body.innerHTML = html;

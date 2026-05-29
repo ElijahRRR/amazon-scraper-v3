@@ -104,7 +104,7 @@
                         </div>
                         <small class="text-secondary">{% if b.total_tasks > 0 %}{{ (b.completed * 100 / b.total_tasks)|round|int }}{% else %}0{% endif %}%</small>
                     </td>
-                    <td><small class="text-secondary">{{ b.created_at }}</small></td>
+                    <td><small class="text-secondary">{{ b.created_at | cst }}</small></td>
                 </tr>
                 {% endfor %}
                 {% if not batches %}
@@ -216,7 +216,7 @@ setInterval(async () => {
                         </div>
                         <small class="text-secondary">${(b.total_tasks > 0 ? Math.round(b.completed / b.total_tasks * 100) : 0)}% <span class="text-success">(${(b.completed + b.failed > 0 ? Math.round(b.completed / (b.completed + b.failed) * 100) : 0)}%)</span></small>
                     </td>
-                    <td><small class="text-secondary">${esc(b.created_at)}</small></td>
+                    <td><small class="text-secondary">${toCST(b.created_at)}</small></td>
                 </tr>`).join('');
             }
         }

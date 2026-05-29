@@ -218,7 +218,7 @@
                     '</div>' +
                     '<div class="worker-footer">' +
                         '<span><i class="bi bi-clock"></i> ' + fmtDuration(w.uptime) + '</span>' +
-                        '<span><i class="bi bi-activity"></i> ' + escapeHtml(w.last_seen || '-') + '</span>' +
+                        '<span><i class="bi bi-activity"></i> ' + epochToCST(w.last_seen) + '</span>' +
                     '</div>' +
                 '</div>' +
             '</div>' +

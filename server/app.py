@@ -182,6 +182,30 @@ app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
 
 
+def _cst_filter(value):
+    """Jinja 过滤器 `| cst`：把 UTC 时间字符串转中国时间（Asia/Shanghai, UTC+8）显示。
+    服务器存 UTC（系统时区 Etc/UTC），前端统一显示中国时间。"""
+    if not value:
+        return ""
+    try:
+        dt = datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
+        return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return value
+
+
+templates.env.filters["cst"] = _cst_filter
+
+# 中国时间（UTC+8）：用于批次名/导出文件名/定时任务调度判定，与前端展示口径一致。
+# 注意：数据库里存储的 created_at/updated_at 仍是 UTC（系统时区 Etc/UTC），由前端 +8 显示。
+_CN_TZ_OFFSET = timedelta(hours=8)
+
+
+def _cn_now():
+    """当前中国时间（Asia/Shanghai, UTC+8）。仅用于命名与调度判定，不用于 DB 存储。"""
+    return datetime.utcnow() + _CN_TZ_OFFSET
+
+
 # ==================== 后台任务 ====================
 
 async def _timeout_task_loop():
@@ -525,7 +549,7 @@ async def _auto_scrape_scheduler():
         await asyncio.sleep(60)
         try:
             schedules = _runtime_settings.get("auto_scrape_schedules", [])
-            now = datetime.now()
+            now = _cn_now()  # 按中国时间判定「执行时间」，使 18:00 = 中国 18:00
             today = now.strftime("%Y-%m-%d")
             changed = False
 
@@ -848,7 +872,7 @@ async def api_upload(request: Request,
             seen.add(a)
 
     if not batch_name:
-        batch_name = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        batch_name = f"batch_{_cn_now().strftime('%Y%m%d_%H%M%S')}"
 
     # callback_url 校验（防 SSRF + 格式）
     cb_url = (callback_url or "").strip() or None
@@ -962,7 +986,7 @@ async def api_upload_sellers(request: Request,
         raise HTTPException(400, "未识别到任何 seller ID（支持裸 ID、含 me=/seller= 的 URL）")
 
     if not batch_name:
-        batch_name = f"sellers_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        batch_name = f"sellers_{_cn_now().strftime('%Y%m%d_%H%M%S')}"
 
     zc = zip_code or _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
     batch_id, inserted = await db.create_seller_batch(
@@ -1692,7 +1716,7 @@ async def api_export_fields():
 @app.get("/api/export/all")
 async def api_export_all(format: str = "xlsx", change_filter: str = "all", fields: str = None):
     selected = _parse_selected_fields(fields)
-    name = f"all_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    name = f"all_{_cn_now().strftime('%Y%m%d_%H%M%S')}"
     if format == "csv":
         return await _export_csv_streaming(name, batch_id=None, change_filter=change_filter, selected_fields=selected)
     else:
@@ -2067,7 +2091,7 @@ async def api_create_schedule(request: Request,
 
     # 首次创建：last_run_date 设为昨天，确保首次检查时立即触发
     from datetime import timedelta
-    yesterday = (datetime.now() - timedelta(days=interval_days)).strftime("%Y-%m-%d")
+    yesterday = (_cn_now() - timedelta(days=interval_days)).strftime("%Y-%m-%d")
 
     sched = {
         "id": sched_id,
@@ -2162,7 +2186,7 @@ async def api_run_schedule_now(sched_id: str):
     if not asin_list:
         raise HTTPException(400, "ASIN 文件为空或不存在")
 
-    now = datetime.now()
+    now = _cn_now()  # 批次名与 last_run 用中国时间
     batch_name = f"auto_{target.get('name', 'task')}_{now:%Y%m%d_%H%M}"
     zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
     ns = target.get("needs_screenshot", False)

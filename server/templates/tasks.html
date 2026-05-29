@@ -448,7 +448,7 @@ async function showErrors(batchName) {
                         <span class="badge text-bg-secondary">${t.retry_count || 0}</span>
                     </td>
                     <td><small style="color:var(--text-secondary);">${esc(t.worker_id || '-')}</small></td>
-                    <td><small style="color:var(--text-secondary);">${esc(t.updated_at || '')}</small></td>
+                    <td><small style="color:var(--text-secondary);">${toCST(t.updated_at)}</small></td>
                 </tr>`;
             }
             html += '</tbody></table></div>';

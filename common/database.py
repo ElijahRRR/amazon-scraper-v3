@@ -15,6 +15,7 @@ import aiosqlite
 import asyncio
 import logging
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
@@ -300,6 +301,14 @@ class Database:
         # 兼容旧用法：所有现有 `async with self._write_lock:` 计入 caller='other'
         # 热点路径用 `async with self._write_lock("xxx"):` 单独追踪
         self._write_lock = TimedLock()
+        # ============ 读写解耦（2026-05 落地）============
+        # 独立只读连接池：仪表盘/导出等读查询走这里，与 worker 写热路径（self._db）
+        # 物理隔离。WAL 模式下「多读 + 单写」可并发，重读（扫 asin_data / 聚合 113 万
+        # tasks）不再占用写连接的单线程，从根本上消除「读阻塞写」导致的拉取/上传超时。
+        self._read_pool: Optional[asyncio.Queue] = None
+        self._read_conns: List[aiosqlite.Connection] = []
+        self._read_pool_size = 3  # 2GB VPS 上的折中：3 条读连接，私有 cache 各 16MB
+        self._maintenance_task: Optional[asyncio.Task] = None
 
     async def connect(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -319,13 +328,94 @@ class Database:
         await self._db.execute("PRAGMA temp_store=MEMORY")
         # 5) journal_size_limit=64MB：checkpoint 后自动 truncate WAL，回收磁盘
         await self._db.execute("PRAGMA journal_size_limit=67108864")
-        # 6) optimize=0x10002：启动时给查询优化器一次更新统计的机会（轻量，不阻塞）
-        await self._db.execute("PRAGMA optimize=0x10002")
+        # 6) optimize：原先在此同步执行（PRAGMA optimize=0x10002），在 2.4GB 库上会
+        #    阻塞启动 2~3 分钟（ANALYZE 扫全表）。改为端口监听后由 run_startup_optimize()
+        #    异步执行，让服务先就绪、worker 先能拉任务，ANALYZE 在后台慢慢做。
         # =====================================================
         self._db.row_factory = aiosqlite.Row
         await self.init_tables()
+        await self._open_read_pool()
+
+    async def _open_read_pool(self):
+        """打开独立只读连接池（query_only=ON）。每条连接独立后台线程，
+        WAL 下与写连接并发读，互不阻塞。"""
+        self._read_pool = asyncio.Queue()
+        self._read_conns = []
+        for _ in range(self._read_pool_size):
+            rconn = await aiosqlite.connect(self.db_path, isolation_level=None)
+            await rconn.execute("PRAGMA query_only=ON")       # 物理只读，杜绝误写
+            await rconn.execute("PRAGMA busy_timeout=5000")
+            await rconn.execute("PRAGMA cache_size=-16384")   # 私有 cache 16MB/条
+            await rconn.execute("PRAGMA mmap_size=268435456") # 共享文件映射，复用页缓存
+            await rconn.execute("PRAGMA temp_store=MEMORY")
+            rconn.row_factory = aiosqlite.Row
+            self._read_conns.append(rconn)
+            self._read_pool.put_nowait(rconn)
+        logger.info(f"只读连接池就绪：{self._read_pool_size} 条连接")
+
+    @asynccontextmanager
+    async def read(self):
+        """从只读连接池借一条连接（池空时排队等待，形成读侧背压，绝不触碰写连接）。
+        回退：池未初始化时退化到写连接，保证调用方始终可用。"""
+        if self._read_pool is None:
+            yield self._db
+            return
+        conn = await self._read_pool.get()
+        try:
+            yield conn
+        finally:
+            self._read_pool.put_nowait(conn)
+
+    async def run_startup_optimize(self):
+        """启动后异步执行一次 PRAGMA optimize（刷新查询优化器统计）。
+        optimize 本质是写（更新 sqlite_stat1），必须走写连接；用 analysis_limit=400
+        限制每个索引的采样行数，在 2.4GB 库上也是毫秒级，套 _write_lock 短暂持有，
+        不会重演同步执行时 2~3 分钟的冷启动阻塞。"""
+        try:
+            async with self._write_lock("optimize"):
+                await self._db.execute("PRAGMA analysis_limit=400")  # 采样上限，避免全表 ANALYZE
+                await self._db.execute("PRAGMA optimize=0x10002")
+            logger.info("✅ 启动期 optimize 完成（异步，采样上限 400）")
+        except Exception as e:
+            logger.warning(f"启动期 optimize 异常: {e}")
+
+    async def maintenance_loop(self, checkpoint_interval: int = 120):
+        """后台维护协程：定期 WAL checkpoint(TRUNCATE)，防止 WAL 顶到 64MB 上限
+        后 checkpoint 饥饿，同时回收磁盘、缩短下次重启的 WAL recovery 时间。
+        必须在 _write_lock 下执行：否则 checkpoint 语句可能插进别的写事务（BEGIN..
+        COMMIT）中间，因连接持有写事务而无法 checkpoint，永远 busy。"""
+        logger.info(f"🔧 WAL 维护协程启动（每 {checkpoint_interval}s 一次 TRUNCATE checkpoint）")
+        while True:
+            await asyncio.sleep(checkpoint_interval)
+            try:
+                async with self._write_lock("checkpoint"):
+                    res = await self.wal_checkpoint("TRUNCATE")
+                if res and res[0] == 1:
+                    # busy=1：仍有读连接持 WAL 读标记，TRUNCATE 未完全完成，下轮再试
+                    logger.debug(f"WAL checkpoint busy，稍后重试: {res}")
+            except Exception as e:
+                logger.warning(f"WAL 维护协程异常: {e}")
+
+    def start_maintenance(self, checkpoint_interval: int = 120):
+        """由 lifespan 调用：拉起后台维护协程（幂等）。"""
+        if self._maintenance_task is None or self._maintenance_task.done():
+            self._maintenance_task = asyncio.create_task(
+                self.maintenance_loop(checkpoint_interval))
 
     async def close(self):
+        if self._maintenance_task and not self._maintenance_task.done():
+            self._maintenance_task.cancel()
+            try:
+                await self._maintenance_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for rconn in self._read_conns:
+            try:
+                await rconn.close()
+            except Exception:
+                pass
+        self._read_conns = []
+        self._read_pool = None
         if self._db:
             await self._db.close()
             self._db = None
@@ -474,6 +564,9 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority DESC);
             CREATE INDEX IF NOT EXISTS idx_tasks_status_worker ON tasks(status, worker_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at);
+            -- 覆盖索引：让 get_batches 的「按 batch 分组 + 统计各 status」走 index-only，
+            -- 不再为 113 万行逐行回表读 status（仪表盘 /api/batches 每几秒轮询一次）。
+            CREATE INDEX IF NOT EXISTS idx_tasks_batch_status ON tasks(batch_id, status);
 
             -- 截图任务表（独立追踪，可靠重试）
             CREATE TABLE IF NOT EXISTS screenshots (
@@ -728,12 +821,12 @@ class Database:
             GROUP BY b.id
             ORDER BY b.id DESC
         """
-        async with self._db.execute(sql) as c:
+        async with self.read() as rc, rc.execute(sql) as c:
             rows = await c.fetchall()
             return [dict(r) for r in rows]
 
     async def get_batch_by_name(self, name: str) -> Optional[Dict]:
-        async with self._db.execute("SELECT * FROM batches WHERE name = ?", (name,)) as c:
+        async with self.read() as rc, rc.execute("SELECT * FROM batches WHERE name = ?", (name,)) as c:
             row = await c.fetchone()
             return dict(row) if row else None
 
@@ -744,26 +837,27 @@ class Database:
 
         完成判定：所有 task ∈ {done, failed} AND 所有 screenshot ∈ {done, failed}
         """
-        async with self._db.execute(
-            """SELECT
-                   SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
-                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-                   SUM(CASE WHEN status NOT IN ('done','failed') THEN 1 ELSE 0 END) AS open_,
-                   COUNT(*) AS total
-               FROM tasks WHERE batch_id=?""",
-            (batch_id,)
-        ) as c:
-            t = await c.fetchone()
-        async with self._db.execute(
-            """SELECT
-                   SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
-                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
-                   SUM(CASE WHEN status NOT IN ('done','failed') THEN 1 ELSE 0 END) AS open_,
-                   COUNT(*) AS total
-               FROM screenshots WHERE batch_id=?""",
-            (batch_id,)
-        ) as c:
-            s = await c.fetchone()
+        async with self.read() as rc:
+            async with rc.execute(
+                """SELECT
+                       SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
+                       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                       SUM(CASE WHEN status NOT IN ('done','failed') THEN 1 ELSE 0 END) AS open_,
+                       COUNT(*) AS total
+                   FROM tasks WHERE batch_id=?""",
+                (batch_id,)
+            ) as c:
+                t = await c.fetchone()
+            async with rc.execute(
+                """SELECT
+                       SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
+                       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                       SUM(CASE WHEN status NOT IN ('done','failed') THEN 1 ELSE 0 END) AS open_,
+                       COUNT(*) AS total
+                   FROM screenshots WHERE batch_id=?""",
+                (batch_id,)
+            ) as c:
+                s = await c.fetchone()
 
         t_done = (t["done"] or 0) if t else 0
         t_failed = (t["failed"] or 0) if t else 0
@@ -1258,7 +1352,7 @@ class Database:
             params = ()
 
         stats = {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0}
-        async with self._db.execute(sql, params) as c:
+        async with self.read() as rc, rc.execute(sql, params) as c:
             async for row in c:
                 stats[row["status"]] = row["cnt"]
         stats["total"] = sum(stats[k] for k in ["pending", "processing", "done", "failed"])
@@ -1882,7 +1976,7 @@ class Database:
                 params.append(batch_filter)
             sql += " ORDER BY updated_at DESC, id DESC"
 
-            async with self._db.execute(sql, params) as c:
+            async with self.read() as rc, rc.execute(sql, params) as c:
                 rows = await c.fetchall()
 
             for row in rows:
@@ -2034,7 +2128,7 @@ class Database:
         """
         params.append(limit + 1)  # 多取一条判断 has_more
 
-        async with self._db.execute(sql, params) as c:
+        async with self.read() as rc, rc.execute(sql, params) as c:
             rows = await c.fetchall()
 
         items = [dict(r) for r in rows]
@@ -2057,7 +2151,7 @@ class Database:
             count_where = " AND ".join(count_where_parts) if count_where_parts else "1=1"
 
         count_sql = f"SELECT COUNT(*) FROM asin_data d {count_join_clause} WHERE {count_where}"
-        async with self._db.execute(count_sql, count_params) as c:
+        async with self.read() as rc, rc.execute(count_sql, count_params) as c:
             total = (await c.fetchone())[0]
 
         next_cursor = items[-1]["id"] if items else None
@@ -2072,17 +2166,18 @@ class Database:
         }
 
     async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
-        async with self._db.execute("SELECT * FROM asin_data WHERE asin = ?", (asin,)) as c:
+        # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁
+        async with self.read() as rc, rc.execute("SELECT * FROM asin_data WHERE asin = ?", (asin,)) as c:
             row = await c.fetchone()
-            if not row:
-                return None
-            item = dict(row)
-            await self._hydrate_screenshot_paths([item])
-            return item
+        if not row:
+            return None
+        item = dict(row)
+        await self._hydrate_screenshot_paths([item])
+        return item
 
     async def get_asin_changes(self, asin: str) -> List[Dict]:
         """获取 ASIN 的变动历史"""
-        async with self._db.execute(
+        async with self.read() as rc, rc.execute(
             "SELECT * FROM asin_changes WHERE asin = ? ORDER BY id DESC", (asin,)
         ) as c:
             return [dict(r) for r in await c.fetchall()]
@@ -2144,47 +2239,50 @@ class Database:
 
     async def iter_results(self, batch_id: int = None, change_filter: str = "all",
                            batch_size: int = 500):
-        """流式迭代结果（keyset 分页，支持 batch_id + change_filter）"""
+        """流式迭代结果（keyset 分页，支持 batch_id + change_filter）。
+        整个导出（可能数千次 LIMIT 查询、持续数分钟）借用同一条只读连接，
+        全程不触碰写连接，导出再大也不会拖慢 worker 拉取/上传。"""
         last_id = 0
-        while True:
-            joins = []
-            join_params: list = []
-            where = ["d.id > ?"]
-            where_params: list = [last_id]
+        async with self.read() as rc:
+            while True:
+                joins = []
+                join_params: list = []
+                where = ["d.id > ?"]
+                where_params: list = [last_id]
 
-            if batch_id:
-                joins.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
-                join_params.append(batch_id)
-
-            if change_filter == "price_stock":
-                sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='price_stock'"
                 if batch_id:
-                    sub += " AND batch_id=?"
+                    joins.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
                     join_params.append(batch_id)
-                sub += ") ac ON ac.asin = d.asin"
-                joins.append(sub)
-            elif change_filter == "title_bullets":
-                sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='title_bullets'"
-                if batch_id:
-                    sub += " AND batch_id=?"
-                    join_params.append(batch_id)
-                sub += ") ac ON ac.asin = d.asin"
-                joins.append(sub)
-            elif change_filter == "new":
-                if batch_id:
-                    joins.append("JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1")
-                    join_params.append(batch_id)
-                else:
-                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='new') ac ON ac.asin = d.asin")
 
-            join_clause = " ".join(joins)
-            where_clause = " AND ".join(where)
-            params = join_params + where_params + [batch_size]
+                if change_filter == "price_stock":
+                    sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='price_stock'"
+                    if batch_id:
+                        sub += " AND batch_id=?"
+                        join_params.append(batch_id)
+                    sub += ") ac ON ac.asin = d.asin"
+                    joins.append(sub)
+                elif change_filter == "title_bullets":
+                    sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='title_bullets'"
+                    if batch_id:
+                        sub += " AND batch_id=?"
+                        join_params.append(batch_id)
+                    sub += ") ac ON ac.asin = d.asin"
+                    joins.append(sub)
+                elif change_filter == "new":
+                    if batch_id:
+                        joins.append("JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1")
+                        join_params.append(batch_id)
+                    else:
+                        joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type='new') ac ON ac.asin = d.asin")
 
-            sql = f"SELECT d.* FROM asin_data d {join_clause} WHERE {where_clause} ORDER BY d.id ASC LIMIT ?"
+                join_clause = " ".join(joins)
+                where_clause = " AND ".join(where)
+                params = join_params + where_params + [batch_size]
 
-            async with self._db.execute(sql, params) as c:
-                rows = await c.fetchall()
+                sql = f"SELECT d.* FROM asin_data d {join_clause} WHERE {where_clause} ORDER BY d.id ASC LIMIT ?"
+
+                async with rc.execute(sql, params) as c:
+                    rows = await c.fetchall()
                 if not rows:
                     break
                 for row in rows:
@@ -2195,13 +2293,13 @@ class Database:
     # ==================== 统计 ====================
 
     async def get_total_asins(self) -> int:
-        async with self._db.execute("SELECT COUNT(*) FROM asin_data") as c:
+        async with self.read() as rc, rc.execute("SELECT COUNT(*) FROM asin_data") as c:
             return (await c.fetchone())[0]
 
     async def get_all_asins(self) -> List[str]:
         """获取所有已知 ASIN（用于自动采集）"""
         result = []
-        async with self._db.execute("SELECT asin FROM asin_data ORDER BY id") as c:
+        async with self.read() as rc, rc.execute("SELECT asin FROM asin_data ORDER BY id") as c:
             async for row in c:
                 result.append(row["asin"])
         return result
@@ -2213,7 +2311,7 @@ class Database:
 
         stats = {}
         sql = f"SELECT change_type, COUNT(DISTINCT asin) as cnt FROM asin_changes {batch_filter} GROUP BY change_type"
-        async with self._db.execute(sql, params) as c:
+        async with self.read() as rc, rc.execute(sql, params) as c:
             async for row in c:
                 stats[row["change_type"]] = row["cnt"]
         return stats

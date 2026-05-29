@@ -166,6 +166,11 @@ async def lifespan(app):
     asyncio.create_task(_auto_scrape_scheduler())
     asyncio.create_task(_completion_watcher())
     asyncio.create_task(_callback_dispatcher())
+    # 后台 WAL 维护（每 120s TRUNCATE checkpoint，防 WAL 顶 64MB checkpoint 饥饿）
+    db.start_maintenance(checkpoint_interval=120)
+    # 启动期 optimize 改为异步：服务先就绪、worker 先能拉任务，ANALYZE 后台慢慢做
+    # （此前同步执行在 2.4GB 库上会阻塞启动 2~3 分钟）
+    asyncio.create_task(db.run_startup_optimize())
     yield
     if db:
         await db.close()
@@ -1215,20 +1220,21 @@ async def api_batch_errors(batch_name: str):
     if not batch:
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
-    async with db._db.execute(
-        "SELECT error_type, COUNT(*) as cnt FROM tasks "
-        "WHERE batch_id=? AND status='failed' "
-        "GROUP BY error_type ORDER BY cnt DESC",
-        (batch_id,)
-    ) as c:
-        error_summary = [dict(r) for r in await c.fetchall()]
-    async with db._db.execute(
-        "SELECT asin, error_type, error_detail, retry_count, worker_id, updated_at "
-        "FROM tasks WHERE batch_id=? AND status='failed' "
-        "ORDER BY updated_at DESC LIMIT 200",
-        (batch_id,)
-    ) as c:
-        failed_tasks = [dict(r) for r in await c.fetchall()]
+    async with db.read() as rc:
+        async with rc.execute(
+            "SELECT error_type, COUNT(*) as cnt FROM tasks "
+            "WHERE batch_id=? AND status='failed' "
+            "GROUP BY error_type ORDER BY cnt DESC",
+            (batch_id,)
+        ) as c:
+            error_summary = [dict(r) for r in await c.fetchall()]
+        async with rc.execute(
+            "SELECT asin, error_type, error_detail, retry_count, worker_id, updated_at "
+            "FROM tasks WHERE batch_id=? AND status='failed' "
+            "ORDER BY updated_at DESC LIMIT 200",
+            (batch_id,)
+        ) as c:
+            failed_tasks = [dict(r) for r in await c.fetchall()]
     return {"error_summary": error_summary, "failed_tasks": failed_tasks}
 
 

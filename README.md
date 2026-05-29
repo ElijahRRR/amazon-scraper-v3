@@ -8,7 +8,7 @@
 Server (FastAPI, 1C/2GB 即可)        Worker (可部署多台)
   - Web 管理界面                       - curl_cffi TLS 指纹模拟
   - 任务分发 & 结果收集                 - AIMD 自适应并发控制
-  - SQLite (WAL + FTS5)               - Session 热备轮换
+  - SQLite (WAL/FTS5, 读写分离连接池)   - Session 热备轮换
   - 定时任务调度                        - Playwright 截图 (可选)
   - 全局并发配额协调                     - lease_epoch 防重复
   - Webhook 完成回调                    - variant_offset 检测
@@ -325,9 +325,15 @@ NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
 - 不本地重试，不 rotate session（避免打爆隧道 5 QPS）
 - 直接上报失败，让 server 调度其他 worker / 其他时间重试
 
-### SQLite 性能优化
+### SQLite 性能优化 + 读写解耦
 
-`common/database.py` 在 `connect()` 应用了一组 PRAGMA：
+**连接模型：写连接（worker 热路径）与只读连接池（仪表盘 / 导出）物理隔离。**
+全服曾共用单个 aiosqlite 连接，读写挤在同一后台线程：管理后台一开导出（扫 1GB+ asin_data）
+或聚合查询（百万行 tasks），写操作 `pull_tasks` / `accept_results_batch` 就在 `BEGIN IMMEDIATE`
+处排队，持锁飙到几十秒~数分钟，触发 worker 的 10s 拉取 / 8s 提交超时（「拉取任务异常 / 批量提交异常」）。
+WAL 模式天然支持「多读 + 单写」并发，故把重读全部移到独立只读连接池，写连接只服务 worker，根治此类 stall。
+
+**写连接 PRAGMA**（`connect()`）：
 
 ```python
 PRAGMA journal_mode=WAL              # WAL 模式（并发读写）
@@ -337,13 +343,24 @@ PRAGMA mmap_size=268435456           # 256MB mmap
 PRAGMA temp_store=MEMORY             # 临时表入内存
 PRAGMA wal_autocheckpoint=1000       # 自动 checkpoint
 PRAGMA journal_size_limit=67108864   # WAL 上限 64MB
-PRAGMA optimize=0x10002              # 启动刷新优化器统计
+# 注：optimize 不再在 connect() 同步执行——2.4GB 库上 ANALYZE 会阻塞启动 2~3 分钟。
+#     改由 run_startup_optimize() 在端口监听后异步执行（analysis_limit=400 采样，~毫秒级），
+#     冷启动 ~150s → ~10s。
 ```
 
-**按需 TRUNCATE checkpoint**（`_timeout_task_loop`）：
-- 默认 PASSIVE（不阻塞 writer）
-- 仅当 WAL > 128MB 时主动 TRUNCATE
-- 消除固定周期 TRUNCATE 引起的 commit 抖动（实测 max hold 407ms → 231ms）
+**只读连接池**（`_open_read_pool()`，默认 3 条）：
+- 每条 `PRAGMA query_only=ON`，独立后台线程，私有 cache 16MB
+- `read()` 上下文管理器借还连接，池空排队（读侧背压，绝不触碰写连接）
+- 路由的读：`get_batches` / `get_progress` / `get_results` / `iter_results`(导出) / `get_change_stats` / `get_batch_completion_status` / 批次错误详情
+
+**覆盖索引** `idx_tasks(batch_id, status)`：
+- `get_batches` 的「按 batch 统计各 status」走 **index-only**，不再为百万行逐行回表读 status
+
+**后台 WAL 维护**（`maintenance_loop`，每 120s）：
+- 在 `_write_lock` 下做 **TRUNCATE** checkpoint —— `journal_size_limit=64MB` 会把 WAL 封顶在 64MB，
+  使旧的「WAL>128MB 才 TRUNCATE」分支永不触发、PASSIVE 又在负载下完不成 → WAL 长期卡 64MB、
+  checkpoint 饥饿。无条件 120s TRUNCATE 补此洞，同时缩短重启时的 WAL recovery
+- （`_timeout_task_loop` 仍保留 5 分钟 PASSIVE 作为兜底）
 
 ### FTS5 全文搜索
 
@@ -513,8 +530,17 @@ curl http://<SERVER>:8899/api/batches/<batch_name>/status | python3 -m json.tool
 | 30k ASIN 跑完总时长 | ~9 分钟 |
 | `/api/results` 搜索（10 万行）| 5-50 ms |
 | `/api/batches` 仪表盘加载 | 35-100 ms |
-| 数据库主表 | ~2.4 GB / 10 万 ASIN |
-| FTS5 索引开销 | ~20 MB / 10 万 ASIN |
+| 数据库主表 | ~1.8 GB / 29 万 ASIN（VACUUM 后）|
+| FTS5 索引开销 | ~90 MB / 29 万 ASIN |
+
+**读写解耦前后**（导出风暴下：3 路全量 CSV 导出 + 仪表盘轮询并发打）：
+
+| 指标 | 解耦前 | 解耦后 |
+|---|---:|---:|
+| `pull_tasks` 持锁 max | **288,000 ms** | **272 ms** |
+| `pull_tasks` 等锁 max | **259,000 ms** | **963 ms** |
+| 8899 并发连接堆积 | 42-43 | 4 |
+| 冷启动耗时（2.4GB 库）| ~150 s | ~10 s |
 
 ## License
 

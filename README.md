@@ -101,11 +101,13 @@ systemctl enable --now amazon-scraper-v3.service
 
 - 支持格式：`.xlsx` / `.csv` / `.txt`
 - 自动提取 `B[0-9A-Z]{9}` 格式的 ASIN 并去重
-- 可选：指定批次名、邮编、是否截图
+- 可选：指定批次名、邮编、是否截图、**是否自动采集多属性变体**
+- **🔗 自动采集多属性变体**（开关，默认关）：开启后，采完上传的 ASIN 会把它们的同款全部变体（不同颜色/尺寸等）也采进【同一批次】，详见「多属性变体提取 + 自动展开」
 - **per-ASIN 邮编**：xlsx 的 B 列填 5 位邮编可为单个 ASIN 指定邮编（同一 batch 内不同邮编自动切换 session）
 - **API 调用**：可直接 `POST /api/upload`（multipart），支持以下额外字段：
   - `external_id`：调用方自己的批次 ID，原样回传，便于追踪
   - `callback_url`：采集完成时 POST 到此地址通知（详见下方 Webhook）
+  - `expand_variants`：`true`/`false`，是否自动展开变体（同上方开关）
 
 ### 采集结果
 
@@ -130,7 +132,8 @@ systemctl enable --now amazon-scraper-v3.service
 - 字段：全选 / 仅价格库存 / 自定义勾选
 - 范围：当前选中的批次 + 变动筛选条件
 - 支持流式导出，百万级数据不 OOM
-- 导出列：ASIN → 链接 → 标题 → 品牌 → 评分 → 评论数 → 卖家店铺 → 价格 → 库存 → 配送 → 描述 → 类目 → 尺寸 → 制造商 → 排名 → 站点 → 时间
+- 导出列含 **变体属性**（`color_name=X; size_name=Y`）/ 父体 ASIN / 变体 ASIN 列表；
+  原 **EAN 列已下线**（amazon.com 实测 100% 为空），其槽位由「变体属性」顶上
 
 ### 定时自动采集
 
@@ -324,6 +327,32 @@ NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
 **worker 处理策略**：
 - 不本地重试，不 rotate session（避免打爆隧道 5 QPS）
 - 直接上报失败，让 server 调度其他 worker / 其他时间重试
+
+### 多属性变体提取 + 自动展开
+
+**变体属性提取**（worker/parser.py `_parse_twister`）：单次请求的商品页内嵌 Amazon twister
+变体矩阵，无需逐个子体请求即可拿到全家族。
+- `dimensionValuesDisplayData`（子 ASIN → 各维度值）+ `dimensions`（有序维度名，如
+  `["color_name","size_name"]`）→ 本 ASIN 写入 `variant_attributes`，格式
+  `color_name=Red; size_name=L`（沿用全库「分隔字符串」风格，无 JSON；维度任意：
+  color/size/style/flavor… 一列吃下，不加稀疏列）
+- `variation_asins` 由 twister 的真实家族键生成（精确同族）；取不到时回退旧的全页正则
+- 注：`ean_list` 已逻辑下线（amazon.com 实测 100% 空），导出槽位让位给「变体属性」
+
+**自动展开**（batch 级 opt-in，`expand_variants`）：把同款全部变体补齐进【同一批次】。
+- **触发时机**：批次本轮**全部终态后**（completion watcher），不是每条结果实时 →
+  上传 1 文件 = 1 批次 = 1 导出，**不裂变成多个批次/文件**，只是行数变多（补齐家族）
+- **流程**：轮1 采上传 ASIN → 读其 `variation_asins` → 入队同族进同批 → 轮2 采变体 →
+  无新增即完成。**正常 2 轮收敛**（同族每个成员都列同一家族，轮2 发现的都已在批内）
+- **去重防循环**：`tasks` 表 `UNIQUE(batch_id, asin)` + `INSERT OR IGNORE`，每个
+  `(batch, asin)` 至多一行 → 数学上保证收敛、绝不死循环（即便家族列表不一致也只多 1 轮）
+- **安全阀**（`config.VARIANT_EXPAND_FAMILY_CAP`，默认 10）：单个产品候选同族 > 上限
+  视为巨型/定制类家族（如定制尺寸围栏网，单族可达 2500），**跳过该产品展开 + 打 WARNING**，
+  防止一个种子炸成几千任务；正常小家族（≤上限）照常展开
+- **存储仍为 UTC / 全库口径不变**；非变体产品 `variant_attributes` 为空，不造假数据
+
+> 注意：变体属性依赖 worker 的 twister 解析，**所有 worker 机器都需更新代码**才能产出
+> 干净的同族数据（否则旧正则会混入广告/相关推荐 ASIN）。
 
 ### SQLite 性能优化 + 读写解耦
 

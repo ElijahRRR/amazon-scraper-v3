@@ -369,7 +369,22 @@ async def _completion_watcher():
                     snap = await db.get_batch_completion_status(bid)
                     if not snap["all_terminal"]:
                         continue
-                    # 全部终态 → 状态机转移（幂等）
+                    # 变体自动展开（仅 expand_variants 批次）：本轮全部终态后，把已采 ASIN
+                    # 的同族变体入队【同一批次】继续采。新增 >0 则本批未真正完成，下轮再查。
+                    added = await db.expand_batch_variants(bid)
+                    if added > 0:
+                        rnd = _expand_rounds.get(bid, 0) + 1
+                        _expand_rounds[bid] = rnd
+                        if rnd >= 2:
+                            logger.warning(
+                                f"🧬 批次 {bid} 变体展开第 {rnd} 轮仍新增 {added} 个任务："
+                                f"家族列表可能不一致，请留意（去重保证仍会收敛）")
+                        else:
+                            logger.info(f"🧬 批次 {bid} 变体展开：新增 {added} 个同族任务，继续采集")
+                        _completion_check_set.add(bid)  # 等这轮采完再复查
+                        continue
+                    _expand_rounds.pop(bid, None)
+                    # 全部终态且无新变体 → 状态机转移（幂等）
                     changed = await db.mark_batch_completed(bid)
                     if changed:
                         logger.info(f"✅ 批次 {bid} 已完成，入队回调")
@@ -701,6 +716,10 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB 上限，防止 2GB 内存 VPS OOM
 # - 由 accept_results_batch 在写入结果后 add(batch_id) （O(1)、不阻塞）
 # - 由 _completion_watcher 协程消费
 _completion_check_set: Set[int] = set()
+# 变体自动展开：记录每个批次已展开的轮次。正常 2 轮收敛（轮1=上传，轮2=变体）；
+# 若第 2 次展开仍新增（=采集第 3 轮）则打 WARNING（家族列表不一致信号），但靠
+# UNIQUE(batch_id,asin) 去重仍保证收敛、不死循环。批次完成后清理。
+_expand_rounds: Dict[int, int] = {}
 # 待发送的 callback 内存队列：
 # - _completion_watcher 把刚标记 completed 的 batch_id 入队
 # - _timeout_task_loop 兜底从 DB 扫描入队（处理重启 / 实时漏掉的）
@@ -788,7 +807,8 @@ async def api_upload(request: Request,
                      zip_code: str = Form(None),
                      needs_screenshot: bool = Form(False),
                      callback_url: str = Form(None),
-                     external_id: str = Form(None)):
+                     external_id: str = Form(None),
+                     expand_variants: bool = Form(False)):
     """上传 ASIN 文件创建批次。
 
     支持 xlsx / csv / txt 三种格式：
@@ -887,6 +907,7 @@ async def api_upload(request: Request,
     batch_id = await db.create_batch(
         batch_name, needs_screenshot,
         external_id=ext_id, callback_url=cb_url,
+        expand_variants=expand_variants,
     )
     inserted = await db.create_tasks(
         batch_id, unique_asins, zc, needs_screenshot,

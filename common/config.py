@@ -44,6 +44,10 @@ MAX_RETRIES = 3
 TASK_TIMEOUT_MINUTES = 10  # 硬超时兜底（liveness safety net），主回收靠心跳感知
 SESSION_ROTATE_EVERY = 1000
 
+# 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
+# （如定制尺寸围栏网，单族可达数千），跳过该产品的自动展开，防止一个种子炸成几千任务。
+VARIANT_EXPAND_FAMILY_CAP = 10
+
 # 令牌桶限流
 TOKEN_BUCKET_RATE = 64.0
 
@@ -173,6 +177,7 @@ HEADER_MAP = {
     "package_weight": "包装重量",
     "item_dimensions": "商品本体尺寸",
     "item_weight": "商品本体重量",
+    "variant_attributes": "变体属性",
     "parent_asin": "父体 ASIN",
     "variation_asins": "变体 ASIN 列表",
     "root_category_id": "根类目 ID",

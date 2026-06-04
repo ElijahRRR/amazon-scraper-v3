@@ -54,6 +54,7 @@ class AsinData:
     long_description: str = ""
     upc_list: str = ""
     ean_list: str = ""
+    variant_attributes: str = ""
     parent_asin: str = ""
     variation_asins: str = ""
     root_category_id: str = ""
@@ -112,5 +113,7 @@ CHANGE_TYPE_TITLE_BULLETS = "title_bullets"
 CHANGE_TYPE_NEW = "new"
 
 # 导出可选字段（排除内部字段，加虚拟字段 total_price）
-_INTERNAL_FIELDS = {"id", "content_hash", "title_bullets_hash", "created_at", "updated_at", "screenshot_path"}
+# ean_list 已逻辑下线（amazon.com 基本不暴露 EAN，实测 100% 为空）：不再导出，
+# 其槽位由 variant_attributes（变体属性）顶上；DB 物理列保留不动。
+_INTERNAL_FIELDS = {"id", "content_hash", "title_bullets_hash", "created_at", "updated_at", "screenshot_path", "ean_list"}
 EXPORTABLE_FIELDS = [f.name for f in __import__("dataclasses").fields(AsinData) if f.name not in _INTERNAL_FIELDS] + ["total_price"]

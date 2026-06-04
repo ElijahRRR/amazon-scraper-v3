@@ -281,7 +281,8 @@ ASIN_DATA_FIELDS = [
     "original_price", "current_price", "buybox_price", "buybox_shipping",
     "is_fba", "stock_count", "stock_status", "delivery_date", "delivery_time",
     "image_urls", "bullet_points", "long_description", "upc_list", "ean_list",
-    "parent_asin", "variation_asins", "root_category_id", "category_ids",
+    "parent_asin", "variation_asins", "variant_attributes",
+    "root_category_id", "category_ids",
     "category_tree", "first_available_date", "package_dimensions",
     "package_weight", "item_dimensions", "item_weight", "product_url",
     "site", "zip_code", "crawl_time", "screenshot_path",
@@ -442,6 +443,7 @@ class Database:
                 name TEXT NOT NULL UNIQUE,
                 needs_screenshot BOOLEAN DEFAULT 0,
                 is_auto BOOLEAN DEFAULT 0,
+                expand_variants BOOLEAN DEFAULT 0,    -- 变体自动展开开关
                 -- 状态机：running / completed / failed
                 status TEXT DEFAULT 'running',
                 completed_at TIMESTAMP,
@@ -496,6 +498,7 @@ class Database:
                 ean_list TEXT,
                 parent_asin TEXT,
                 variation_asins TEXT,
+                variant_attributes TEXT,
                 root_category_id TEXT,
                 category_ids TEXT,
                 category_tree TEXT,
@@ -624,8 +627,8 @@ class Database:
         except Exception:
             pass
 
-        # 迁移：batches 表添加 is_auto
-        for col, default in [("is_auto", "0")]:
+        # 迁移：batches 表添加 is_auto / expand_variants（变体自动展开开关）
+        for col, default in [("is_auto", "0"), ("expand_variants", "0")]:
             try:
                 await self._db.execute(f"ALTER TABLE batches ADD COLUMN {col} BOOLEAN DEFAULT {default}")
                 logger.info(f"数据库迁移: batches 表新增 {col} 列")
@@ -662,6 +665,15 @@ class Database:
         # 迁移：asin_data 表添加 baseline 字段
         for col in ["baseline_price", "baseline_buybox_price", "baseline_stock_count",
                      "baseline_stock_status", "baseline_title_bullets_hash", "baseline_updated_at"]:
+            try:
+                await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
+                logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
+            except Exception:
+                pass
+
+        # 迁移：asin_data 表添加变体属性字段（多属性产品：本 ASIN 自己的属性值，
+        # 形如 "color_name=Red; size_name=L"；非变体产品为空）
+        for col in ["variant_attributes"]:
             try:
                 await self._db.execute(f"ALTER TABLE asin_data ADD COLUMN {col} TEXT")
                 logger.info(f"数据库迁移: asin_data 表新增 {col} 列")
@@ -785,11 +797,14 @@ class Database:
     async def create_batch(self, name: str, needs_screenshot: bool = False,
                            is_auto: bool = False,
                            external_id: Optional[str] = None,
-                           callback_url: Optional[str] = None) -> int:
+                           callback_url: Optional[str] = None,
+                           expand_variants: bool = False) -> int:
         """创建批次，返回 batch_id。
 
         external_id: 调用方自己的批次 ID（原样回传，便于追踪）。
         callback_url: 采集完成时 POST 通知到此 URL。空表示不通知。
+        expand_variants: 开启后，本批第一轮采完会把已采 ASIN 的同族变体（variation_asins）
+            自动入队进【同一批次】继续采，直到无新增（正常 2 轮收敛）。默认关。
         """
         callback_status = "pending" if callback_url else None
         async with self._write_lock:
@@ -797,10 +812,11 @@ class Database:
             await self._db.execute(
                 "INSERT OR IGNORE INTO batches "
                 "(name, needs_screenshot, is_auto, status, external_id, "
-                " callback_url, callback_status) "
-                "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+                " callback_url, callback_status, expand_variants) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
                 (name, 1 if needs_screenshot else 0, 1 if is_auto else 0,
-                 external_id, callback_url, callback_status)
+                 external_id, callback_url, callback_status,
+                 1 if expand_variants else 0)
             )
             await self._db.execute("COMMIT")
             async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name,)) as c:
@@ -829,6 +845,66 @@ class Database:
         async with self.read() as rc, rc.execute("SELECT * FROM batches WHERE name = ?", (name,)) as c:
             row = await c.fetchone()
             return dict(row) if row else None
+
+    async def expand_batch_variants(self, batch_id: int) -> int:
+        """变体自动展开：把本批【已采 ASIN 的同族变体】（variation_asins）入队进【同一批次】。
+
+        仅对开启 expand_variants 的批次生效；其余返回 0。
+        去重：只入队不在本批 batch_asins 里的 ASIN；底层 create_tasks 用
+        INSERT OR IGNORE(UNIQUE(batch_id,asin)) 再兜一层 → 数学上保证收敛、绝不死循环。
+        返回本次实际新增的任务数（0 = 没有新变体，批次可真正完成）。
+        正常调用时机：批次本轮全部终态后（completion watcher）。
+        """
+        async with self.read() as rc:
+            async with rc.execute(
+                "SELECT needs_screenshot, expand_variants FROM batches WHERE id=?",
+                (batch_id,)
+            ) as c:
+                brow = await c.fetchone()
+            if not brow or not brow["expand_variants"]:
+                return 0
+            ss = bool(brow["needs_screenshot"])
+            # 继承本批已有任务的 zip（同族应同邮编）
+            async with rc.execute(
+                "SELECT zip_code FROM tasks WHERE batch_id=? LIMIT 1", (batch_id,)
+            ) as c:
+                zrow = await c.fetchone()
+            zip_code = (zrow["zip_code"] if zrow else None) or config.DEFAULT_ZIP_CODE
+            # 本批已采 ASIN 的同族列表（twister 洗干净的真家族）
+            async with rc.execute(
+                "SELECT d.variation_asins FROM asin_data d "
+                "JOIN batch_asins ba ON ba.asin = d.asin "
+                "WHERE ba.batch_id=? AND d.variation_asins IS NOT NULL AND d.variation_asins != ''",
+                (batch_id,)
+            ) as c:
+                fam_rows = await c.fetchall()
+            # 本批已有 ASIN（去重基准）
+            async with rc.execute(
+                "SELECT asin FROM batch_asins WHERE batch_id=?", (batch_id,)
+            ) as c:
+                existing = {r["asin"].upper() for r in await c.fetchall()}
+
+        # 安全阀：按【单个产品家族】计数。某产品的候选同族变体数超过上限，
+        # 视为巨型/定制类家族（如定制尺寸产品，单族可达数千），跳过该产品的展开，
+        # 防止一个种子炸成几千任务。正常小家族（≤上限）照常展开。
+        cap = config.VARIANT_EXPAND_FAMILY_CAP
+        candidates = set()
+        skipped_big = 0
+        for r in fam_rows:
+            sibs = [a.strip() for a in (r["variation_asins"] or "").split(",")
+                    if a.strip() and a.strip().upper() not in existing]
+            if len(sibs) > cap:
+                skipped_big += 1
+                continue  # 超大家族：跳过，不入队
+            candidates.update(sibs)
+        if skipped_big:
+            logger.warning(
+                f"批次 {batch_id}: 跳过 {skipped_big} 个超大变体家族（单族新增 >{cap}，"
+                f"疑似定制/巨型 listing），不自动展开")
+        if not candidates:
+            return 0
+        # 复用 create_tasks：INSERT OR IGNORE tasks + 维护 batch_asins + 截图任务，返回实际新增数
+        return await self.create_tasks(batch_id, sorted(candidates), zip_code, ss)
 
     # ==================== 批次完成检测 + 回调 ====================
 

@@ -183,18 +183,16 @@ class AmazonParser:
         css_imgs = self._slx_parse_images(tree, html_text)
         result["image_urls"] = css_imgs if css_imgs else jsonld.get("image_urls", "")
 
-        # UPC / EAN（合并 JSON-LD 的 gtin13）
+        # UPC（EAN 已下线：amazon.com 基本不暴露，实测 100% 空，保留空值且不导出）
         result["upc_list"] = self._slx_parse_upc(tree, html_text, page_details)
-        css_ean = self._parse_ean(html_text)
-        jsonld_ean = jsonld.get("ean_list", "")
-        if css_ean and jsonld_ean and jsonld_ean not in css_ean:
-            result["ean_list"] = f"{css_ean},{jsonld_ean}"
-        else:
-            result["ean_list"] = css_ean or jsonld_ean
+        result["ean_list"] = ""
 
-        # 父体 ASIN / 变体
+        # 父体 ASIN / 变体（twister：本 ASIN 自己的属性 + 精确同族列表）
         result["parent_asin"] = self._parse_parent_asin(html_text, asin)
-        result["variation_asins"] = self._parse_variation_asins(html_text, asin, result["parent_asin"])
+        attrs, family = self._parse_twister(html_text, asin)
+        result["variant_attributes"] = attrs
+        result["variation_asins"] = family if family is not None \
+            else self._parse_variation_asins(html_text, asin, result["parent_asin"])
 
         # 类目
         result["root_category_id"], result["category_ids"], result["category_tree"] = \
@@ -890,18 +888,16 @@ class AmazonParser:
         css_imgs = self._parse_images(tree, html_text)
         result["image_urls"] = css_imgs if css_imgs else jsonld.get("image_urls", "")
 
-        # UPC / EAN（合并 JSON-LD 的 gtin13）
+        # UPC（EAN 已下线：amazon.com 基本不暴露，实测 100% 空，保留空值且不导出）
         result["upc_list"] = self._parse_upc(tree, html_text, page_details)
-        css_ean = self._parse_ean(html_text)
-        jsonld_ean = jsonld.get("ean_list", "")
-        if css_ean and jsonld_ean and jsonld_ean not in css_ean:
-            result["ean_list"] = f"{css_ean},{jsonld_ean}"
-        else:
-            result["ean_list"] = css_ean or jsonld_ean
+        result["ean_list"] = ""
 
-        # 父体 ASIN / 变体
+        # 父体 ASIN / 变体（twister：本 ASIN 自己的属性 + 精确同族列表）
         result["parent_asin"] = self._parse_parent_asin(html_text, asin)
-        result["variation_asins"] = self._parse_variation_asins(html_text, asin, result["parent_asin"])
+        attrs, family = self._parse_twister(html_text, asin)
+        result["variant_attributes"] = attrs
+        result["variation_asins"] = family if family is not None \
+            else self._parse_variation_asins(html_text, asin, result["parent_asin"])
 
         # 类目
         result["root_category_id"], result["category_ids"], result["category_tree"] = \
@@ -1335,6 +1331,7 @@ class AmazonParser:
             "ean_list": "",
             "parent_asin": asin,
             "variation_asins": "",
+            "variant_attributes": "",
             "root_category_id": "N/A",
             "category_ids": "",
             "category_tree": "",
@@ -1540,6 +1537,103 @@ class AmazonParser:
             return ",".join(list(variations))
         except Exception:
             return ""
+
+    @staticmethod
+    def _slice_balanced(text: str, key: str, opener: str, max_gap: int = 8) -> Optional[str]:
+        """从 `"key":` 之后提取一段配平的 JSON 字面量（对象或数组）。
+        opener 为 '{' 或 '['。返回原始子串；找不到返回 None。带 40 万字符上限防失控。
+        max_gap：开括号必须紧跟在 `"key":` 之后（中间只允许 `:`/空白），否则视为该键
+        不是期望的 `"key":[...]` / `"key":{...}` 形态（防止像 "dimensions" 这种常见词
+        命中别处后跳到很远的无关括号）。"""
+        i = text.find('"%s"' % key)
+        if i < 0:
+            return None
+        after = i + len(key) + 2  # 跳过匹配到的 "key"
+        j = text.find(opener, after)
+        if j < 0 or (j - after) > max_gap:
+            return None
+        closer = ']' if opener == '[' else '}'
+        depth = 0
+        in_str = False
+        esc = False
+        end = min(len(text), j + 400000)
+        for k in range(j, end):
+            c = text[k]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == opener:
+                    depth += 1
+                elif c == closer:
+                    depth -= 1
+                    if depth == 0:
+                        return text[j:k + 1]
+        return None
+
+    def _parse_twister(self, html_text: str, asin: str) -> Tuple[str, Optional[str]]:
+        """解析 Amazon twister 变体矩阵（单次请求即含全家族）。
+
+        返回 (variant_attributes, variation_asins)：
+          - variant_attributes: 本 ASIN 自己的属性，形如 "color_name=Red; size_name=L"；
+            非变体 / 解析失败 → ""
+          - variation_asins: 精确同族 ASIN（矩阵的键去掉自身），逗号分隔；
+            twister 不可用时返回 None，交调用方回退到旧的全页正则。
+        数据库其它多值字段一律用分隔字符串（无 JSON），此处沿用同一风格。
+        """
+        try:
+            dvdd_raw = self._slice_balanced(html_text, "dimensionValuesDisplayData", "{")
+            if not dvdd_raw:
+                return "", None
+            dvdd = json.loads(dvdd_raw)
+            if not isinstance(dvdd, dict) or not dvdd:
+                return "", None
+
+            # 维度名（有序），如 ["color_name","size_name"]。
+            # 实测真实页面用的是 "dimensions" 键；"dimensionsDisplay" 作兜底。
+            # 两者顺序都与 dimensionValuesDisplayData 里每个 ASIN 的值顺序一致。
+            dims = None
+            for dim_key in ("dimensions", "dimensionsDisplay"):
+                dims_raw = self._slice_balanced(html_text, dim_key, "[")
+                if not dims_raw:
+                    continue
+                try:
+                    d = json.loads(dims_raw)
+                    if isinstance(d, list) and d and all(isinstance(x, str) for x in d):
+                        dims = d
+                        break
+                except Exception:
+                    pass
+
+            # 本 ASIN 自己的属性值（大小写不敏感匹配键）
+            my_vals = None
+            au = asin.upper()
+            for k, v in dvdd.items():
+                if isinstance(k, str) and k.upper() == au:
+                    my_vals = v
+                    break
+
+            attrs = ""
+            if isinstance(my_vals, list) and my_vals:
+                vals = [str(x).strip() for x in my_vals]
+                if dims and len(dims) == len(vals):
+                    attrs = "; ".join("%s=%s" % (d, val) for d, val in zip(dims, vals))
+                else:
+                    # 没拿到维度名或长度不匹配：只列值，避免错位贴标签
+                    attrs = "; ".join(vals)
+
+            # 精确同族：矩阵的键去掉自身
+            family = [k for k in dvdd.keys()
+                      if isinstance(k, str) and k.upper() != au]
+            return attrs, ",".join(family)
+        except Exception:
+            return "", None
 
     def _map_detail(self, d: Dict, k: str, v: str):
         """字段名映射"""

@@ -36,6 +36,13 @@
                             <i class="bi bi-camera"></i> 开启网页截图取证
                         </label>
                     </div>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" name="expand_variants" id="expandVariantsSwitch">
+                        <label class="form-check-label small" for="expandVariantsSwitch"
+                               title="开启后：采完上传的 ASIN，会自动把它们的同款全部变体（不同颜色/尺寸等）也采集进同一批次（约 2 轮收敛，不新建批次）">
+                            <i class="bi bi-diagram-3"></i> 自动采集多属性变体
+                        </label>
+                    </div>
                 </div>
                 <button type="submit" class="btn btn-accent" id="uploadBtn">
                     <i class="bi bi-upload"></i> 上传
@@ -194,6 +201,8 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
     // checkbox 选中时值为 "on"，需要转换为 "true"/"false" 给后端
     const screenshotChecked = document.getElementById('screenshotSwitch').checked;
     formData.set('needs_screenshot', screenshotChecked ? 'true' : 'false');
+    const expandChecked = document.getElementById('expandVariantsSwitch').checked;
+    formData.set('expand_variants', expandChecked ? 'true' : 'false');
     try {
         const resp = await fetch('/api/upload', { method: 'POST', body: formData });
         const data = await resp.json();

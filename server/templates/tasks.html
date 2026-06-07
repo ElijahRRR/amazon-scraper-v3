@@ -103,11 +103,17 @@
 
 <!-- 批次列表 -->
 <div class="card">
-    <div class="card-header"><i class="bi bi-collection"></i> 历史批次</div>
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-collection"></i> 历史批次</span>
+        <button class="btn btn-sm btn-outline-danger" id="bulkDeleteBtn" onclick="bulkDeleteBatches()" disabled>
+            <i class="bi bi-trash"></i> 删除选中
+        </button>
+    </div>
     <div class="card-body p-0">
         <table class="table table-hover mb-0">
             <thead>
                 <tr>
+                    <th style="width:34px;"><input class="form-check-input" type="checkbox" id="selectAllBatches" title="全选/取消"></th>
                     <th>批次名称</th>
                     <th>总数</th>
                     <th>待处理</th>
@@ -121,6 +127,7 @@
             <tbody>
                 {% for b in batches %}
                 <tr>
+                    <td><input class="form-check-input batch-cb" type="checkbox" value="{{ b.id }}" data-name="{{ b.name }}"></td>
                     <td>{{ b.name }}</td>
                     <td>{{ b.total_tasks }}</td>
                     <td><span class="badge-status badge-pending">{{ b.pending }}</span></td>
@@ -165,7 +172,7 @@
                 </tr>
                 {% endfor %}
                 {% if not batches %}
-                <tr><td colspan="8" class="text-center text-secondary py-4">暂无批次，请上传 ASIN 文件</td></tr>
+                <tr><td colspan="9" class="text-center text-secondary py-4">暂无批次，请上传 ASIN 文件</td></tr>
                 {% endif %}
             </tbody>
         </table>
@@ -323,6 +330,59 @@ async function deleteBatch(name) {
     if (!confirm(`确定删除批次 "${name}"？此操作不可恢复！`)) return;
     await fetch(`/api/batches/${encodeURIComponent(name)}`, { method: 'DELETE' });
     location.reload();
+}
+
+// ===== 历史批次：勾选批量删除 =====
+function updateBulkDeleteBtn() {
+    const n = document.querySelectorAll('.batch-cb:checked').length;
+    const btn = document.getElementById('bulkDeleteBtn');
+    if (!btn) return;
+    btn.disabled = n === 0;
+    btn.innerHTML = n > 0
+        ? `<i class="bi bi-trash"></i> 删除选中 (${n})`
+        : `<i class="bi bi-trash"></i> 删除选中`;
+}
+(function initBulkDelete() {
+    const selectAll = document.getElementById('selectAllBatches');
+    if (selectAll) {
+        selectAll.addEventListener('change', (e) => {
+            document.querySelectorAll('.batch-cb').forEach(cb => { cb.checked = e.target.checked; });
+            updateBulkDeleteBtn();
+        });
+    }
+    document.querySelectorAll('.batch-cb').forEach(cb => cb.addEventListener('change', () => {
+        // 任一取消勾选时，同步取消「全选」勾
+        if (selectAll && !cb.checked) selectAll.checked = false;
+        updateBulkDeleteBtn();
+    }));
+})();
+async function bulkDeleteBatches() {
+    const checked = [...document.querySelectorAll('.batch-cb:checked')];
+    const ids = checked.map(cb => parseInt(cb.value, 10)).filter(x => !isNaN(x));
+    if (!ids.length) return;
+    if (!confirm(`确定删除选中的 ${ids.length} 个批次？此操作不可恢复（含任务、结果关联、截图文件）！`)) return;
+    const btn = document.getElementById('bulkDeleteBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 删除中...';
+    try {
+        const resp = await fetch('/api/batches/delete-bulk', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ batch_ids: ids }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+            location.reload();
+        } else {
+            alert('批量删除失败：' + (data.detail || resp.status));
+            btn.disabled = false;
+            updateBulkDeleteBtn();
+        }
+    } catch (e) {
+        alert('批量删除异常：' + e);
+        btn.disabled = false;
+        updateBulkDeleteBtn();
+    }
 }
 
 // 错误类型 → 中文标签 + Bootstrap 颜色级别

@@ -1258,6 +1258,56 @@ async def api_delete_batch(batch_name: str):
     return {"ok": True}
 
 
+@app.post("/api/batches/delete-bulk")
+async def api_delete_batches_bulk(request: Request):
+    """批量删除多个批次（按 batch_id）及其全部关联数据 + 截图文件。
+    入参 JSON：{"batch_ids": [1,2,3]}。一次事务删除，原子性。"""
+    body = await request.json()
+    raw = body.get("batch_ids", [])
+    if not isinstance(raw, list):
+        raise HTTPException(400, "batch_ids 必须是数组")
+    # 仅接受整数 id，去重，上限保护（防超大 IN 子句）
+    seen = set()
+    batch_ids = []
+    for x in raw:
+        try:
+            i = int(x)
+        except (ValueError, TypeError):
+            continue
+        if i not in seen:
+            seen.add(i)
+            batch_ids.append(i)
+    batch_ids = batch_ids[:500]
+    if not batch_ids:
+        raise HTTPException(400, "batch_ids 为空或无效")
+
+    ph = ",".join("?" * len(batch_ids))
+    # 先收集截图物理文件路径（只读连接，不占写锁）
+    async with db.read() as rc, rc.execute(
+        f"SELECT file_path FROM screenshots WHERE batch_id IN ({ph}) AND file_path IS NOT NULL",
+        batch_ids
+    ) as c:
+        screenshot_files = [row["file_path"] for row in await c.fetchall()]
+
+    async with db._write_lock:
+        await db._db.execute("BEGIN")
+        try:
+            for tbl in ("tasks", "batch_asins", "screenshots", "asin_changes"):
+                await db._db.execute(f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", batch_ids)
+            await db._db.execute(f"DELETE FROM batches WHERE id IN ({ph})", batch_ids)
+            await db._db.execute("COMMIT")
+        except Exception:
+            try:
+                await db._db.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    _remove_screenshot_files(screenshot_files)
+    logger.info(f"批量删除批次: {len(batch_ids)} 个 (ids={batch_ids[:20]}{'...' if len(batch_ids) > 20 else ''})")
+    return {"ok": True, "deleted": len(batch_ids)}
+
+
 @app.get("/api/batches/{batch_name}/errors")
 async def api_batch_errors(batch_name: str):
     """获取批次错误详情"""

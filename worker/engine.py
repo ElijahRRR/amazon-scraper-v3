@@ -1266,16 +1266,15 @@ class Worker:
                 #        A/B test、地域缓存、库存差异引起，rotate 后重试**结果一样**；
                 #     2. 大量 rotation 会瞬间打爆隧道代理 5 QPS 限额 → CONNECT 429
                 #        → Session 初始化失败 → 全局吞吐崩溃。
-                #   新策略：检测到偏移直接失败任务，不轮换 session、不本地重试。
-                #   失败结果回传 server，server 端的 retry_count 机制会让其他 worker
-                #   / 其他时间重试（自然更换 IP/cookie/缓存），治本不治标。
+                #   新策略：检测到偏移直接失败任务，不轮换 session、不本地重试；
+                #   失败结果回传 server 后直接进入终态 failed，避免继续消耗配额。
                 page_asin = result_data.get("_page_asin")
                 if page_asin and page_asin.upper() != asin.upper():
                     self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     last_error_type = "variant_offset"
                     last_error_detail = f"page={page_asin} requested={asin}"
                     logger.warning(
-                        f"⚠️ ASIN {asin} variant 偏移：页面实际是 {page_asin}（不轮换不重试，交给 server 调度）"
+                        f"⚠️ ASIN {asin} variant 偏移：页面实际是 {page_asin}（不轮换不重试，直接终态失败）"
                     )
                     # 直接跳出 retry 循环，让外层走"任务失败"路径
                     attempt = max_retries

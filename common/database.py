@@ -31,21 +31,19 @@ logger = logging.getLogger(__name__)
 # 当任务的 retry_count >= cap 时直接 status='failed' 终态。
 # 不在 dict 中的 error_type 默认用 config.MAX_RETRIES（=3）。
 #
-# - variant_offset: 给 1 次重试机会（cap=2）
-#   理由：偶发性偏移（临时 A/B test / 缓存）有机会救回；
-#   稳定的 Amazon 侧问题第 2 次失败立即终态，不浪费配额。
+# - variant_offset: 不重试（cap=1）
+#   理由：这是 Amazon 返回了兄弟 variant 页面，继续重试容易浪费配额并污染队列。
 # ============================================================
 LIMITED_RETRY_ERROR_TYPES = {
-    "variant_offset": 2,   # 最多失败 2 次（= 1 次原始失败 + 1 次重试）
+    "variant_offset": 1,   # 首次失败即终态，不回 pending
 }
 
 # ============================================================
 # 不进入"循环类"重试的 error_type 集合
 # 用于 auto_retry_failed_tasks / api_retry_batch（默认）
 #
-# 进入此集合的失败，即使 layer 2 已给过有限次重试机会，
-# 也不再被 server 周期任务或用户手动按钮重新激活。
-# 用户如确需重采，可 Shift+点击"重试"按钮（force=true 强制覆盖）。
+# 进入此集合的失败不会被 server 周期任务或用户默认手动按钮重新激活。
+# 批次手动重试也会跳过这些类型。
 # ============================================================
 NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
 
@@ -1288,8 +1286,7 @@ class Database:
         每次自动重试前，任务的 updated_at 至少要早于 delay_minutes 分钟（避免刚失败就立刻再跑）。
 
         排除：NO_AUTO_RETRY_ERROR_TYPES 中的失败（如 variant_offset）。
-        这些类型已经在 fail_task / accept_results_batch 里给过有限次重试机会，
-        如果仍失败说明是产品/页面层稳定问题，再循环重试浪费配额。
+        这些类型是稳定的产品/页面层事实，循环重试会浪费配额。
         """
         if max_auto_cycles <= 0:
             return 0
@@ -1349,7 +1346,7 @@ class Database:
                 retry_count = row[0] + 1
 
                 # 按 error_type 决定该任务的失败上限：
-                # - variant_offset: cap=2（给 1 次重试机会）
+                # - variant_offset: cap=1（不重试）
                 # - 其他: cap=MAX_RETRIES（=3）
                 cap = _fail_cap(error_type)
                 if retry_count >= cap:
@@ -1776,7 +1773,7 @@ class Database:
                             continue
                         retry_count = row[0] + 1
                         # 按 error_type 决定该任务的失败上限
-                        # （variant_offset 给 1 次重试机会，其他用 MAX_RETRIES）
+                        # （variant_offset 不重试，其他用 MAX_RETRIES）
                         cap = _fail_cap(error_type)
                         if retry_count >= cap:
                             await self._db.execute(

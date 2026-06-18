@@ -302,7 +302,7 @@ amazon-scraper-v3/
 ```python
 # common/database.py
 LIMITED_RETRY_ERROR_TYPES = {
-    "variant_offset": 2,   # 给 1 次重试机会（cap=2）
+    "variant_offset": 1,   # 不重试（cap=1，首次失败即终态）
 }
 NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
 ```
@@ -310,7 +310,7 @@ NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
 | 错误类型 | layer 2 cap | layer 3 自动重试 | layer 4 手动重试 |
 |---|---|---|---|
 | `network` / `timeout` / `parse_error` / `blocked` / `captcha` | 3 | ✓ | ✓ |
-| `variant_offset` | **2**（给 1 次重试机会） | ✗ 跳过 | ⚠ 默认跳过，Shift+点击强制 |
+| `variant_offset` | **1**（不重试，首次失败即终态） | ✗ 跳过 | ✗ 跳过 |
 
 要加新类型只需改 `LIMITED_RETRY_ERROR_TYPES` 和 `NO_AUTO_RETRY_ERROR_TYPES`，全链路自动跟上。
 
@@ -326,7 +326,7 @@ NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
 
 **worker 处理策略**：
 - 不本地重试，不 rotate session（避免打爆隧道 5 QPS）
-- 直接上报失败，让 server 调度其他 worker / 其他时间重试
+- 直接上报失败，server 首次收到后即标记终态 failed
 
 ### 多属性变体提取 + 自动展开
 
@@ -505,16 +505,12 @@ curl http://<SERVER>:8899/api/_debug/lock-stats | python3 -m json.tool
 ### 手动重试失败任务
 
 UI：任务管理页点击"重试"按钮
-- 默认跳过 `variant_offset` 类型
-- 按住 Shift 点击 → 强制重试所有（含 variant_offset）
+- 跳过 `variant_offset` 类型
 
 API：
 ```bash
-# 默认跳过 NO_AUTO_RETRY_ERROR_TYPES
+# 跳过 NO_AUTO_RETRY_ERROR_TYPES
 curl -X POST http://<SERVER>:8899/api/batches/<batch_name>/retry
-
-# 强制重试所有失败
-curl -X POST 'http://<SERVER>:8899/api/batches/<batch_name>/retry?force=true'
 ```
 
 返回：

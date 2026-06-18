@@ -1178,9 +1178,8 @@ async def api_prioritize(batch_id: int):
 async def api_retry_batch(batch_name: str, force: bool = False):
     """重试失败任务
 
-    默认跳过 NO_AUTO_RETRY_ERROR_TYPES（如 variant_offset），因为这些类型
-    已经在 layer 2 给过有限次重试机会，仍失败说明是 Amazon 侧稳定问题。
-    如确需强制重试，可加 ?force=true（前端按住 Shift 点击）。
+    始终跳过 NO_AUTO_RETRY_ERROR_TYPES（如 variant_offset），因为这些类型
+    是 Amazon 侧返回兄弟变体页的稳定问题，不再重试。
     返回 retried/skipped_no_retry 数量，前端可展示。
     """
     from common.database import NO_AUTO_RETRY_ERROR_TYPES
@@ -1196,7 +1195,7 @@ async def api_retry_batch(batch_name: str, force: bool = False):
         await db._db.execute("BEGIN")
         # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
         skipped = 0
-        if not force and no_retry_list:
+        if no_retry_list:
             async with db._db.execute(
                 f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
                 f"AND COALESCE(error_type, '') IN ({no_retry_placeholders})",
@@ -1205,8 +1204,8 @@ async def api_retry_batch(batch_name: str, force: bool = False):
                 row = await c.fetchone()
                 skipped = row[0] if row else 0
 
-        # 实际重试 SQL：默认排除 NO_RETRY；force=true 时全部重试
-        if force or not no_retry_list:
+        # 实际重试 SQL：始终排除 NO_RETRY；force 参数保留兼容旧调用，但不覆盖 variant_offset。
+        if not no_retry_list:
             cursor = await db._db.execute(
                 "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
                 "WHERE batch_id=? AND status='failed'",

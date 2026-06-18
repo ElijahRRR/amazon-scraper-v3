@@ -775,10 +775,10 @@ class Database:
                   VALUES (new.id, new.asin, new.title, new.brand);
                 END;
             """)
-            # 首次部署：如果 FTS 索引为空但 asin_data 已有数据，自动 rebuild
-            # （生产环境已通过 SQL 脚本完成首次 rebuild，这里只是兜底用于全新环境/迁移）
-            async with self._db.execute("SELECT COUNT(*) FROM asin_data_fts") as c:
-                fts_count = (await c.fetchone())[0]
+            # 首次部署：如果 FTS 索引为空但 asin_data 已有数据，自动 rebuild。
+            # 不要对 FTS 虚表做 COUNT(*)：生产库上会扫完整 trigram 索引，阻塞启动。
+            async with self._db.execute("SELECT 1 FROM asin_data_fts_idx LIMIT 1") as c:
+                fts_count = 1 if await c.fetchone() else 0
             async with self._db.execute("SELECT COUNT(*) FROM asin_data") as c:
                 main_count = (await c.fetchone())[0]
             if main_count > 0 and fts_count == 0:

@@ -10,6 +10,7 @@ import re
 import asyncio
 import ipaddress
 import logging
+import socket
 import time
 import zipfile
 from contextlib import asynccontextmanager
@@ -328,7 +329,7 @@ async def _timeout_task_loop():
             # 兜底完成检测：扫描长期 running 的批次（防止入队事件丢失）
             # 只扫最近活动的 batches，避免全表查询
             try:
-                async with db._db.execute(
+                async with db.read() as rc, rc.execute(
                     """SELECT id FROM batches
                        WHERE status='running'
                        ORDER BY updated_at DESC
@@ -433,7 +434,7 @@ async def _callback_dispatcher():
 async def _send_one_callback(client: httpx.AsyncClient, batch_id: int):
     """发送单个 batch 的回调。失败按退避表写回 DB。"""
     # 读取 batch 当前状态（要求 callback_status='pending' 才发；其他状态可能已 sent/failed/取消）
-    async with db._db.execute(
+    async with db.read() as rc, rc.execute(
         """SELECT id, name, external_id, callback_url, callback_attempts,
                   callback_status, completed_at, status
            FROM batches WHERE id=?""",
@@ -456,7 +457,7 @@ async def _send_one_callback(client: httpx.AsyncClient, batch_id: int):
         return
 
     # 二次 SSRF 校验（防 DB 被改）
-    ok, reason = _is_safe_callback_url(callback_url)
+    ok, reason = await _is_safe_callback_url(callback_url)
     if not ok:
         await db.mark_callback_attempt(
             batch_id, success=False, error=f"unsafe_url:{reason}",
@@ -474,7 +475,7 @@ async def _send_one_callback(client: httpx.AsyncClient, batch_id: int):
     # 计算用时
     duration = None
     try:
-        async with db._db.execute(
+        async with db.read() as rc, rc.execute(
             "SELECT created_at FROM batches WHERE id=?", (batch_id,)
         ) as c:
             row2 = await c.fetchone()
@@ -736,14 +737,23 @@ _COMPLETION_WATCHER_INTERVAL = 2.0                # 每 2 秒批量处理一次
 _SSRF_BLOCKED_HOSTS = {"localhost", "ip6-localhost", "ip6-loopback"}
 
 
-def _is_safe_callback_url(url: str) -> tuple[bool, str]:
+def _ip_is_blocked(ip: "ipaddress._BaseAddress") -> bool:
+    """内网 / 回环 / 链路本地 / 保留 / 组播 地址一律拒绝。"""
+    return (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+async def _is_safe_callback_url(url: str) -> tuple[bool, str]:
     """判定 callback URL 是否安全可用于公网回调。
 
     返回 (ok, reason)。公网场景下：
     - 只允许 http/https
     - 拒绝 localhost 字面量
     - 拒绝字面量私网 / 回环 / 链路本地 IP（10/8、172.16-31、192.168/16、127/8、169.254/16、::1 等）
-    - 域名一律放行（公网假设；不做 DNS 解析以避免 TOCTOU）
+    - 域名做 DNS 解析后复检：任一解析结果落在内网 / 元数据 IP（如 169.254.169.254）
+      即拒绝，堵住"域名指向内网"的 SSRF 绕过。
+      注：解析与实际发起连接之间仍存在 TOCTOU 窗口（DNS 可能被改），这里只做尽力校验；
+      真正的强隔离需在连接层 pin 住已校验 IP。
     """
     if not url or not isinstance(url, str):
         return False, "empty"
@@ -761,10 +771,32 @@ def _is_safe_callback_url(url: str) -> tuple[bool, str]:
     # 尝试作为 IP 字面量解析
     try:
         ip = ipaddress.ip_address(host)
-        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        if _ip_is_blocked(ip):
             return False, f"blocked_ip:{host}"
+        return True, ""  # 合法公网 IP 字面量，无需 DNS 解析
     except ValueError:
-        pass  # 是域名
+        pass  # 是域名，继续做 DNS 复检
+
+    # 域名：解析所有 A/AAAA 记录，任一落在内网即拒绝
+    try:
+        port = u.port or (443 if u.scheme == "https" else 80)
+    except ValueError:
+        return False, "bad_port"
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception as e:
+        return False, f"dns_fail:{type(e).__name__}"
+    if not infos:
+        return False, "dns_empty"
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if _ip_is_blocked(ip):
+            return False, f"blocked_resolved_ip:{ip_str}"
     return True, ""
 
 
@@ -798,6 +830,23 @@ def _normalize_zip(val) -> Optional[str]:
     if head.isdigit() and len(head) <= 5:
         head = head.zfill(5)
     return head if _US_ZIP_RE.match(head) else None
+
+
+def _safe_fs_component(name: str) -> Optional[str]:
+    """校验一个字符串是否可安全用作文件系统路径组件（目录名 / 文件名前缀）。
+
+    截图存储路径由 batch_name / asin 直接拼成（server/static/screenshots/<batch>/<asin>.png）。
+    含 '/'、'\\'、'..'、控制字符或空值的输入会造成路径穿越，一律拒绝（返回 None）。
+    合法的自动/手动批次名（字母数字、下划线、连字符、点、空格、中文）不受影响。
+    """
+    if not name or not isinstance(name, str):
+        return None
+    if "/" in name or "\\" in name or "\x00" in name:
+        return None
+    # 拒绝 '.'、'..' 以及任何以 '..' 开头的穿越尝试
+    if name in (".", "..") or ".." in name:
+        return None
+    return name
 
 
 @app.post("/api/upload")
@@ -897,7 +946,7 @@ async def api_upload(request: Request,
     # callback_url 校验（防 SSRF + 格式）
     cb_url = (callback_url or "").strip() or None
     if cb_url:
-        ok, reason = _is_safe_callback_url(cb_url)
+        ok, reason = await _is_safe_callback_url(cb_url)
         if not ok:
             raise HTTPException(400, f"非法 callback_url（{reason}）。仅接受 http(s)://公网域名/IP")
 
@@ -1055,7 +1104,7 @@ async def api_seller_discoveries(batch_id: int,
     )
     params.extend([limit, offset])
     rows = []
-    async with db._db.execute(sql, params) as c:
+    async with db.read() as rc, rc.execute(sql, params) as c:
         async for r in c:
             rows.append(dict(r))
     return {"items": rows, "limit": limit, "offset": offset}
@@ -1575,6 +1624,13 @@ async def api_upload_screenshot(request: Request,
         if time.time() - _worker_registry[worker_id]["last_seen"] > 120:
             raise HTTPException(409, f"Worker {worker_id} 心跳超时，截图被丢弃")
 
+    # 路径安全：asin / batch_name 会直接拼成磁盘路径，必须校验防穿越
+    asin = _normalize_asin(asin)
+    if not asin:
+        raise HTTPException(400, "非法 ASIN")
+    if _safe_fs_component(batch_name) is None:
+        raise HTTPException(400, "非法批次名")
+
     batch = await db.get_batch_by_name(batch_name)
     if not batch:
         raise HTTPException(400, f"批次不存在: {batch_name}")
@@ -1965,6 +2021,9 @@ async def _export_csv_streaming(filename: str, batch_id: int = None,
 
 @app.get("/api/export/{batch_name}/screenshots")
 async def api_export_screenshots(batch_name: str):
+    # 路径安全：batch_name 直接拼成磁盘目录，校验防穿越
+    if _safe_fs_component(batch_name) is None:
+        raise HTTPException(400, "非法批次名")
     ss_dir = os.path.join(config.SCREENSHOT_DIR, batch_name)
     if not os.path.isdir(ss_dir):
         raise HTTPException(404, "无截图文件")

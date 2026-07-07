@@ -1618,31 +1618,32 @@ class Database:
             "discovered_asins": 0,
             "discover_mode": None,
         }
-        async with self._db.execute(
-            "SELECT discover_mode FROM batches WHERE id=?", (batch_id,)
-        ) as c:
-            row = await c.fetchone()
-            if row:
-                out["discover_mode"] = row["discover_mode"]
+        async with self.read() as rc:
+            async with rc.execute(
+                "SELECT discover_mode FROM batches WHERE id=?", (batch_id,)
+            ) as c:
+                row = await c.fetchone()
+                if row:
+                    out["discover_mode"] = row["discover_mode"]
 
-        async with self._db.execute(
-            "SELECT task_type, status, COUNT(*) as cnt FROM tasks "
-            "WHERE batch_id=? GROUP BY task_type, status",
-            (batch_id,)
-        ) as c:
-            async for row in c:
-                tt = row["task_type"] or "asin"
-                bucket = out["discover"] if tt == "discover_seller" else out["detail"]
-                bucket[row["status"]] = row["cnt"]
+            async with rc.execute(
+                "SELECT task_type, status, COUNT(*) as cnt FROM tasks "
+                "WHERE batch_id=? GROUP BY task_type, status",
+                (batch_id,)
+            ) as c:
+                async for row in c:
+                    tt = row["task_type"] or "asin"
+                    bucket = out["discover"] if tt == "discover_seller" else out["detail"]
+                    bucket[row["status"]] = row["cnt"]
 
-        for bucket in (out["discover"], out["detail"]):
-            bucket["total"] = sum(bucket[k] for k in ("pending", "processing", "done", "failed"))
+            for bucket in (out["discover"], out["detail"]):
+                bucket["total"] = sum(bucket[k] for k in ("pending", "processing", "done", "failed"))
 
-        async with self._db.execute(
-            "SELECT COUNT(*) FROM seller_discoveries WHERE batch_id=?", (batch_id,)
-        ) as c:
-            row = await c.fetchone()
-            out["discovered_asins"] = row[0] if row else 0
+            async with rc.execute(
+                "SELECT COUNT(*) FROM seller_discoveries WHERE batch_id=?", (batch_id,)
+            ) as c:
+                row = await c.fetchone()
+                out["discovered_asins"] = row[0] if row else 0
         return out
 
     # ==================== 结果操作（含变动检测）====================
@@ -1708,7 +1709,7 @@ class Database:
         async with self._write_lock("accept_results_batch"):
             # 用 BEGIN IMMEDIATE 显式拿写锁，与 pull_tasks 一致
             _t_total = time.monotonic()
-            await self._db.execute("BEGIN")
+            await self._db.execute("BEGIN IMMEDIATE")
             try:
                 for item in items:
                     task_id = item.get("task_id")
@@ -2284,7 +2285,7 @@ class Database:
     # ==================== 截图操作 ====================
 
     async def get_pending_screenshots(self, batch_id: int, limit: int = 50) -> List[Dict]:
-        async with self._db.execute(
+        async with self.read() as rc, rc.execute(
             "SELECT * FROM screenshots WHERE batch_id = ? AND status = 'pending' LIMIT ?",
             (batch_id, limit)
         ) as c:
@@ -2328,7 +2329,7 @@ class Database:
     async def get_screenshot_progress(self, batch_id: int) -> Dict:
         sql = "SELECT status, COUNT(*) as cnt FROM screenshots WHERE batch_id = ? GROUP BY status"
         stats = {"pending": 0, "processing": 0, "done": 0, "failed": 0}
-        async with self._db.execute(sql, (batch_id,)) as c:
+        async with self.read() as rc, rc.execute(sql, (batch_id,)) as c:
             async for row in c:
                 stats[row["status"]] = row["cnt"]
         stats["total"] = sum(stats.values())

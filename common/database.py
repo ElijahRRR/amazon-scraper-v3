@@ -2084,6 +2084,32 @@ class Database:
                 saved += 1
         return saved
 
+    async def get_batch_failures(
+        self,
+        batch_id: int,
+        error_types: Optional[List[str]] = None,
+        limit: int = 100000,
+    ) -> List[Dict]:
+        """返回指定批次失败任务明细，用于调用方按失败原因处理本批最新采集状态。"""
+        where_parts = ["batch_id = ?", "status = 'failed'"]
+        params: list = [batch_id]
+        clean_types = [str(t).strip() for t in (error_types or []) if str(t).strip()]
+        if clean_types:
+            placeholders = ",".join("?" for _ in clean_types)
+            where_parts.append(f"COALESCE(error_type, '') IN ({placeholders})")
+            params.extend(clean_types)
+        params.append(max(1, min(int(limit or 100000), 100000)))
+
+        sql = f"""
+            SELECT asin, status, error_type, error_detail, retry_count, worker_id, updated_at
+            FROM tasks
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+        """
+        async with self.read() as rc, rc.execute(sql, params) as c:
+            return [dict(r) for r in await c.fetchall()]
+
     # ==================== 查询操作（keyset 分页）====================
 
     async def get_results(self, batch_id: int = None, cursor_id: int = None,
@@ -2318,6 +2344,63 @@ class Database:
         last_id = 0
         async with self.read() as rc:
             while True:
+                if batch_id:
+                    joins = [
+                        "LEFT JOIN asin_data d ON d.asin = ba.asin",
+                        "LEFT JOIN tasks t ON t.batch_id = ba.batch_id AND t.asin = ba.asin",
+                    ]
+                    join_params: list = []
+                    where = ["ba.batch_id = ?", "ba.rowid > ?"]
+                    where_params: list = [batch_id, last_id]
+
+                    if change_filter == "price_stock":
+                        joins.append(
+                            "JOIN (SELECT DISTINCT asin FROM asin_changes "
+                            "WHERE change_type='price_stock' AND batch_id=?) ac ON ac.asin = ba.asin"
+                        )
+                        join_params.append(batch_id)
+                    elif change_filter == "title_bullets":
+                        joins.append(
+                            "JOIN (SELECT DISTINCT asin FROM asin_changes "
+                            "WHERE change_type='title_bullets' AND batch_id=?) ac ON ac.asin = ba.asin"
+                        )
+                        join_params.append(batch_id)
+                    elif change_filter == "new":
+                        where.append("ba.is_new = 1")
+
+                    params = join_params + where_params + [batch_size]
+                    sql = f"""
+                        SELECT d.*,
+                               ba.rowid AS batch_rowid,
+                               ba.asin AS batch_requested_asin,
+                               ba.is_new AS batch_is_new,
+                               t.status AS batch_task_status,
+                               t.error_type AS batch_error_type,
+                               t.error_detail AS batch_error_detail,
+                               t.retry_count AS batch_retry_count,
+                               t.auto_retry_count AS batch_auto_retry_count,
+                               t.worker_id AS batch_worker_id,
+                               t.updated_at AS batch_task_updated_at,
+                               d.updated_at AS batch_asin_data_updated_at,
+                               CASE WHEN d.asin IS NULL THEN 0 ELSE 1 END AS batch_has_asin_data
+                        FROM batch_asins ba
+                        {' '.join(joins)}
+                        WHERE {' AND '.join(where)}
+                        ORDER BY ba.rowid ASC
+                        LIMIT ?
+                    """
+
+                    async with rc.execute(sql, params) as c:
+                        rows = await c.fetchall()
+                    if not rows:
+                        break
+                    for row in rows:
+                        d = dict(row)
+                        last_id = d["batch_rowid"]
+                        d["asin"] = d.get("batch_requested_asin") or d.get("asin")
+                        yield d
+                    continue
+
                 joins = []
                 join_params: list = []
                 where = ["d.id > ?"]

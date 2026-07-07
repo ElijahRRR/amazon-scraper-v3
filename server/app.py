@@ -1332,6 +1332,20 @@ async def api_batch_errors(batch_name: str):
     return {"error_summary": error_summary, "failed_tasks": failed_tasks}
 
 
+@app.get("/api/batches/{batch_id}/failures")
+async def api_batch_failures(
+    batch_id: int,
+    error_type: Optional[str] = Query(None, description="逗号分隔的 error_type 过滤"),
+    limit: int = Query(100000, ge=1, le=100000),
+):
+    """按 batch_id 获取失败任务明细；不依赖批次名，且不截断到 200 条。"""
+    error_types = None
+    if error_type:
+        error_types = [t.strip() for t in error_type.split(",") if t.strip()]
+    failed_tasks = await db.get_batch_failures(batch_id, error_types=error_types, limit=limit)
+    return {"batch_id": batch_id, "failed_tasks": failed_tasks, "count": len(failed_tasks)}
+
+
 @app.get("/api/coordinator")
 async def api_coordinator():
     """全局并发协调器状态"""
@@ -1731,6 +1745,19 @@ async def api_update_settings(request: Request):
 from common.models import EXPORTABLE_FIELDS
 from common.database import _parse_price_float
 
+BATCH_STATUS_EXPORT_HEADERS = [
+    "本批采集结果",
+    "数据来源",
+    "失败类型",
+    "失败详情",
+    "实际页面ASIN",
+    "重试次数",
+    "本批任务更新时间",
+    "产品库数据更新时间",
+]
+
+_VARIANT_PAGE_ASIN_RE = re.compile(r"\bpage=([A-Z0-9]{10})\b", re.IGNORECASE)
+
 
 def _parse_selected_fields(fields_param: str = None):
     """解析并校验字段选择，返回 None 表示全选"""
@@ -1740,7 +1767,7 @@ def _parse_selected_fields(fields_param: str = None):
     return selected if selected else None
 
 
-def _get_export_headers(selected_fields=None):
+def _get_export_headers(selected_fields=None, include_batch_status: bool = False):
     """构建导出表头和字段键"""
     if selected_fields is None:
         selected_fields = list(EXPORTABLE_FIELDS)
@@ -1754,10 +1781,57 @@ def _get_export_headers(selected_fields=None):
         idx = headers.index(shipping_h) + 1 if shipping_h in headers else len(headers)
         headers.insert(idx, config.HEADER_MAP.get("total_price", "总价"))
 
+    if include_batch_status:
+        headers.extend(BATCH_STATUS_EXPORT_HEADERS)
+
     return headers, field_keys, include_total
 
 
-def _prepare_row(item: dict, field_keys: list, headers: list, include_total: bool):
+def _batch_status_export_values(item: dict) -> list:
+    status = str(item.get("batch_task_status") or "")
+    has_asin_data = bool(item.get("batch_has_asin_data"))
+    error_type = str(item.get("batch_error_type") or "") if status == "failed" else ""
+    error_detail = str(item.get("batch_error_detail") or "") if status == "failed" else ""
+
+    result_map = {
+        "done": "成功",
+        "failed": "失败",
+        "processing": "处理中",
+        "pending": "待采集",
+    }
+    batch_result = result_map.get(status, status)
+
+    if status == "done" and has_asin_data:
+        data_source = "本次采集更新"
+    elif has_asin_data:
+        data_source = "历史产品库数据，本次未更新"
+    elif status == "failed":
+        data_source = "无产品库数据，本次失败"
+    elif status in ("pending", "processing"):
+        data_source = "无产品库数据，本次未完成"
+    else:
+        data_source = "无产品库数据"
+
+    actual_page_asin = ""
+    if error_type == "variant_offset":
+        m = _VARIANT_PAGE_ASIN_RE.search(error_detail)
+        if m:
+            actual_page_asin = m.group(1).upper()
+
+    return [
+        batch_result,
+        data_source,
+        error_type,
+        error_detail,
+        actual_page_asin,
+        str(item.get("batch_retry_count") or ""),
+        str(item.get("batch_task_updated_at") or ""),
+        str(item.get("batch_asin_data_updated_at") or ""),
+    ]
+
+
+def _prepare_row(item: dict, field_keys: list, headers: list, include_total: bool,
+                 include_batch_status: bool = False):
     """构建单行导出数据"""
     row = [str(item.get(f, "") or "") for f in field_keys]
     if include_total:
@@ -1771,6 +1845,8 @@ def _prepare_row(item: dict, field_keys: list, headers: list, include_total: boo
         shipping_h = config.HEADER_MAP.get("buybox_shipping", "buybox_shipping")
         idx = headers.index(shipping_h) + 1 if shipping_h in headers else len(row)
         row.insert(idx, total)
+    if include_batch_status:
+        row.extend(_batch_status_export_values(item))
     return row
 
 
@@ -1809,14 +1885,18 @@ async def _export_xlsx_streaming(filename: str, batch_id: int = None,
                                   change_filter: str = "all", selected_fields=None):
     """write_only 模式 + 临时文件 + 流式响应（百万级不 OOM）"""
     import tempfile
-    headers, field_keys, include_total = _get_export_headers(selected_fields)
+    include_batch_status = batch_id is not None
+    headers, field_keys, include_total = _get_export_headers(
+        selected_fields, include_batch_status=include_batch_status)
     wb = openpyxl.Workbook(write_only=True)
     ws = wb.create_sheet(title="采集结果")
     ws.append(headers)
 
     count = 0
     async for item in db.iter_results(batch_id, change_filter=change_filter):
-        ws.append(_prepare_row(item, field_keys, headers, include_total))
+        ws.append(_prepare_row(
+            item, field_keys, headers, include_total,
+            include_batch_status=include_batch_status))
         count += 1
 
     if count == 0:
@@ -1859,7 +1939,9 @@ async def _export_xlsx_streaming(filename: str, batch_id: int = None,
 async def _export_csv_streaming(filename: str, batch_id: int = None,
                                  change_filter: str = "all", selected_fields=None):
     """逐行 yield 的真流式 CSV（百万级不 OOM）"""
-    headers, field_keys, include_total = _get_export_headers(selected_fields)
+    include_batch_status = batch_id is not None
+    headers, field_keys, include_total = _get_export_headers(
+        selected_fields, include_batch_status=include_batch_status)
 
     async def generate():
         out = io.StringIO()
@@ -1868,7 +1950,9 @@ async def _export_csv_streaming(filename: str, batch_id: int = None,
 
         async for item in db.iter_results(batch_id, change_filter=change_filter):
             out = io.StringIO()
-            csv.writer(out).writerow(_prepare_row(item, field_keys, headers, include_total))
+            csv.writer(out).writerow(_prepare_row(
+                item, field_keys, headers, include_total,
+                include_batch_status=include_batch_status))
             yield out.getvalue().encode("utf-8")
 
     safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', filename)

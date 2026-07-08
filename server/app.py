@@ -1823,6 +1823,20 @@ def _parse_selected_fields(fields_param: str = None):
     return selected if selected else None
 
 
+def _export_needed_columns(field_keys, include_total: bool):
+    """导出实际需要从 asin_data 读取的列（供 iter_results 收窄投影用）。
+
+    = 用户勾选的输出列 field_keys；若含虚拟列「总价」，额外需要 buybox_price /
+    buybox_shipping 两列参与计算。批次状态列来自 tasks/别名，不在此列出。
+    """
+    needed = list(field_keys)
+    if include_total:
+        for c in ("buybox_price", "buybox_shipping"):
+            if c not in needed:
+                needed.append(c)
+    return needed
+
+
 def _get_export_headers(selected_fields=None, include_batch_status: bool = False):
     """构建导出表头和字段键"""
     if selected_fields is None:
@@ -1944,12 +1958,13 @@ async def _export_xlsx_streaming(filename: str, batch_id: int = None,
     include_batch_status = batch_id is not None
     headers, field_keys, include_total = _get_export_headers(
         selected_fields, include_batch_status=include_batch_status)
+    needed_cols = _export_needed_columns(field_keys, include_total)
     wb = openpyxl.Workbook(write_only=True)
     ws = wb.create_sheet(title="采集结果")
     ws.append(headers)
 
     count = 0
-    async for item in db.iter_results(batch_id, change_filter=change_filter):
+    async for item in db.iter_results(batch_id, change_filter=change_filter, columns=needed_cols):
         ws.append(_prepare_row(
             item, field_keys, headers, include_total,
             include_batch_status=include_batch_status))
@@ -1998,13 +2013,14 @@ async def _export_csv_streaming(filename: str, batch_id: int = None,
     include_batch_status = batch_id is not None
     headers, field_keys, include_total = _get_export_headers(
         selected_fields, include_batch_status=include_batch_status)
+    needed_cols = _export_needed_columns(field_keys, include_total)
 
     async def generate():
         out = io.StringIO()
         csv.writer(out).writerow(headers)
         yield out.getvalue().encode("utf-8-sig")
 
-        async for item in db.iter_results(batch_id, change_filter=change_filter):
+        async for item in db.iter_results(batch_id, change_filter=change_filter, columns=needed_cols):
             out = io.StringIO()
             csv.writer(out).writerow(_prepare_row(
                 item, field_keys, headers, include_total,

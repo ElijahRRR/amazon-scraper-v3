@@ -1823,6 +1823,11 @@ def _parse_selected_fields(fields_param: str = None):
     return selected if selected else None
 
 
+# 导出时每攒够这么多行就交给工作线程处理一次（append/格式化）。
+# 取值权衡：太小 → executor 往返频繁；太大 → 单次线程调用持锁时间变长。
+_EXPORT_ROWS_PER_CHUNK = 2000
+
+
 def _export_needed_columns(field_keys, include_total: bool):
     """导出实际需要从 asin_data 读取的列（供 iter_results 收窄投影用）。
 
@@ -1953,40 +1958,77 @@ async def api_export_batch(batch_name: str, format: str = "xlsx", change_filter:
 
 async def _export_xlsx_streaming(filename: str, batch_id: int = None,
                                   change_filter: str = "all", selected_fields=None):
-    """write_only 模式 + 临时文件 + 流式响应（百万级不 OOM）"""
+    """write_only 模式 + 临时文件 + 流式响应（百万级不 OOM）。
+
+    P2：openpyxl 的行 append 与 wb.save() 是纯 CPU/序列化重活，若在事件循环里同步做，
+    会在导出期间卡住仪表盘轮询与 worker 拉取/上传。这里把所有 openpyxl 操作放到一条
+    专属工作线程（max_workers=1，保证 lxml/zip 有状态对象始终同线程），DB 迭代仍在事件
+    循环里 async 进行；run_in_executor 让出事件循环，save 的 lxml 序列化 + zlib 压缩会
+    释放 GIL，从而与仪表盘/worker 的请求处理真正并行。
+    """
     import tempfile
+    from concurrent.futures import ThreadPoolExecutor
     include_batch_status = batch_id is not None
     headers, field_keys, include_total = _get_export_headers(
         selected_fields, include_batch_status=include_batch_status)
     needed_cols = _export_needed_columns(field_keys, include_total)
-    wb = openpyxl.Workbook(write_only=True)
-    ws = wb.create_sheet(title="采集结果")
-    ws.append(headers)
 
-    count = 0
-    async for item in db.iter_results(batch_id, change_filter=change_filter, columns=needed_cols):
-        ws.append(_prepare_row(
-            item, field_keys, headers, include_total,
-            include_batch_status=include_batch_status))
-        count += 1
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xlsx-export")
+    st = {"wb": None, "ws": None, "count": 0}
 
-    if count == 0:
-        wb.close()
-        raise HTTPException(404, "无数据")
+    def _init():
+        wb = openpyxl.Workbook(write_only=True)
+        ws = wb.create_sheet(title="采集结果")
+        ws.append(headers)
+        st["wb"], st["ws"] = wb, ws
 
-    os.makedirs(config.EXPORT_DIR, exist_ok=True)
-    tmp = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".xlsx", prefix="export_",
-        dir=config.EXPORT_DIR)
-    tmp_path = tmp.name
-    tmp.close()
+    def _append(items):
+        ws = st["ws"]
+        for item in items:
+            ws.append(_prepare_row(
+                item, field_keys, headers, include_total,
+                include_batch_status=include_batch_status))
+        st["count"] += len(items)
+
+    def _close():
+        try:
+            st["wb"].close()
+        except Exception:
+            pass
+
+    tmp_path = None
     try:
-        wb.save(tmp_path)
-    except Exception:
-        wb.close()
-        os.unlink(tmp_path)
-        raise
-    wb.close()
+        await loop.run_in_executor(executor, _init)
+
+        buf = []
+        async for item in db.iter_results(batch_id, change_filter=change_filter, columns=needed_cols):
+            buf.append(item)
+            if len(buf) >= _EXPORT_ROWS_PER_CHUNK:
+                await loop.run_in_executor(executor, _append, buf)
+                buf = []
+        if buf:
+            await loop.run_in_executor(executor, _append, buf)
+
+        if st["count"] == 0:
+            await loop.run_in_executor(executor, _close)
+            raise HTTPException(404, "无数据")
+
+        os.makedirs(config.EXPORT_DIR, exist_ok=True)
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=".xlsx", prefix="export_",
+            dir=config.EXPORT_DIR)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            await loop.run_in_executor(executor, st["wb"].save, tmp_path)
+        except Exception:
+            await loop.run_in_executor(executor, _close)
+            os.unlink(tmp_path)
+            raise
+        await loop.run_in_executor(executor, _close)
+    finally:
+        executor.shutdown(wait=False)
 
     async def stream_and_cleanup():
         try:
@@ -2009,23 +2051,40 @@ async def _export_xlsx_streaming(filename: str, batch_id: int = None,
 
 async def _export_csv_streaming(filename: str, batch_id: int = None,
                                  change_filter: str = "all", selected_fields=None):
-    """逐行 yield 的真流式 CSV（百万级不 OOM）"""
+    """分块流式 CSV（百万级不 OOM）。
+
+    P2：把每 _EXPORT_ROWS_PER_CHUNK 行的 _prepare_row + csv 格式化放到工作线程
+    （run_in_executor），避免行格式化的 CPU 工作占住事件循环；同时按块 yield 而非逐行，
+    减少 chunk 数量。DB 迭代仍在事件循环里 async 进行。
+    """
     include_batch_status = batch_id is not None
     headers, field_keys, include_total = _get_export_headers(
         selected_fields, include_batch_status=include_batch_status)
     needed_cols = _export_needed_columns(field_keys, include_total)
 
+    def _format_chunk(items):
+        out = io.StringIO()
+        w = csv.writer(out)
+        for item in items:
+            w.writerow(_prepare_row(
+                item, field_keys, headers, include_total,
+                include_batch_status=include_batch_status))
+        return out.getvalue().encode("utf-8")
+
     async def generate():
+        loop = asyncio.get_running_loop()
         out = io.StringIO()
         csv.writer(out).writerow(headers)
         yield out.getvalue().encode("utf-8-sig")
 
+        buf = []
         async for item in db.iter_results(batch_id, change_filter=change_filter, columns=needed_cols):
-            out = io.StringIO()
-            csv.writer(out).writerow(_prepare_row(
-                item, field_keys, headers, include_total,
-                include_batch_status=include_batch_status))
-            yield out.getvalue().encode("utf-8")
+            buf.append(item)
+            if len(buf) >= _EXPORT_ROWS_PER_CHUNK:
+                yield await loop.run_in_executor(None, _format_chunk, buf)
+                buf = []
+        if buf:
+            yield await loop.run_in_executor(None, _format_chunk, buf)
 
     safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', filename)
     return StreamingResponse(

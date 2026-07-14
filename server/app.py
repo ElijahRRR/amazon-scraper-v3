@@ -665,7 +665,7 @@ async def page_dashboard(request: Request):
     progress["completion_rate"] = round(progress["done"] / progress["total"] * 100, 1) if progress["total"] else 0
     progress["success_rate"] = round(progress["done"] / total * 100, 1) if total else 0
     batches = await db.get_batches()
-    return templates.TemplateResponse("dashboard.html", {
+    return templates.TemplateResponse(request=request, name="dashboard.html", context={
         "request": request,
         "progress": progress,
         "batches": batches,
@@ -676,7 +676,7 @@ async def page_dashboard(request: Request):
 @app.get("/tasks", response_class=HTMLResponse)
 async def page_tasks(request: Request):
     batches = await db.get_batches()
-    return templates.TemplateResponse("tasks.html", {
+    return templates.TemplateResponse(request=request, name="tasks.html", context={
         "request": request,
         "batches": batches,
         "default_zip_code": _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE),
@@ -685,17 +685,17 @@ async def page_tasks(request: Request):
 
 @app.get("/results", response_class=HTMLResponse)
 async def page_results(request: Request):
-    return templates.TemplateResponse("results.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="results.html", context={"request": request})
 
 
 @app.get("/workers", response_class=HTMLResponse)
 async def page_workers(request: Request):
-    return templates.TemplateResponse("workers.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="workers.html", context={"request": request})
 
 
 @app.get("/settings", response_class=HTMLResponse)
 async def page_settings(request: Request):
-    return templates.TemplateResponse("settings.html", {
+    return templates.TemplateResponse(request=request, name="settings.html", context={
         "request": request,
         "settings": _runtime_settings,
         "config": {
@@ -2103,16 +2103,56 @@ async def api_export_screenshots(batch_name: str):
     if not os.path.isdir(ss_dir):
         raise HTTPException(404, "无截图文件")
 
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in os.listdir(ss_dir):
-            if fname.endswith(".png"):
+    png_files = [
+        fname for fname in os.listdir(ss_dir)
+        if fname.lower().endswith(".png")
+        and os.path.isfile(os.path.join(ss_dir, fname))
+    ]
+    if not png_files:
+        raise HTTPException(404, "无截图文件")
+
+    # BytesIO 会让完整 ZIP 常驻进程内存；并发下载时按 ZIP 大小线性叠加。
+    # 落盘临时文件后按块发送，让常驻内存与截图批次大小脱钩。
+    import tempfile
+    os.makedirs(config.EXPORT_DIR, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".zip", prefix="screenshots_",
+        dir=config.EXPORT_DIR,
+    )
+    tmp_path = tmp.name
+    tmp.close()
+
+    def build_zip():
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            for fname in png_files:
                 zf.write(os.path.join(ss_dir, fname), fname)
 
-    output.seek(0)
+    try:
+        await asyncio.to_thread(build_zip)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    async def stream_and_cleanup():
+        try:
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
     filename = f"screenshots_{batch_name}.zip"
     return StreamingResponse(
-        output,
+        stream_and_cleanup(),
         media_type="application/zip",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )

@@ -1579,7 +1579,7 @@ class Worker:
         }
         for attempt in range(3):
             try:
-                async with httpx.AsyncClient(timeout=30, headers=self._server_headers()) as client:
+                async with httpx.AsyncClient(timeout=30) as client:
                     resp = await client.post(url, json=payload)
                 if resp.status_code == 200:
                     data = resp.json()

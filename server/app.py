@@ -243,12 +243,17 @@ async def _timeout_task_loop():
                 del _worker_registry[wid]
                 _global_coordinator.pop(wid, None)
 
-            # 清理导出临时文件（超过 1 小时的 export_*.xlsx）
+            # 清理导出临时文件（超过 1 小时）：
+            #   export_*.xlsx      —— xlsx 流式导出的临时文件
+            #   screenshots_*.zip  —— 截图 ZIP 流式导出的临时文件
+            # 正常路径由各自的 finally 删除；此处兜底进程崩溃/异常退出遗留的孤儿文件。
             try:
                 export_dir = config.EXPORT_DIR
                 if os.path.isdir(export_dir):
                     for fname in os.listdir(export_dir):
-                        if fname.startswith("export_") and fname.endswith(".xlsx"):
+                        is_export_tmp = fname.startswith("export_") and fname.endswith(".xlsx")
+                        is_screenshot_tmp = fname.startswith("screenshots_") and fname.endswith(".zip")
+                        if is_export_tmp or is_screenshot_tmp:
                             fpath = os.path.join(export_dir, fname)
                             if now - os.path.getmtime(fpath) > 3600:
                                 os.remove(fpath)

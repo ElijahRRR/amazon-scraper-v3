@@ -43,6 +43,9 @@ REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
 TASK_TIMEOUT_MINUTES = 10  # 硬超时兜底（liveness safety net），主回收靠心跳感知
 SESSION_ROTATE_EVERY = 1000
+# 会话池化后并发初始化闸门：冷启动/大规模轮换时最多同时初始化多少个 session，
+# 平滑代理 ~5 QPS CONNECT 突发。稳态下 session 复用、初始化很少，几乎无副作用。
+SESSION_INIT_CONCURRENCY = int(os.environ.get("SESSION_INIT_CONCURRENCY", "3"))
 
 # 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
 # （如定制尺寸围栏网，单族可达数千），跳过该产品的自动展开，防止一个种子炸成几千任务。

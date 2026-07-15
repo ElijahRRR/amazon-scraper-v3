@@ -260,6 +260,11 @@ class Worker:
         self._global_block_epoch = 0   # 已处理的全局封锁 epoch
         self._recovery_jitter = 0.5    # Server 分配的恢复抖动系数
 
+        # Tier 2a on_fetch 观测：商品页 glow 判定的命中分布，用于真机 A/B 判断安全性。
+        #   match=生效(True) / mismatch=未生效(False) / unknown=商品页无 glow(None，宽松放行)
+        # unknown 占比高 → 商品页不稳定暴露邮编 → on_fetch 不安全，应弃用或换信号。
+        self._zip_onfetch = {"match": 0, "mismatch": 0, "unknown": 0}
+
     def _server_headers(self) -> dict:
         """与 ERP Server 通信的统一 header（含 API Key 认证）"""
         h = {}
@@ -276,6 +281,9 @@ class Worker:
         logger.info(f"   邮编: {self.zip_code}")
         logger.info(f"   截图功能: {'开启' if self._enable_screenshot else '关闭'}")
         logger.info(f"   代理模式: TPS")
+        logger.info(f"   邮编验证模式: {getattr(config, 'ZIP_VERIFY_MODE', 'standalone')} "
+                    f"(on_fetch=省验证GET) | 会话初始化并发: "
+                    f"{getattr(config, 'SESSION_INIT_CONCURRENCY', 3)}")
 
         self._running = True
         self._stats["start_time"] = time.time()
@@ -1222,6 +1230,7 @@ class Worker:
                         and target_zip):
                     zip_eff = zip_effective_in_html(target_zip, resp.text)
                     if zip_eff is False:
+                        self._zip_onfetch["mismatch"] += 1
                         self._controller.record_result(req_elapsed, False, False, resp_bytes)
                         attempt += 1
                         last_error_type = "zip_not_effective"
@@ -1229,6 +1238,15 @@ class Worker:
                         logger.warning(f"ASIN {asin} 邮编未生效（目标 {target_zip}）(尝试 {attempt}/{max_retries})")
                         await slot.rotate(reason="邮编未生效")
                         continue
+                    # True=命中，None=商品页无 glow（宽松放行）。周期性汇总命中分布。
+                    self._zip_onfetch["match" if zip_eff is True else "unknown"] += 1
+                    _zt = sum(self._zip_onfetch.values())
+                    if _zt % 100 == 0:
+                        logger.info(
+                            f"📍 on_fetch 命中分布 | 生效:{self._zip_onfetch['match']} "
+                            f"未生效:{self._zip_onfetch['mismatch']} "
+                            f"无glow:{self._zip_onfetch['unknown']} (共 {_zt})"
+                        )
 
                 # v3: No Featured Offer 产品请求 AOD AJAX 端点补充价格/运费/配送/FBA
                 if result_data.get("current_price") == "No Featured Offer":

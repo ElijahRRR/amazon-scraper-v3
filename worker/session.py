@@ -18,6 +18,7 @@ from curl_cffi.requests import AsyncSession, Response
 
 from common import config
 from worker.proxy import ProxyManager
+from worker.ziputil import zip_effective_in_html
 
 # CAPTCHA 自动识别（可选依赖）
 try:
@@ -229,24 +230,15 @@ class AmazonSession:
             if resp.status_code != 200:
                 return False
 
-            text = resp.text
-            import re
-            zip_match = re.search(r'id="glow-ingress-line2"[^>]*>\s*([^<]+)', text)
-            if zip_match:
-                location_text = zip_match.group(1).strip()
-                if self.zip_code in location_text:
-                    logger.info(f"📍 邮编验证通过: {location_text}")
-                    return True
-                else:
-                    logger.warning(f"📍 邮编验证不匹配: 期望 {self.zip_code}, 页面显示 '{location_text}'")
-                    return False
-
-            non_us_indicators = ['CNY', '¥', '€', '£', 'JP¥']
-            for indicator in non_us_indicators:
-                if indicator in text[:50000]:
-                    logger.warning(f"📍 邮编验证失败: 页面包含非美国货币标识 '{indicator}'")
-                    return False
-
+            # 复用与 Tier 2a on_fetch 相同的判定逻辑（单一事实源），
+            # 仅在此处补充首页语境下的日志。
+            eff = zip_effective_in_html(self.zip_code, resp.text)
+            if eff is True:
+                logger.info(f"📍 邮编验证通过: {self.zip_code}")
+                return True
+            if eff is False:
+                logger.warning(f"📍 邮编验证不匹配/非美国区: 期望 {self.zip_code}")
+                return False
             logger.info(f"📍 邮编验证: 未找到 location widget，但无异常货币标识")
             return True
 

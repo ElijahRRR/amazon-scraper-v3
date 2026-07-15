@@ -67,8 +67,8 @@ class FakeSession:
     def is_ready(self):
         return self._ready and not self.closed
 
-    async def change_zip_code(self, target):
-        self.change_zip_calls.append(target)
+    async def change_zip_code(self, target, verify=True):
+        self.change_zip_calls.append((target, verify))
         if self.change_zip_ok:
             self.zip_code = target
         return self.change_zip_ok
@@ -173,8 +173,24 @@ class SessionSlotTests(unittest.TestCase):
         run(slot.ensure_ready())
         ok = run(slot.ensure_zip("90210"))
         self.assertTrue(ok)
-        self.assertEqual(slot.session.change_zip_calls, ["90210"])
+        # 默认 standalone 模式：change_zip_code(verify=True)
+        self.assertEqual(slot.session.change_zip_calls, [("90210", True)])
         self.assertEqual(slot.session.zip_code, "90210")
+
+    def test_ensure_zip_on_fetch_mode_skips_verify(self):
+        import common.config as appcfg
+        old = getattr(appcfg, "ZIP_VERIFY_MODE", "standalone")
+        appcfg.ZIP_VERIFY_MODE = "on_fetch"
+        try:
+            w = FakeWorker(zip_code="10001")
+            slot = SessionSlot(w)
+            run(slot.ensure_ready())
+            ok = run(slot.ensure_zip("90210"))
+            self.assertTrue(ok)
+            # on_fetch 模式：change_zip_code(verify=False)，不发独立验证 GET
+            self.assertEqual(slot.session.change_zip_calls, [("90210", False)])
+        finally:
+            appcfg.ZIP_VERIFY_MODE = old
 
     def test_ensure_zip_post_failure(self):
         w = FakeWorker(zip_code="10001")

@@ -30,6 +30,7 @@ from worker.session import AmazonSession
 from worker.parser import AmazonParser as _ParserClass
 from worker.metrics import MetricsCollector
 from worker.adaptive import AdaptiveController, TokenBucket
+from worker.ziputil import zip_effective_in_html
 
 # 日志配置
 logging.basicConfig(
@@ -80,12 +81,18 @@ class SessionSlot:
         return self.session is not None and self.session.is_ready()
 
     async def ensure_zip(self, target_zip: str) -> bool:
-        """把本 slot 的 session 切到目标邮编（无 drain）。返回是否成功。"""
+        """把本 slot 的 session 切到目标邮编（无 drain）。返回是否成功。
+
+        Tier 2a：on_fetch 模式下切邮编只 POST、不发独立验证 GET（verify=False），
+        邮编是否生效改由 _process_task 用商品页 HTML 判定。standalone 模式保持
+        POST + 验证 GET 的旧行为。
+        """
         if not target_zip or self.session is None:
             return True
         if self.session.zip_code == target_zip:
             return True
-        return await self.session.change_zip_code(target_zip)
+        verify = getattr(config, "ZIP_VERIFY_MODE", "standalone") != "on_fetch"
+        return await self.session.change_zip_code(target_zip, verify=verify)
 
     def note_success(self):
         self._success_since_rotate += 1
@@ -1205,6 +1212,23 @@ class Worker:
                     logger.warning(f"ASIN {asin} 核心字段全部缺失，疑似降级页面 (尝试 {attempt}/{max_retries})")
                     await slot.rotate_on_empty(asin, reason="核心字段缺失")
                     continue
+
+                # Tier 2a：邮编验证折叠——on_fetch 模式下切邮编不发独立验证 GET，
+                # 改用刚采到的这张商品页 HTML 自身的 glow 挂件判定目标邮编是否生效。
+                #   True  → 生效，正常写库（省掉了一次验证 GET）
+                #   False → 明确未生效（glow 显示别的邮编/非美国区）→ 轮换换 IP 重采，不写脏数据
+                #   None  → 商品页未暴露 glow 邮编 → 无法判定，宽松放行（非美国区已被上面的货币校验拦掉）
+                if (getattr(config, "ZIP_VERIFY_MODE", "standalone") == "on_fetch"
+                        and target_zip):
+                    zip_eff = zip_effective_in_html(target_zip, resp.text)
+                    if zip_eff is False:
+                        self._controller.record_result(req_elapsed, False, False, resp_bytes)
+                        attempt += 1
+                        last_error_type = "zip_not_effective"
+                        last_error_detail = f"商品页邮编未生效: target={target_zip}"
+                        logger.warning(f"ASIN {asin} 邮编未生效（目标 {target_zip}）(尝试 {attempt}/{max_retries})")
+                        await slot.rotate(reason="邮编未生效")
+                        continue
 
                 # v3: No Featured Offer 产品请求 AOD AJAX 端点补充价格/运费/配送/FBA
                 if result_data.get("current_price") == "No Featured Offer":

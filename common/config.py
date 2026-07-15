@@ -46,6 +46,13 @@ SESSION_ROTATE_EVERY = 1000
 # 会话池化后并发初始化闸门：冷启动/大规模轮换时最多同时初始化多少个 session，
 # 平滑代理 ~5 QPS CONNECT 突发。稳态下 session 复用、初始化很少，几乎无副作用。
 SESSION_INIT_CONCURRENCY = int(os.environ.get("SESSION_INIT_CONCURRENCY", "3"))
+# Tier 2a：邮编验证模式
+#   "standalone"（默认，旧行为）—— 切邮编后单发一次首页 GET 验证是否生效
+#   "on_fetch"                  —— 不发独立验证 GET；切邮编只 POST，采完商品后用
+#                                  商品页 HTML 自身的 glow 挂件判定邮编是否生效
+# per-ASIN 邮编批次下，on_fetch 每个 ASIN 省一次代理请求（验证 GET）。
+# 默认保守用 standalone；真机 A/B 验证 on_fetch 命中率达标后再切换/设默认。
+ZIP_VERIFY_MODE = os.environ.get("ZIP_VERIFY_MODE", "standalone")
 
 # 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
 # （如定制尺寸围栏网，单族可达数千），跳过该产品的自动展开，防止一个种子炸成几千任务。

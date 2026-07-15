@@ -28,6 +28,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# 切换邮编后的验证重试：TPS 模式每请求换 IP，POST 设置地址后，验证 GET 走的是
+# 另一个出口 IP，Amazon 的收货地址常有传播延迟 → 首次验证易“看到旧邮编”而误判失败。
+# 带几次重试吸收该延迟，把本可成功的切换从误判里救回来。
+_ZIP_VERIFY_ATTEMPTS = 3         # 验证最大尝试次数
+_ZIP_VERIFY_RETRY_DELAY = 1.2    # 每次验证之间等待（秒）
+
 
 class AmazonSession:
     """
@@ -211,13 +217,14 @@ class AmazonSession:
             logger.error(f"📍 邮编设置异常: {e}")
             return False
 
-    async def _verify_zip_code(self) -> bool:
-        """验证邮编是否实际生效"""
+    async def _verify_zip_code(self, timeout: float = 8.0) -> bool:
+        """验证邮编是否实际生效（用较短超时，避免验证 GET 空耗到 20s）"""
         try:
             headers = self._build_headers(referer="https://www.amazon.com/")
             resp = await self._session.get(
                 self.AMAZON_BASE,
                 headers=headers,
+                timeout=timeout,
             )
             if resp.status_code != 200:
                 return False
@@ -272,15 +279,23 @@ class AmazonSession:
             logger.warning(f"📍 切换邮编失败（POST 阶段）: {old_zip} → {new_zip}，已回滚")
             self.zip_code = old_zip
             return False
-        # 2) 可选：验证页面是否生效
+        # 2) 可选：验证页面是否生效（带重试吸收 TPS 换 IP 的地址传播延迟）
         if verify:
-            try:
-                ok = await self._verify_zip_code()
-            except Exception as e:
-                logger.warning(f"📍 切换邮编验证异常: {e}")
-                ok = False
+            ok = False
+            for vattempt in range(_ZIP_VERIFY_ATTEMPTS):
+                try:
+                    ok = await self._verify_zip_code()
+                except Exception as e:
+                    logger.warning(f"📍 切换邮编验证异常: {e}")
+                    ok = False
+                if ok:
+                    break
+                # POST 已被 Amazon 接受；换 IP 场景下地址有传播延迟，
+                # 短暂等待后重验即可，无需重发 POST。
+                if vattempt < _ZIP_VERIFY_ATTEMPTS - 1:
+                    await asyncio.sleep(_ZIP_VERIFY_RETRY_DELAY)
             if not ok:
-                logger.warning(f"📍 切换邮编未通过验证: {old_zip} → {new_zip}，已回滚")
+                logger.warning(f"📍 切换邮编未通过验证（{_ZIP_VERIFY_ATTEMPTS} 次）: {old_zip} → {new_zip}，已回滚")
                 # 尽力把邮编改回去（best-effort）
                 self.zip_code = old_zip
                 try:

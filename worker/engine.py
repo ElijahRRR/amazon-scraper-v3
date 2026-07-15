@@ -282,10 +282,7 @@ class Worker:
                         if batch_id and await self._is_batch_scrape_complete(batch_id):
                             scrape_complete_batches.add(batch)
 
-                    if not scrape_complete_batches:
-                        await asyncio.sleep(1)
-                        continue
-
+                    # 为已采完的批次写 _scraping_done 标记（让截图子进程可以收尾该批）
                     for batch in scrape_complete_batches:
                         marker = os.path.join(self._screenshot_html_dir, batch, "_scraping_done")
                         if not os.path.exists(marker):
@@ -293,39 +290,38 @@ class Worker:
                             with open(marker, "w") as f:
                                 f.write(str(time.time()))
 
+                    # 只要还有批次没采完（server 仍有 pending/processing，例如
+                    # zip_switch_failed 重入队的任务），就【不门控】，落到下面正常拉取
+                    # 把这些任务捞回来重试。否则 worker 会卡在这里空转轮询 /api/progress、
+                    # 又不拉那些 pending 任务 → 活锁（批次永远到不了 100%）。
                     incomplete_batches = self._screenshot_pending_batches - scrape_complete_batches
-                    if incomplete_batches:
-                        logger.info(
-                            f"📸 批次仍在采集，暂不门控: {sorted(incomplete_batches)}"
-                        )
-                        await asyncio.sleep(1)
+                    if not incomplete_batches:
+                        pending = len(scrape_complete_batches)
+                        logger.info(f"⏸️ 等待截图完成后再拉取新任务（{pending} 个批次待处理）")
+                        self._screenshot_gate.clear()
+
+                        # 检测截图子进程是否存活，崩溃则强制放行
+                        if self._screenshot_process and self._screenshot_process.returncode is not None:
+                            logger.warning(f"📸 截图子进程已退出 (code={self._screenshot_process.returncode})，跳过门控")
+                            self._screenshot_pending_batches.clear()
+                            self._screenshot_batch_ids.clear()
+                            self._screenshot_gate.set()
+                            continue
+
+                        # 门控超时：最多等 5 分钟，避免子进程异常导致 Worker 永久卡死
+                        try:
+                            await asyncio.wait_for(self._screenshot_gate.wait(), timeout=300)
+                            if not self._running:
+                                # shutdown 触发的解锁（stop() 里 set 了 gate）
+                                break
+                            logger.info("▶️ 截图批次已完成，继续拉取新任务")
+                        except asyncio.TimeoutError:
+                            logger.warning("⚠️ 截图门控超时（5分钟），强制放行继续拉取任务")
+                            self._screenshot_pending_batches.clear()
+                            self._screenshot_batch_ids.clear()
+                            self._screenshot_gate.set()
                         continue
-
-                    pending = len(scrape_complete_batches)
-                    logger.info(f"⏸️ 等待截图完成后再拉取新任务（{pending} 个批次待处理）")
-                    self._screenshot_gate.clear()
-
-                    # 检测截图子进程是否存活，崩溃则强制放行
-                    if self._screenshot_process and self._screenshot_process.returncode is not None:
-                        logger.warning(f"📸 截图子进程已退出 (code={self._screenshot_process.returncode})，跳过门控")
-                        self._screenshot_pending_batches.clear()
-                        self._screenshot_batch_ids.clear()
-                        self._screenshot_gate.set()
-                        continue
-
-                    # 门控超时：最多等 5 分钟，避免子进程异常导致 Worker 永久卡死
-                    try:
-                        await asyncio.wait_for(self._screenshot_gate.wait(), timeout=300)
-                        if not self._running:
-                            # shutdown 触发的解锁（stop() 里 set 了 gate）
-                            break
-                        logger.info("▶️ 截图批次已完成，继续拉取新任务")
-                    except asyncio.TimeoutError:
-                        logger.warning("⚠️ 截图门控超时（5分钟），强制放行继续拉取任务")
-                        self._screenshot_pending_batches.clear()
-                        self._screenshot_batch_ids.clear()
-                        self._screenshot_gate.set()
-                    continue
+                    # 还有批次未采完 → 不 continue，落到下面正常拉取逻辑
                 threshold = int(self._queue_size * self._prefetch_threshold)
 
                 if queue_size < threshold:

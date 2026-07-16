@@ -417,5 +417,30 @@ class LooksDegradedDeliveryTests(unittest.TestCase):
         self.assertFalse(self._f(self._base(stock_status="N/A")))
 
 
+class DumpDegradedHtmlTests(unittest.TestCase):
+    """_dump_degraded_html 门控（用 SimpleNamespace 作 self，避免实例化 Worker）。"""
+
+    def test_disabled_is_noop(self):
+        fake = types.SimpleNamespace(
+            _dump_degraded=False, _degraded_dump_count=0,
+            _degraded_dump_max=300, _degraded_dump_dir="/nonexistent")
+        run(Worker._dump_degraded_html(fake, "B0X", "10001", "<html>x</html>"))
+        self.assertEqual(fake._degraded_dump_count, 0)  # 关闭时直接返回、不写盘
+
+    def test_cap_reached_is_noop(self):
+        fake = types.SimpleNamespace(
+            _dump_degraded=True, _degraded_dump_count=300,
+            _degraded_dump_max=300, _degraded_dump_dir="/nonexistent")
+        run(Worker._dump_degraded_html(fake, "B0X", "10001", "<html>x</html>"))
+        self.assertEqual(fake._degraded_dump_count, 300)  # 达上限不再写
+
+    def test_empty_html_is_noop(self):
+        fake = types.SimpleNamespace(
+            _dump_degraded=True, _degraded_dump_count=0,
+            _degraded_dump_max=300, _degraded_dump_dir="/nonexistent")
+        run(Worker._dump_degraded_html(fake, "B0X", "10001", ""))
+        self.assertEqual(fake._degraded_dump_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

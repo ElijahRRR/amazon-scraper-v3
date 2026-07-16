@@ -275,6 +275,13 @@ class Worker:
         # unknown 占比高 → 商品页不稳定暴露邮编 → on_fetch 不安全，应弃用或换信号。
         self._zip_onfetch = {"match": 0, "mismatch": 0, "unknown": 0}
 
+        # 降级页样本采集（排查用，默认关，见 config.DUMP_DEGRADED_HTML）
+        self._dump_degraded = getattr(config, "DUMP_DEGRADED_HTML", False)
+        self._degraded_dump_max = getattr(config, "DEGRADED_DUMP_MAX", 300)
+        self._degraded_dump_count = 0
+        self._degraded_dump_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "degraded_dump")
+
     def _server_headers(self) -> dict:
         """与 ERP Server 通信的统一 header（含 API Key 认证）"""
         h = {}
@@ -297,6 +304,9 @@ class Worker:
                     f"{getattr(config, 'SESSION_INIT_CONCURRENCY', 3)}")
         logger.info(f"   降级页兜底: 可售但无配送区时轮换重采 ×"
                     f"{getattr(config, 'DELIVERY_RETRY_MAX', 2)} (0=关闭)")
+        if self._dump_degraded:
+            logger.info(f"   降级页样本采集: 开启 (上限 {self._degraded_dump_max}，"
+                        f"目录 {self._degraded_dump_dir})")
 
         self._running = True
         self._stats["start_time"] = time.time()
@@ -1033,6 +1043,32 @@ class Worker:
             return False
         return True
 
+    async def _dump_degraded_html(self, asin: str, zip_code: str, html: str):
+        """把疑似降级页的原始 HTML 存到独立目录（截图流程不碰它），供离线排查。
+
+        默认关（DUMP_DEGRADED_HTML=1 开启），带数量上限防塞满盘。任何异常都吞掉，
+        绝不影响采集主流程。
+        """
+        if not self._dump_degraded or not html:
+            return
+        if self._degraded_dump_count >= self._degraded_dump_max:
+            return
+        try:
+            os.makedirs(self._degraded_dump_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            n = self._degraded_dump_count
+            fname = f"{asin}_{zip_code or 'na'}_{ts}_{n}.html"
+            path = os.path.join(self._degraded_dump_dir, fname)
+            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+                await f.write(html)
+            self._degraded_dump_count += 1
+            if self._degraded_dump_count == 1:
+                logger.info(f"🗂️ 降级页样本采集已开启，写入 {self._degraded_dump_dir}")
+            elif self._degraded_dump_count == self._degraded_dump_max:
+                logger.info(f"🗂️ 降级页样本已达上限 {self._degraded_dump_max}，停止 dump")
+        except Exception as e:
+            logger.debug(f"降级页 dump 失败 {asin}: {e}")
+
     async def _process_task(self, task: Dict, slot: "SessionSlot") -> tuple:
         """
         处理单个采集任务
@@ -1324,8 +1360,8 @@ class Worker:
                 # 却删掉了配送区(配送 ETA + 变体报价)，导致 delivery_date=N/A。换 IP 重采
                 # 尝试拿到完整页（顺带救回变体/报价）。有上限，用尽仍无配送才接受 N/A。
                 _dret_cap = getattr(config, "DELIVERY_RETRY_MAX", 2)
-                if (_dret_cap > 0 and delivery_retry_tries < _dret_cap
-                        and self._looks_degraded_delivery(result_data)):
+                _degraded = self._looks_degraded_delivery(result_data)
+                if _degraded and _dret_cap > 0 and delivery_retry_tries < _dret_cap:
                     delivery_retry_tries += 1
                     self._controller.record_result(req_elapsed, False, False, resp_bytes)
                     logger.warning(
@@ -1334,6 +1370,9 @@ class Worker:
                     )
                     await slot.rotate(reason="降级页无配送区")
                     continue
+                if _degraded:
+                    # 重采用尽/已关闭仍降级：接受 N/A 结果，同时按需 dump 原始 HTML 供排查
+                    await self._dump_degraded_html(asin, zip_code, resp.text)
 
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes)

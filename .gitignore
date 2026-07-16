@@ -9,6 +9,8 @@ data/exports/
 data/schedules/
 server/static/screenshots/
 screenshot_cache/
+degraded_dump/
+worker/degraded_dump/
 runtime_settings.json
 *.egg-info/
 .venv/

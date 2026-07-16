@@ -63,6 +63,11 @@ ZIP_REPOST_MAX_TRIES = int(os.environ.get("ZIP_REPOST_MAX_TRIES", "2"))
 # 却拿不到配送区时，判为降级页 → 轮换换 IP 重采，最多重采 N 次仍无配送才接受 N/A。
 # 每次命中多花代理请求；能否恢复取决于换 IP 后是否仍降级（真机验证）。设 0 关闭。
 DELIVERY_RETRY_MAX = int(os.environ.get("DELIVERY_RETRY_MAX", "2"))
+# 降级页样本采集（排查用，默认关）：DUMP_DEGRADED_HTML=1 时，把重采用尽后仍判定为
+# 降级页（可售但无配送区）的原始 HTML 另存到 worker/degraded_dump（截图流程不碰它），
+# 供离线分析、收紧检测条件。DEGRADED_DUMP_MAX 限制最多存多少张，防塞满磁盘。
+DUMP_DEGRADED_HTML = os.environ.get("DUMP_DEGRADED_HTML", "0") == "1"
+DEGRADED_DUMP_MAX = int(os.environ.get("DEGRADED_DUMP_MAX", "300"))
 
 # 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
 # （如定制尺寸围栏网，单族可达数千），跳过该产品的自动展开，防止一个种子炸成几千任务。

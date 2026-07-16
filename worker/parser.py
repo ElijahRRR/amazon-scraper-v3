@@ -36,6 +36,18 @@ else:
     logger.info("解析引擎: lxml (fallback)")
 
 
+# 配送日期匹配（Tomorrow/Today 或 "Month Day"）。抽成模块级编译常量，
+# selectolax / lxml 两条解析路径共用同一份逻辑，避免重复维护。
+_DELIVERY_DATE_RE = re.compile(
+    r'(Tomorrow|Today|'
+    r'Jan(?:uary)?\.?\s+\d+|Feb(?:ruary)?\.?\s+\d+|Mar(?:ch)?\.?\s+\d+|'
+    r'Apr(?:il)?\.?\s+\d+|May\.?\s+\d+|Jun(?:e)?\.?\s+\d+|'
+    r'Jul(?:y)?\.?\s+\d+|Aug(?:ust)?\.?\s+\d+|Sep(?:tember)?\.?\s+\d+|'
+    r'Oct(?:ober)?\.?\s+\d+|Nov(?:ember)?\.?\s+\d+|Dec(?:ember)?\.?\s+\d+)',
+    re.IGNORECASE,
+)
+
+
 class AmazonParser:
     """Amazon 商品页面解析器"""
 
@@ -534,52 +546,70 @@ class AmazonParser:
             pass
         return 999
 
+    def _delivery_raw_to_days(self, raw: str, today) -> Optional[int]:
+        """把 "Tomorrow"/"Today"/"July 20" 之类的日期文本换算成距今天数；无法解析返回 None。"""
+        low = raw.lower()
+        if "today" in low:
+            return 0
+        if "tomorrow" in low:
+            return 1
+        try:
+            import dateparser
+            dt = dateparser.parse(raw, settings={'PREFER_DATES_FROM': 'future'})
+            if not dt:
+                return None
+            if dt.month < today.month and today.month == 12:
+                dt = dt.replace(year=today.year + 1)
+            elif dt.year < today.year:
+                dt = dt.replace(year=today.year)
+            return (dt.date() - today.date()).days
+        except Exception:
+            return None
+
+    def _pick_delivery(self, candidates: List[str]) -> Tuple[str, str]:
+        """从配送候选文本里选**页面上能看到的最快**配送日期/时长（含 Prime 会员专享）。
+
+        candidates: 配送文本列表——data-csa-c-delivery-time 属性值（权威），或回退
+        用的整段配送文本。从中用正则抽出所有日期，取距今天数最小者。
+        """
+        today = datetime.now()
+        best_raw, best_days = None, 999
+        for text in candidates:
+            for m in _DELIVERY_DATE_RE.finditer(text):
+                raw = m.group(1)
+                days = self._delivery_raw_to_days(raw, today)
+                if days is None or days < 0:
+                    continue
+                if days < best_days:
+                    best_raw, best_days = raw, days
+        if best_raw is not None:
+            return best_raw, str(best_days)
+        return "N/A", "N/A"
+
     def _slx_parse_delivery(self, tree) -> Tuple[str, str]:
         try:
-            texts = []
-            for n in tree.css('[data-csa-c-delivery-time] *, div.delivery-message *'):
-                t = n.text(strip=True)
-                if t:
-                    texts.append(t)
-            full_text = " ".join(texts)
-            today = datetime.now()
-            min_days = 999
-            best_date_str = "N/A"
+            # 优先直接读 data-csa-c-delivery-time 属性（权威、格式稳定 "Weekday, Month Day"），
+            # 比抓子元素文本鲁棒：有的模板日期是属性所在 span 的直接文本节点，
+            # 旧的 '[attr] *' 选择器抓不到任何子元素 → 返回 N/A。
+            candidates: List[str] = []
+            for n in tree.css('[data-csa-c-delivery-time]'):
+                raw = (n.attributes.get('data-csa-c-delivery-time') or "").strip()
+                if raw:
+                    candidates.append(raw)
 
-            pattern = (
-                r'(Tomorrow|Today|'
-                r'Jan(?:uary)?\.?\s+\d+|Feb(?:ruary)?\.?\s+\d+|Mar(?:ch)?\.?\s+\d+|'
-                r'Apr(?:il)?\.?\s+\d+|May\.?\s+\d+|Jun(?:e)?\.?\s+\d+|'
-                r'Jul(?:y)?\.?\s+\d+|Aug(?:ust)?\.?\s+\d+|Sep(?:tember)?\.?\s+\d+|'
-                r'Oct(?:ober)?\.?\s+\d+|Nov(?:ember)?\.?\s+\d+|Dec(?:ember)?\.?\s+\d+)'
-            )
+            # 回退：页面不带该属性时，用整段配送文本 + 正则（覆盖老/异形模板）。
+            if not candidates:
+                texts = []
+                for n in tree.css('[data-csa-c-delivery-time] *, div.delivery-message *, '
+                                  'div#deliveryBlockMessage *'):
+                    t = n.text(strip=True)
+                    if t:
+                        texts.append(t)
+                if texts:
+                    candidates.append(" ".join(texts))
 
-            for m in re.finditer(pattern, full_text, re.IGNORECASE):
-                raw = m.group(1)
-                days = 999
-                if "today" in raw.lower():
-                    days = 0
-                elif "tomorrow" in raw.lower():
-                    days = 1
-                else:
-                    try:
-                        import dateparser
-                        dt = dateparser.parse(raw, settings={'PREFER_DATES_FROM': 'future'})
-                        if dt:
-                            if dt.month < today.month and today.month == 12:
-                                dt = dt.replace(year=today.year + 1)
-                            elif dt.year < today.year:
-                                dt = dt.replace(year=today.year)
-                            days = (dt.date() - today.date()).days
-                    except Exception:
-                        continue
-
-                if 0 <= days < min_days:
-                    min_days = days
-                    best_date_str = raw
-
-            if min_days < 999:
-                return best_date_str, str(min_days)
+            if candidates:
+                return self._pick_delivery(candidates)
         except Exception:
             pass
         return "N/A", "N/A"
@@ -1893,47 +1923,24 @@ class AmazonParser:
 
     def _parse_delivery(self, tree) -> Tuple[str, str]:
         try:
-            texts = self._get_all_text(tree,
-                '//*[@data-csa-c-delivery-time]//text() | //div[contains(@class,"delivery-message")]//text()')
-            full_text = " ".join(texts)
-            today = datetime.now()
-            min_days = 999
-            best_date_str = "N/A"
+            # 与 selectolax 路径一致：优先直接读 data-csa-c-delivery-time 属性值；
+            # 无属性时回退整段配送文本。
+            candidates: List[str] = []
+            for el in tree.xpath('//*[@data-csa-c-delivery-time]'):
+                raw = (el.get('data-csa-c-delivery-time') or "").strip()
+                if raw:
+                    candidates.append(raw)
 
-            pattern = (
-                r'(Tomorrow|Today|'
-                r'Jan(?:uary)?\.?\s+\d+|Feb(?:ruary)?\.?\s+\d+|Mar(?:ch)?\.?\s+\d+|'
-                r'Apr(?:il)?\.?\s+\d+|May\.?\s+\d+|Jun(?:e)?\.?\s+\d+|'
-                r'Jul(?:y)?\.?\s+\d+|Aug(?:ust)?\.?\s+\d+|Sep(?:tember)?\.?\s+\d+|'
-                r'Oct(?:ober)?\.?\s+\d+|Nov(?:ember)?\.?\s+\d+|Dec(?:ember)?\.?\s+\d+)'
-            )
+            if not candidates:
+                texts = self._get_all_text(tree,
+                    '//*[@data-csa-c-delivery-time]//text() | '
+                    '//div[contains(@class,"delivery-message")]//text() | '
+                    '//div[@id="deliveryBlockMessage"]//text()')
+                if texts:
+                    candidates.append(" ".join(texts))
 
-            for m in re.finditer(pattern, full_text, re.IGNORECASE):
-                raw = m.group(1)
-                days = 999
-                if "today" in raw.lower():
-                    days = 0
-                elif "tomorrow" in raw.lower():
-                    days = 1
-                else:
-                    try:
-                        import dateparser
-                        dt = dateparser.parse(raw, settings={'PREFER_DATES_FROM': 'future'})
-                        if dt:
-                            if dt.month < today.month and today.month == 12:
-                                dt = dt.replace(year=today.year + 1)
-                            elif dt.year < today.year:
-                                dt = dt.replace(year=today.year)
-                            days = (dt.date() - today.date()).days
-                    except Exception:
-                        continue
-
-                if 0 <= days < min_days:
-                    min_days = days
-                    best_date_str = raw
-
-            if min_days < 999:
-                return best_date_str, str(min_days)
+            if candidates:
+                return self._pick_delivery(candidates)
         except Exception:
             pass
         return "N/A", "N/A"

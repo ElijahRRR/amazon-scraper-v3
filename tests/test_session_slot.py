@@ -48,7 +48,7 @@ _stub("worker.adaptive", AdaptiveController=object, TokenBucket=object)
 import logging
 logging.disable(logging.CRITICAL)
 
-from worker.engine import SessionSlot  # noqa: E402
+from worker.engine import SessionSlot, Worker  # noqa: E402
 
 
 # ── Fakes ───────────────────────────────────────────────────────────────────
@@ -379,6 +379,42 @@ class SessionSlotTests(unittest.TestCase):
         run(slot.close())
         self.assertTrue(s.closed)
         self.assertIsNone(slot.session)
+
+
+class LooksDegradedDeliveryTests(unittest.TestCase):
+    """_looks_degraded_delivery：判定"可售但无配送区"的软降级页（纯 dict 逻辑，
+    不用 self，故用 Worker._looks_degraded_delivery(None, r) 直接调）。"""
+
+    def _f(self, r):
+        return Worker._looks_degraded_delivery(None, r)
+
+    def _base(self, **kw):
+        r = {"delivery_date": "N/A", "current_price": "$9.99",
+             "is_fba": "FBA", "stock_status": "In Stock"}
+        r.update(kw)
+        return r
+
+    def test_degraded_fba_in_stock_no_delivery(self):
+        self.assertTrue(self._f(self._base()))
+        self.assertTrue(self._f(self._base(delivery_date=None)))
+        self.assertTrue(self._f(self._base(delivery_date="")))
+        self.assertTrue(self._f(self._base(stock_status="Only 3 left in stock")))
+
+    def test_not_degraded_when_delivery_present(self):
+        self.assertFalse(self._f(self._base(delivery_date="July 20")))
+
+    def test_not_degraded_when_not_fba(self):
+        self.assertFalse(self._f(self._base(is_fba="第三方")))
+        self.assertFalse(self._f(self._base(is_fba="N/A")))
+
+    def test_not_degraded_when_not_sellable(self):
+        for price in ("N/A", "No Featured Offer", "不可售", "See price in cart", ""):
+            self.assertFalse(self._f(self._base(current_price=price)), price)
+
+    def test_not_degraded_when_unavailable_or_empty_stock(self):
+        self.assertFalse(self._f(self._base(stock_status="Currently unavailable")))
+        self.assertFalse(self._f(self._base(stock_status="")))
+        self.assertFalse(self._f(self._base(stock_status="N/A")))
 
 
 if __name__ == "__main__":

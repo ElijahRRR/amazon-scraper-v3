@@ -295,6 +295,8 @@ class Worker:
                     f"(on_fetch=省验证GET，未生效先重发POST×"
                     f"{getattr(config, 'ZIP_REPOST_MAX_TRIES', 2)}再冷轮换) | 会话初始化并发: "
                     f"{getattr(config, 'SESSION_INIT_CONCURRENCY', 3)}")
+        logger.info(f"   降级页兜底: 可售但无配送区时轮换重采 ×"
+                    f"{getattr(config, 'DELIVERY_RETRY_MAX', 2)} (0=关闭)")
 
         self._running = True
         self._stats["start_time"] = time.time()
@@ -1012,6 +1014,25 @@ class Worker:
         _jitter_max = min(0.3, 0.5 / _qps)
         await asyncio.sleep(random.uniform(0, _jitter_max))
 
+    def _looks_degraded_delivery(self, r: Dict) -> bool:
+        """判断是否疑似"软降级"页：商品可售（有真实价格 + FBA + 有货）但配送区缺失。
+
+        亚马逊对可疑请求会删掉配送 ETA/变体报价，此时 delivery_date=N/A 但价格/库存仍在。
+        用它区分"降级页导致的无配送"(该重采) 与"商品本就无配送/不可售"(不该重采)。
+        """
+        if r.get("delivery_date") not in (None, "", "N/A"):
+            return False
+        price = r.get("current_price")
+        if price in (None, "", "N/A", "No Featured Offer", "不可售", "See price in cart"):
+            return False
+        # FBA 商品几乎总有配送 ETA；非 FBA/第三方可能本就不显示，保守只对 FBA 重采。
+        if str(r.get("is_fba") or "") != "FBA":
+            return False
+        stock = str(r.get("stock_status") or "").lower()
+        if not stock or stock in ("n/a", "none") or "unavailable" in stock:
+            return False
+        return True
+
     async def _process_task(self, task: Dict, slot: "SessionSlot") -> tuple:
         """
         处理单个采集任务
@@ -1032,6 +1053,7 @@ class Worker:
         last_error_detail = ""
         attempt = 0
         zip_repost_tries = 0  # on_fetch 邮编未生效时的同 session 重发计数（冷轮换后清零）
+        delivery_retry_tries = 0  # 疑似降级页（可售但无配送区）的轮换重采计数
         while attempt < max_retries:
             try:
                 # === Session 获取（本协程私有 slot，独立 session）===
@@ -1297,6 +1319,21 @@ class Worker:
                                 logger.info(f"NFO {asin} OLP: {offer['price']} ship={offer.get('shipping','?')} {offer.get('is_fba','?')} del={offer.get('delivery','?')}")
                     except Exception as e:
                         logger.debug(f"NFO {asin} offer-listing 请求失败: {e}")
+
+                # 软降级页兜底：亚马逊对可疑请求返回"降级"页——商品明明可售(FBA/In Stock)
+                # 却删掉了配送区(配送 ETA + 变体报价)，导致 delivery_date=N/A。换 IP 重采
+                # 尝试拿到完整页（顺带救回变体/报价）。有上限，用尽仍无配送才接受 N/A。
+                _dret_cap = getattr(config, "DELIVERY_RETRY_MAX", 2)
+                if (_dret_cap > 0 and delivery_retry_tries < _dret_cap
+                        and self._looks_degraded_delivery(result_data)):
+                    delivery_retry_tries += 1
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
+                    logger.warning(
+                        f"ASIN {asin} 疑似降级页（可售但无配送区），轮换换 IP 重采 "
+                        f"[{delivery_retry_tries}/{_dret_cap}]"
+                    )
+                    await slot.rotate(reason="降级页无配送区")
+                    continue
 
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes)

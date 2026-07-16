@@ -21,6 +21,10 @@ if not os.path.isdir(os.path.join(_REPO_ROOT, "worker")):
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+# 其他测试（如 test_session_slot）会把 worker.parser 桩成 fake 塞进 sys.modules。
+# 本文件需要真实解析器，运行顺序在其后时会拿到桩件 → 先移除，强制加载真实模块。
+sys.modules.pop("worker.parser", None)
+
 from worker.parser import AmazonParser  # noqa: E402
 
 try:

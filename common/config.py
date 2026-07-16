@@ -58,6 +58,11 @@ ZIP_VERIFY_MODE = os.environ.get("ZIP_VERIFY_MODE", "on_fetch")
 # 小于冷轮换），最多重发 N 次仍未生效才回退到冷轮换换 IP。冷轮换会关 session +
 # report_blocked，喂给代理 429/被封计数；重发 POST 则复用 IP 预算，更省。
 ZIP_REPOST_MAX_TRIES = int(os.environ.get("ZIP_REPOST_MAX_TRIES", "2"))
+# 软降级页兜底：亚马逊对可疑请求（经 TPS 轮换代理的数据中心 IP）有时只返回标题/
+# 价格/图片，删掉个性化区块（配送 ETA + 变体报价）。商品明明可售（FBA/In Stock）
+# 却拿不到配送区时，判为降级页 → 轮换换 IP 重采，最多重采 N 次仍无配送才接受 N/A。
+# 每次命中多花代理请求；能否恢复取决于换 IP 后是否仍降级（真机验证）。设 0 关闭。
+DELIVERY_RETRY_MAX = int(os.environ.get("DELIVERY_RETRY_MAX", "2"))
 
 # 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
 # （如定制尺寸围栏网，单族可达数千），跳过该产品的自动展开，防止一个种子炸成几千任务。

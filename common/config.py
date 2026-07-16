@@ -43,6 +43,31 @@ REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
 TASK_TIMEOUT_MINUTES = 10  # 硬超时兜底（liveness safety net），主回收靠心跳感知
 SESSION_ROTATE_EVERY = 1000
+# 会话池化后并发初始化闸门：冷启动/大规模轮换时最多同时初始化多少个 session，
+# 平滑代理 ~5 QPS CONNECT 突发。稳态下 session 复用、初始化很少，几乎无副作用。
+SESSION_INIT_CONCURRENCY = int(os.environ.get("SESSION_INIT_CONCURRENCY", "3"))
+# Tier 2a：邮编验证模式
+#   "on_fetch"（默认）—— 不发独立验证 GET；切邮编只 POST，采完商品后用商品页
+#                        HTML 自身的 glow 挂件判定邮编是否生效
+#   "standalone"       —— 旧行为：切邮编后单发一次首页 GET 验证是否生效
+# per-ASIN 邮编批次下，on_fetch 每个 ASIN 省一次代理请求（验证 GET）。真机 A/B
+# 已验证 on_fetch 数据准确、未生效能被 glow 捕获并重试、zip 失败率更低，故设为默认；
+# 需回退旧行为时设 ZIP_VERIFY_MODE=standalone。
+ZIP_VERIFY_MODE = os.environ.get("ZIP_VERIFY_MODE", "on_fetch")
+# on_fetch 下「商品页邮编未生效」的处理：先在同一 session 上重发邮编 POST（代价远
+# 小于冷轮换），最多重发 N 次仍未生效才回退到冷轮换换 IP。冷轮换会关 session +
+# report_blocked，喂给代理 429/被封计数；重发 POST 则复用 IP 预算，更省。
+ZIP_REPOST_MAX_TRIES = int(os.environ.get("ZIP_REPOST_MAX_TRIES", "2"))
+# 软降级页兜底：亚马逊对可疑请求（经 TPS 轮换代理的数据中心 IP）有时只返回标题/
+# 价格/图片，删掉个性化区块（配送 ETA + 变体报价）。商品明明可售（FBA/In Stock）
+# 却拿不到配送区时，判为降级页 → 轮换换 IP 重采，最多重采 N 次仍无配送才接受 N/A。
+# 每次命中多花代理请求；能否恢复取决于换 IP 后是否仍降级（真机验证）。设 0 关闭。
+DELIVERY_RETRY_MAX = int(os.environ.get("DELIVERY_RETRY_MAX", "2"))
+# 降级页样本采集（排查用，默认关）：DUMP_DEGRADED_HTML=1 时，把重采用尽后仍判定为
+# 降级页（可售但无配送区）的原始 HTML 另存到 worker/degraded_dump（截图流程不碰它），
+# 供离线分析、收紧检测条件。DEGRADED_DUMP_MAX 限制最多存多少张，防塞满磁盘。
+DUMP_DEGRADED_HTML = os.environ.get("DUMP_DEGRADED_HTML", "0") == "1"
+DEGRADED_DUMP_MAX = int(os.environ.get("DEGRADED_DUMP_MAX", "300"))
 
 # 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
 # （如定制尺寸围栏网，单族可达数千），跳过该产品的自动展开，防止一个种子炸成几千任务。

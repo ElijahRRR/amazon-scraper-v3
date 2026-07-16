@@ -18,6 +18,7 @@ from curl_cffi.requests import AsyncSession, Response
 
 from common import config
 from worker.proxy import ProxyManager
+from worker.ziputil import zip_effective_in_html
 
 # CAPTCHA 自动识别（可选依赖）
 try:
@@ -229,24 +230,15 @@ class AmazonSession:
             if resp.status_code != 200:
                 return False
 
-            text = resp.text
-            import re
-            zip_match = re.search(r'id="glow-ingress-line2"[^>]*>\s*([^<]+)', text)
-            if zip_match:
-                location_text = zip_match.group(1).strip()
-                if self.zip_code in location_text:
-                    logger.info(f"📍 邮编验证通过: {location_text}")
-                    return True
-                else:
-                    logger.warning(f"📍 邮编验证不匹配: 期望 {self.zip_code}, 页面显示 '{location_text}'")
-                    return False
-
-            non_us_indicators = ['CNY', '¥', '€', '£', 'JP¥']
-            for indicator in non_us_indicators:
-                if indicator in text[:50000]:
-                    logger.warning(f"📍 邮编验证失败: 页面包含非美国货币标识 '{indicator}'")
-                    return False
-
+            # 复用与 Tier 2a on_fetch 相同的判定逻辑（单一事实源），
+            # 仅在此处补充首页语境下的日志。
+            eff = zip_effective_in_html(self.zip_code, resp.text)
+            if eff is True:
+                logger.info(f"📍 邮编验证通过: {self.zip_code}")
+                return True
+            if eff is False:
+                logger.warning(f"📍 邮编验证不匹配/非美国区: 期望 {self.zip_code}")
+                return False
             logger.info(f"📍 邮编验证: 未找到 location widget，但无异常货币标识")
             return True
 
@@ -305,6 +297,22 @@ class AmazonSession:
                 return False
         logger.info(f"📍 邮编切换成功: {old_zip} → {new_zip}")
         return True
+
+    async def resend_zip_code(self) -> bool:
+        """在同一 session 上重发一次当前邮编的 POST（不换 session、不重建、不验证）。
+
+        on_fetch 模式下商品页 glow 显示邮编未生效时使用：TPS 代理下未生效多因设置
+        POST 落的 IP 与后续抓页 IP 不一致，重发一次 POST（配合下一次抓页换新 IP）
+        通常即可让 glow 命中，代价远小于冷轮换（关 session + report_blocked，喂给
+        代理 429/被封计数）。返回 True 表示 POST 已成功发出、可原地重采。
+        """
+        if not self._initialized or self._session is None:
+            return False
+        try:
+            return await self._set_zip_code()
+        except Exception as e:
+            logger.warning(f"📍 邮编重发异常: {e}")
+            return False
 
     def _build_headers(self, referer: str = None) -> Dict[str, str]:
         """构建反指纹请求头"""

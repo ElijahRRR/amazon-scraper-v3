@@ -30,6 +30,7 @@ from worker.session import AmazonSession
 from worker.parser import AmazonParser as _ParserClass
 from worker.metrics import MetricsCollector
 from worker.adaptive import AdaptiveController, TokenBucket
+from worker.ziputil import zip_effective_in_html
 
 # 日志配置
 logging.basicConfig(
@@ -38,6 +39,118 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+class SessionSlot:
+    """一个采集协程私有的 Amazon session + 轮换状态。
+
+    每个 worker 协程独占一个 slot、一个 AmazonSession。协程**串行**使用自己的
+    session（改邮编 → 采集 → 处理），所以切邮编无需 drain 全局在飞请求——只有本
+    协程用这个 session。多个 slot 的不同邮编由此真正并行（消除单共享 session +
+    drain 造成的串行）。
+
+    轮换规则下沉到每个 slot 各自维护（不再全局）：
+      - 被封 / 验证码 / 非美国区 → 即刻冷轮换（5s 防抖）
+      - 空标题 / 降级页 → 累计计数，宽限期外/达阈值即轮换
+      - 主动轮换 → 成功累计到 SESSION_ROTATE_EVERY
+    一个 slot 轮换只影响它自己，其它 slot 继续采集（故不再需要全局热备 hot-swap）。
+    """
+    __slots__ = ("_w", "session", "_success_since_rotate", "_empty_title_count",
+                 "_last_rotate_time", "_grace_until", "_restart_epoch")
+
+    def __init__(self, worker):
+        self._w = worker
+        self.session: Optional[AmazonSession] = None
+        self._success_since_rotate = 0
+        self._empty_title_count = 0
+        self._last_rotate_time = 0.0
+        self._grace_until = 0.0
+        self._restart_epoch = worker._restart_epoch
+
+    async def ensure_ready(self) -> bool:
+        """确保 slot 有可用 session；软重启 epoch 变化时强制重建。"""
+        if self._restart_epoch != self._w._restart_epoch:
+            self._restart_epoch = self._w._restart_epoch
+            await self._close()
+        if self.session is not None and self.session.is_ready():
+            return True
+        await self._close()
+        self.session = await self._w._create_session_with_retry(delay=3)
+        self._success_since_rotate = 0
+        self._empty_title_count = 0
+        return self.session is not None and self.session.is_ready()
+
+    async def ensure_zip(self, target_zip: str) -> bool:
+        """把本 slot 的 session 切到目标邮编（无 drain）。返回是否成功。
+
+        Tier 2a：on_fetch 模式下切邮编只 POST、不发独立验证 GET（verify=False），
+        邮编是否生效改由 _process_task 用商品页 HTML 判定。standalone 模式保持
+        POST + 验证 GET 的旧行为。
+        """
+        if not target_zip or self.session is None:
+            return True
+        if self.session.zip_code == target_zip:
+            return True
+        verify = getattr(config, "ZIP_VERIFY_MODE", "standalone") != "on_fetch"
+        return await self.session.change_zip_code(target_zip, verify=verify)
+
+    async def repost_zip(self, target_zip: str) -> bool:
+        """on_fetch 邮编未生效时：在同一 session 上重发一次邮编 POST（不冷轮换）。
+
+        返回 True 表示重发成功、可原地重采（复用 session 的 IP 预算）；返回 False
+        表示无 session 或重发失败，调用方应回退到冷轮换换 IP。
+        """
+        if not target_zip or self.session is None:
+            return False
+        return await self.session.resend_zip_code()
+
+    def note_success(self):
+        self._success_since_rotate += 1
+
+    def should_rotate_proactive(self) -> bool:
+        return self._success_since_rotate >= self._w._rotate_every
+
+    async def rotate(self, reason: str = "轮换"):
+        """冷轮换本 slot 的 session（5s 防抖）。只影响本 slot，其它 slot 不停。"""
+        now = time.monotonic()
+        if now - self._last_rotate_time < 5:
+            return
+        logger.info(f"🔄 [slot] Session {reason}，冷轮换")
+        await self._close()
+        try:
+            await self._w.proxy_manager.report_blocked()
+        except Exception:
+            pass
+        self.session = await self._w._create_session_with_retry(delay=1)
+        self._success_since_rotate = 0
+        self._empty_title_count = 0
+        self._last_rotate_time = time.monotonic()
+        self._grace_until = time.monotonic() + 3.0
+        if self.session:
+            logger.info("🔄 [slot] 冷轮换完成")
+        else:
+            logger.error("🔄 [slot] 冷轮换失败，将于下次 ensure_ready 重试")
+
+    async def rotate_on_empty(self, asin: str, reason: str = ""):
+        """空标题/降级页：累计计数；宽限期外则轮换本 slot（机制1+机制2）。"""
+        self._empty_title_count += 1
+        if time.monotonic() < self._grace_until:
+            return  # 刚轮换过的宽限期内，不重复轮换
+        if self._empty_title_count >= self._w._empty_title_rotate_threshold:
+            await self.rotate(reason=f"空标题累计 {self._empty_title_count} 次")
+        else:
+            await self.rotate(reason=reason or "空标题")
+
+    async def close(self):
+        await self._close()
+
+    async def _close(self):
+        if self.session:
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+            self.session = None
 
 
 class Worker:
@@ -64,7 +177,7 @@ class Worker:
         # 组件
         self.proxy_manager = get_proxy_manager()
         self.parser = _ParserClass()
-        self._session: Optional[AmazonSession] = None
+        # 会话不再全局共享：每个采集协程持有私有 SessionSlot（见 _worker_loop）。
         self._rate_limiter = TokenBucket()
 
         # 自适应并发控制
@@ -78,10 +191,8 @@ class Worker:
             metrics=self._metrics,
         )
 
-        # per-ASIN 邮编切换：多 worker 共享同一个 session，切 zip 时必须确保
-        # 没有在飞请求（避免 in-flight 请求"用错 zip 收回响应"）。
-        # _zip_switch_lock 串行化切换；切换前 drain 等所有在飞请求落地。
-        self._zip_switch_lock = asyncio.Lock()
+        # per-ASIN 邮编切换：每个协程私有 session，切 zip 只影响本协程、无需 drain。
+        # 不同协程的不同邮编由此真正并行（见 SessionSlot.ensure_zip）。
 
         # 任务队列（优先级队列：首次请求 priority=0 优先处理，重试请求 priority=1 低优先级）
         self._task_queue: asyncio.PriorityQueue = None
@@ -116,23 +227,17 @@ class Worker:
         # 实例级运行参数（不污染全局 config）
         self._max_retries = config.MAX_RETRIES
 
-        # Session 轮换控制
-        self._success_since_rotate = 0
-        self._rotate_every = config.SESSION_ROTATE_EVERY
-        self._rotate_lock = asyncio.Lock()
-        self._last_rotate_time = 0.0  # 轮换防抖（monotonic）
-        self._session_ready = asyncio.Event()  # Session 就绪信号
-        self._rotation_epoch = 0              # 轮换计数（每次成功轮换 +1）
-        self._rotation_grace_until = 0.0      # 轮换后宽限期（monotonic），期间不触发新轮换
-
-        # 机制 2：空标题累计触发主动轮换
-        self._empty_title_count = 0
-        self._empty_title_rotate_threshold = 15
-
-        # Hot Standby Session（TPS 模式专用：预热备用 session，消除轮换停摆）
-        self._standby_session: Optional[AmazonSession] = None
-        self._standby_ready = asyncio.Event()
-        self._standby_warming = False
+        # Session 轮换控制（阈值全局配置，实际计数/防抖/宽限期下沉到各 SessionSlot）
+        self._rotate_every = config.SESSION_ROTATE_EVERY   # 主动轮换：每 N 次成功
+        self._empty_title_rotate_threshold = 15            # 机制 2：空标题累计阈值
+        # 软重启 epoch：server 下发 restart 或本地软重启时 +1，各 SessionSlot 在
+        # 下次 ensure_ready 时感知并强制重建自己的 session（替代原全局 session 重建）。
+        self._restart_epoch = 0
+        # 会话初始化并发闸门：平滑冷启动/大规模轮换时的代理 CONNECT 突发（见
+        # _create_session_with_retry）。稳态下 session 复用、初始化很少，几乎无副作用。
+        self._session_init_sem = asyncio.Semaphore(
+            getattr(config, "SESSION_INIT_CONCURRENCY", 3)
+        )
 
         # Worker 协程管理
         self._worker_tasks: List[asyncio.Task] = []
@@ -165,6 +270,18 @@ class Worker:
         self._global_block_epoch = 0   # 已处理的全局封锁 epoch
         self._recovery_jitter = 0.5    # Server 分配的恢复抖动系数
 
+        # Tier 2a on_fetch 观测：商品页 glow 判定的命中分布，用于真机 A/B 判断安全性。
+        #   match=生效(True) / mismatch=未生效(False) / unknown=商品页无 glow(None，宽松放行)
+        # unknown 占比高 → 商品页不稳定暴露邮编 → on_fetch 不安全，应弃用或换信号。
+        self._zip_onfetch = {"match": 0, "mismatch": 0, "unknown": 0}
+
+        # 降级页样本采集（排查用，默认关，见 config.DUMP_DEGRADED_HTML）
+        self._dump_degraded = getattr(config, "DUMP_DEGRADED_HTML", False)
+        self._degraded_dump_max = getattr(config, "DEGRADED_DUMP_MAX", 300)
+        self._degraded_dump_count = 0
+        self._degraded_dump_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "degraded_dump")
+
     def _server_headers(self) -> dict:
         """与 ERP Server 通信的统一 header（含 API Key 认证）"""
         h = {}
@@ -181,6 +298,15 @@ class Worker:
         logger.info(f"   邮编: {self.zip_code}")
         logger.info(f"   截图功能: {'开启' if self._enable_screenshot else '关闭'}")
         logger.info(f"   代理模式: TPS")
+        logger.info(f"   邮编验证模式: {getattr(config, 'ZIP_VERIFY_MODE', 'standalone')} "
+                    f"(on_fetch=省验证GET，未生效先重发POST×"
+                    f"{getattr(config, 'ZIP_REPOST_MAX_TRIES', 2)}再冷轮换) | 会话初始化并发: "
+                    f"{getattr(config, 'SESSION_INIT_CONCURRENCY', 3)}")
+        logger.info(f"   降级页兜底: 可售但无配送区时轮换重采 ×"
+                    f"{getattr(config, 'DELIVERY_RETRY_MAX', 2)} (0=关闭)")
+        if self._dump_degraded:
+            logger.info(f"   降级页样本采集: 开启 (上限 {self._degraded_dump_max}，"
+                        f"目录 {self._degraded_dump_dir})")
 
         self._running = True
         self._stats["start_time"] = time.time()
@@ -215,8 +341,7 @@ class Worker:
                 *[self._batch_submitter() for _ in range(self._submitter_count)],
                 self._screenshot_gate_monitor(),  # 4. 截图完成监控（检查子进程标记）
                 self._settings_sync(),       # 5. 定期同步服务端设置
-                self._standby_warmer(),      # 6. 热备 session 预热
-                self._startup_watchdog(),    # 7. 启动健康看门狗（60s 内必须有任务/心跳）
+                self._startup_watchdog(),    # 6. 启动健康看门狗（60s 内必须有任务/心跳）
             ]
             if self._auto_restart_hours and self._auto_restart_hours > 0:
                 coroutines.append(self._auto_restart_timer())
@@ -440,7 +565,7 @@ class Worker:
         注：信号量 acquire/release 已移入 _process_task 内部，仅包裹 HTTP 请求，
         令牌桶等待、session 就绪等待、重试 sleep 等不再占用信号量槽位。
         """
-        # 错开启动，分散请求
+        # 错开启动，分散请求（也让各 slot 的 session 初始化错峰，缓解代理 CONNECT 突发）
         initial_c = self._controller.current_concurrency
         if initial_c > 0:
             stagger = worker_idx * (1.0 / initial_c)
@@ -448,42 +573,47 @@ class Worker:
             if stagger > 0:
                 await asyncio.sleep(stagger)
 
-        while self._running:
-            try:
-                # 1. 从优先级队列取任务（最多等 5 秒，不占信号量）
+        # 本协程私有的 SessionSlot：独立 session + 轮换状态，无共享、切邮编无需 drain。
+        slot = SessionSlot(self)
+        try:
+            while self._running:
                 try:
-                    item = await asyncio.wait_for(
-                        self._task_queue.get(), timeout=5.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
+                    # 1. 从优先级队列取任务（最多等 5 秒，不占信号量）
+                    try:
+                        item = await asyncio.wait_for(
+                            self._task_queue.get(), timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        continue
 
-                # 2. 从优先级元组中提取 task dict: (priority, seq, task)
-                task = item[2] if isinstance(item, tuple) else item
+                    # 2. 从优先级元组中提取 task dict: (priority, seq, task)
+                    task = item[2] if isinstance(item, tuple) else item
 
-                # 3. 哨兵值 → 退出
-                if task is None:
+                    # 3. 哨兵值 → 退出
+                    if task is None:
+                        break
+
+                    # 3. 处理任务
+                    # 指标（latency, success, blocked）在 _process_task 内部按每次 HTTP 请求记录，
+                    # 确保 AIMD 看到的 p50 延迟是真实的 HTTP 往返时间，而非含重试/等待的总任务时间。
+                    self._active_task_count += 1
+                    try:
+                        if task.get("task_type") == "discover_seller":
+                            await self._process_seller_task(task, slot)
+                        else:
+                            await self._process_task(task, slot)
+                    finally:
+                        self._active_task_count = max(0, self._active_task_count - 1)
+
+                except asyncio.CancelledError:
                     break
-
-                # 3. 处理任务
-                # 指标（latency, success, blocked）在 _process_task 内部按每次 HTTP 请求记录，
-                # 确保 AIMD 看到的 p50 延迟是真实的 HTTP 往返时间，而非含重试/等待的总任务时间。
-                self._active_task_count += 1
-                try:
-                    if task.get("task_type") == "discover_seller":
-                        await self._process_seller_task(task)
-                    else:
-                        await self._process_task(task)
-                finally:
-                    self._active_task_count = max(0, self._active_task_count - 1)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Worker-{worker_idx} 未捕获异常: {type(e).__name__}: {e}")
-                # 不提交 failed（避免需要手动重试），让任务留在 processing
-                # 由 Server 端超时回收机制自动重置为 pending 重新分发
-                await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Worker-{worker_idx} 未捕获异常: {type(e).__name__}: {e}")
+                    # 不提交 failed（避免需要手动重试），让任务留在 processing
+                    # 由 Server 端超时回收机制自动重置为 pending 重新分发
+                    await asyncio.sleep(1)
+        finally:
+            await slot.close()
 
     # ═══════════════════════════════════════════════
     # 核心处理逻辑
@@ -617,15 +747,24 @@ class Worker:
     async def _create_session_with_retry(self, max_attempts: int = 3,
                                          delay: float = 5) -> Optional[AmazonSession]:
         """创建并初始化 AmazonSession，失败时重试。成功返回 session，全部失败返回 None。
-        优雅关停感知：shutdown_event 被 set 时立即放弃重试。"""
+        优雅关停感知：shutdown_event 被 set 时立即放弃重试。
+
+        会话池化后，冷启动 / 大规模轮换时可能有多个协程同时建 session；session
+        初始化（首页 GET）不走令牌桶，若不加约束会瞬间打爆代理 ~5 QPS CONNECT 预算
+        → 429 → 初始化失败 → 更多轮换的死亡螺旋。用 _session_init_sem 把并发初始化
+        数量压到小常量，平滑 CONNECT 突发（稳态下 session 复用、初始化很少发生，
+        此闸门几乎无副作用）。"""
         for attempt in range(max_attempts):
             if self._shutdown_event.is_set():
                 return None
-            session = AmazonSession(self.proxy_manager, self.zip_code)
-            if await session.initialize():
-                return session
-            logger.warning(f"⚠️ Session 初始化失败 (尝试 {attempt+1}/{max_attempts})")
-            await session.close()
+            async with self._session_init_sem:
+                if self._shutdown_event.is_set():
+                    return None
+                session = AmazonSession(self.proxy_manager, self.zip_code)
+                if await session.initialize():
+                    return session
+                logger.warning(f"⚠️ Session 初始化失败 (尝试 {attempt+1}/{max_attempts})")
+                await session.close()
             if attempt < max_attempts - 1:
                 # 等待重试间隔时也响应 shutdown，避免关停时再卡 5-15s
                 try:
@@ -636,220 +775,33 @@ class Worker:
         return None
 
     async def _init_session(self):
-        """初始化 Amazon session（带硬超时兜底，超时则触发重启而非死等）。
+        """启动连通性自检（带硬超时兜底，超时则触发重启而非死等）。
 
-        execv 后若代理网络瞬时不通，初始化重试链可能耗 ~150s。一旦超过
-        `_init_timeout_seconds`，直接放弃当前 session、置位 _wants_restart，
-        让 run_worker.py 走 os.execv 重新拉起一个干净进程。
+        采集会话不再全局共享——各采集协程的 SessionSlot 会各自懒建 session。
+        此处只做一次启动自检：建一个 session 验证代理/网络可用，随即关闭。
+        保留原有语义：execv 后若代理网络瞬时不通，初始化重试链可能耗 ~150s，
+        一旦超过 `_init_timeout_seconds` 即置位 _wants_restart，让 run_worker.py
+        走 os.execv 重新拉起一个干净进程。
         """
-        logger.info(f"🔧 初始化 Amazon session... (硬超时 {self._init_timeout_seconds}s)")
-        self._session_ready.clear()
+        logger.info(f"🔧 启动连通性自检... (硬超时 {self._init_timeout_seconds}s)")
         try:
-            self._session = await asyncio.wait_for(
+            session = await asyncio.wait_for(
                 self._create_session_with_retry(),
                 timeout=self._init_timeout_seconds,
             )
         except asyncio.TimeoutError:
             logger.error(
-                f"❌ Session 初始化超过 {self._init_timeout_seconds}s 未完成，触发自动重启"
+                f"❌ 启动自检超过 {self._init_timeout_seconds}s 未完成，触发自动重启"
             )
-            self._session = None
-            self._session_ready.set()
             self._wants_restart = True
             self._running = False
             self._shutdown_event.set()
             return
-        self._success_since_rotate = 0
-        if self._session:
-            self._session_ready.set()
-            return
-        logger.error("❌ Session 初始化 3 次全部失败，Worker 将在处理任务时继续重试")
-        self._session_ready.set()
-
-    async def _rotate_session(self, reason: str = "主动轮换"):
-        """
-        轮换 session。
-
-        优先使用热备 session（hot swap，<0.5s），不可用时回退到冷轮换。
-        Burst 缓解：旧 session 延迟 5s 关闭（让 in-flight 请求自然完成），
-        轮换后设 3s 宽限期（期间空标题/空页面不再触发额外轮换）。
-        """
-        async with self._rotate_lock:
-            # 防抖：5秒内不重复轮换
-            now = time.monotonic()
-            if now - self._last_rotate_time < 5:
-                logger.debug(f"🔄 跳过轮换（距上次不足5秒）")
-                return
-            logger.info(f"🔄 Session {reason}...")
-            # 通知所有 worker：session 不可用，请等待
-            self._session_ready.clear()
-            old_session = self._session
-            self._session = None
-
-            # === 优先 Hot Swap：使用预热的备用 session ===
-            if self._standby_session and self._standby_session.is_ready():
-                self._session = self._standby_session
-                self._standby_session = None
-                self._standby_ready.clear()
-                self._success_since_rotate = 0
-                self._empty_title_count = 0
-                self._last_rotate_time = time.monotonic()
-                self._rotation_epoch += 1
-                self._rotation_grace_until = time.monotonic() + 3.0
-                self._session_ready.set()
-                logger.info("🔄 Session 轮换成功（hot swap，瞬间切换）")
-                # 旧 session 延迟关闭：让 in-flight 请求自然完成，避免 burst
-                if old_session:
-                    asyncio.create_task(self._delayed_close_session(old_session, delay=5))
-                # 异步报告被封，让备用预热协程获取新代理
-                await self.proxy_manager.report_blocked()
-                return
-
-            # === Fallback：冷轮换 ===
-            logger.info("🔄 热备不可用，执行冷轮换...")
-            # 冷轮换时旧 session 也延迟关闭
-            if old_session:
-                asyncio.create_task(self._delayed_close_session(old_session, delay=5))
-            await self.proxy_manager.report_blocked()
-            await asyncio.sleep(1)
-
-            self._session = await self._create_session_with_retry(delay=3)
-            self._success_since_rotate = 0
-            self._empty_title_count = 0
-            self._last_rotate_time = time.monotonic()
-            self._rotation_epoch += 1
-            self._rotation_grace_until = time.monotonic() + 3.0
-            if self._session:
-                logger.info("🔄 Session 冷轮换成功")
-            else:
-                logger.error("❌ Session 轮换 3 次全部失败")
-            self._session_ready.set()
-
-    async def _delayed_close_session(self, session: AmazonSession, delay: float = 5):
-        """延迟关闭旧 session，让 in-flight 请求有时间完成"""
-        try:
-            await asyncio.sleep(delay)
+        if session:
             await session.close()
-            logger.debug("🔄 旧 session 延迟关闭完成")
-        except Exception as e:
-            logger.debug(f"旧 session 延迟关闭异常（忽略）: {e}")
-
-    async def _wait_for_rotation_before_retry(self, asin: str, reason: str = ""):
-        """
-        机制 1 + 机制 2 联合处理：空标题/空页面时等待 session 轮换后再重试。
-
-        机制 1（独立触发）：直接请求 session 轮换，等待新 session 就绪后返回。
-        机制 2（累计触发）：累计空标题计数，达到阈值时主动轮换。
-        Burst 缓解：宽限期内不触发额外轮换，只等待当前轮换完成。
-        """
-        self._empty_title_count += 1
-        current_epoch = self._rotation_epoch
-        now = time.monotonic()
-
-        # 宽限期内（轮换后 3s）：不触发新轮换，只等待新 session 就绪
-        in_grace = now < self._rotation_grace_until
-        if in_grace:
-            logger.debug(f"ASIN {asin} {reason} 在宽限期内，等待新 session")
-            await self._session_ready.wait()
+            logger.info("🔧 启动连通性自检通过（采集协程将各自懒建 session）")
             return
-
-        # 机制 2：累计空标题达到阈值，优先触发
-        if self._empty_title_count >= self._empty_title_rotate_threshold:
-            logger.info(f"🔄 机制2: 空标题累计 {self._empty_title_count} 次，触发主动轮换")
-            await self._rotate_session(reason=f"空标题累计 {self._empty_title_count} 次")
-        else:
-            # 机制 1：独立触发轮换（受 5s 防抖保护）
-            await self._rotate_session(reason=f"{reason}")
-
-        # 等待 epoch 变化（确认轮换完成），最多等 15s
-        if self._rotation_epoch == current_epoch:
-            for _ in range(30):
-                await asyncio.sleep(0.5)
-                if self._rotation_epoch != current_epoch or not self._running:
-                    break
-
-        # 确保新 session 就绪
-        await self._session_ready.wait()
-
-    async def _standby_warmer(self):
-        """TPS 热备 Session 预热协程：后台维护一个已初始化的备用 session。"""
-        logger.info("🔥 Hot Standby Session 预热协程启动")
-        await self._session_ready.wait()
-        await asyncio.sleep(3)
-
-        while self._running:
-            try:
-                if self._standby_session is None or not self._standby_session.is_ready():
-                    if not self._standby_warming:
-                        self._standby_warming = True
-                        self._standby_ready.clear()
-                        standby = await self._create_session_with_retry(max_attempts=1, delay=0)
-                        if standby:
-                            old = self._standby_session
-                            self._standby_session = standby
-                            self._standby_ready.set()
-                            if old:
-                                await old.close()
-                            logger.info("🔥 Hot Standby Session 就绪")
-                        else:
-                            logger.warning("⚠️ Standby Session 初始化失败，10s 后重试")
-                        self._standby_warming = False
-
-                # 用 wait_for(shutdown_event) 替代 sleep，关停时立即唤醒
-                try:
-                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=5)
-                    break  # shutdown 触发
-                except asyncio.TimeoutError:
-                    pass
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Standby warmer 异常: {e}")
-                self._standby_warming = False
-                try:
-                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=10)
-                    break
-                except asyncio.TimeoutError:
-                    pass
-
-        if self._standby_session:
-            await self._standby_session.close()
-            self._standby_session = None
-
-    async def _switch_session_zip(self, session, target_zip: str,
-                                   drain_timeout: float = 30.0) -> bool:
-        """切换 session 邮编（多 worker 安全）。
-
-        关键不变量：切换瞬间 session 上不能有在飞请求，否则它们会"用旧 zip 发出但被服务端
-        按新 zip 处理"，造成数据错位。流程：
-          1. 取 zip_switch_lock（串行所有切换尝试）
-          2. 双重检查（lock 期间另一个 worker 可能已经切到目标 zip）
-          3. drain：等到 metrics.inflight == 0，最多等 drain_timeout 秒
-          4. 调 session.change_zip_code（一次 POST + 一次 GET 验证，约 1-2s）
-          5. 释放 lock，所有 worker 恢复用新 zip 发请求
-
-        Returns: True 切换成功（或已是目标 zip）；False 失败（drain 超时/HTTP 失败）
-        """
-        async with self._zip_switch_lock:
-            if session is not self._session:
-                # 锁等待期间 session 已被换（轮换/重启），目标也变了
-                return False
-            if session.zip_code == target_zip:
-                return True  # 别的 worker 已切好
-            # drain：等所有在飞请求结束
-            deadline = time.time() + drain_timeout
-            while self._metrics.inflight > 0:
-                if time.time() > deadline:
-                    logger.warning(
-                        f"📍 zip 切换 drain 超时 ({drain_timeout}s, 仍有 {self._metrics.inflight} 在飞)，强制切换"
-                    )
-                    break
-                await asyncio.sleep(0.05)
-            # 切换
-            ok = await session.change_zip_code(target_zip)
-            if not ok:
-                logger.warning(f"📍 切换 zip 失败: {session.zip_code} → {target_zip}")
-            return ok
+        logger.error("❌ 启动自检 3 次全部失败，Worker 将在处理任务时继续重试")
 
     async def _pull_tasks(self, count: int = None):
         """
@@ -866,13 +818,10 @@ class Worker:
                 "count": count or self._controller.current_concurrency,
                 "enable_screenshot": "1" if self._enable_screenshot else "0",
             }
-            # 当前 session 的 zip 作为派发偏好：server 优先派发相同 zip 的任务，
-            # 减少 worker 端 session 邮编切换次数。
-            current_zip = None
-            if self._session is not None and getattr(self._session, "zip_code", None):
-                current_zip = self._session.zip_code
-            elif self.zip_code:
-                current_zip = self.zip_code
+            # worker 默认 zip 作为派发偏好：均一邮编批次下让 server 优先派发同 zip 任务；
+            # per-ASIN 邮编批次下每个任务自带 zip、此偏好无副作用（各协程私有 session
+            # 各自按任务 zip 切换，见 SessionSlot.ensure_zip）。
+            current_zip = self.zip_code or None
             if current_zip:
                 params["prefer_zip"] = current_zip
             async with httpx.AsyncClient(timeout=10, headers=self._server_headers()) as client:
@@ -1075,16 +1024,60 @@ class Worker:
         _jitter_max = min(0.3, 0.5 / _qps)
         await asyncio.sleep(random.uniform(0, _jitter_max))
 
-    async def _process_task(self, task: Dict) -> tuple:
+    def _looks_degraded_delivery(self, r: Dict) -> bool:
+        """判断是否疑似"软降级"页：商品可售（有真实价格 + FBA + 有货）但配送区缺失。
+
+        亚马逊对可疑请求会删掉配送 ETA/变体报价，此时 delivery_date=N/A 但价格/库存仍在。
+        用它区分"降级页导致的无配送"(该重采) 与"商品本就无配送/不可售"(不该重采)。
+        """
+        if r.get("delivery_date") not in (None, "", "N/A"):
+            return False
+        price = r.get("current_price")
+        if price in (None, "", "N/A", "No Featured Offer", "不可售", "See price in cart"):
+            return False
+        # FBA 商品几乎总有配送 ETA；非 FBA/第三方可能本就不显示，保守只对 FBA 重采。
+        if str(r.get("is_fba") or "") != "FBA":
+            return False
+        stock = str(r.get("stock_status") or "").lower()
+        if not stock or stock in ("n/a", "none") or "unavailable" in stock:
+            return False
+        return True
+
+    async def _dump_degraded_html(self, asin: str, zip_code: str, html: str):
+        """把疑似降级页的原始 HTML 存到独立目录（截图流程不碰它），供离线排查。
+
+        默认关（DUMP_DEGRADED_HTML=1 开启），带数量上限防塞满盘。任何异常都吞掉，
+        绝不影响采集主流程。
+        """
+        if not self._dump_degraded or not html:
+            return
+        if self._degraded_dump_count >= self._degraded_dump_max:
+            return
+        try:
+            os.makedirs(self._degraded_dump_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            n = self._degraded_dump_count
+            fname = f"{asin}_{zip_code or 'na'}_{ts}_{n}.html"
+            path = os.path.join(self._degraded_dump_dir, fname)
+            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+                await f.write(html)
+            self._degraded_dump_count += 1
+            if self._degraded_dump_count == 1:
+                logger.info(f"🗂️ 降级页样本采集已开启，写入 {self._degraded_dump_dir}")
+            elif self._degraded_dump_count == self._degraded_dump_max:
+                logger.info(f"🗂️ 降级页样本已达上限 {self._degraded_dump_max}，停止 dump")
+        except Exception as e:
+            logger.debug(f"降级页 dump 失败 {asin}: {e}")
+
+    async def _process_task(self, task: Dict, slot: "SessionSlot") -> tuple:
         """
         处理单个采集任务
 
         返回: (success: bool, blocked: bool, resp_bytes: int)
 
-        双模式分支：
-        - TPS: 所有 worker 共享全局 self._session，被封时触发全局 _rotate_session
-        - 隧道: 每次请求从 proxy_manager 分配通道，从 session_pool 取对应 session，
-                被封时仅标记该通道，下次循环自动切到其他通道
+        每个采集协程持有自己的 SessionSlot（私有 session + 轮换状态）。
+        协程串行使用自己的 session（切邮编 → 采集 → 处理），切邮编无需 drain
+        全局在飞请求；被封/空标题只轮换本 slot 的 session，其它 slot 不受影响。
         """
         asin = task["asin"]
         task_id = task["id"]
@@ -1095,35 +1088,27 @@ class Worker:
         last_error_type = "network"
         last_error_detail = ""
         attempt = 0
+        zip_repost_tries = 0  # on_fetch 邮编未生效时的同 session 重发计数（冷轮换后清零）
+        delivery_retry_tries = 0  # 疑似降级页（可售但无配送区）的轮换重采计数
         while attempt < max_retries:
             try:
-                # === Session 获取 ===
-                if not self._session_ready.is_set():
-                    logger.debug(f"ASIN {asin} 等待 session 就绪...")
-                    try:
-                        await asyncio.wait_for(self._session_ready.wait(), timeout=30)
-                    except asyncio.TimeoutError:
-                        logger.warning(f"ASIN {asin} 等待 session 超时 30s")
-                        attempt += 1
-                        continue
-                if self._session is None or not self._session.is_ready():
+                # === Session 获取（本协程私有 slot，独立 session）===
+                if not await slot.ensure_ready():
                     attempt += 1
-                    logger.warning(f"ASIN {asin} session 仍未就绪 (尝试 {attempt}/{max_retries})")
+                    logger.warning(f"ASIN {asin} session 未就绪 (尝试 {attempt}/{max_retries})")
                     await asyncio.sleep(2)
                     continue
-                session = self._session
+                session = slot.session
 
                 # === per-ASIN 邮编切换 ===
-                # 每个任务带自己的 zip_code（从上传文件的 B 列读入）；如果与 session 当前
-                # zip 不一致，需切换。多 worker 并发时用 lock 串行，切换前 drain 在飞请求。
+                # 只有本协程用这个 session，切邮编无需 drain 全局在飞请求（这是并行的关键）。
                 target_zip = (zip_code or "").strip() or self.zip_code
-                if target_zip and session.zip_code != target_zip:
-                    if not await self._switch_session_zip(session, target_zip):
-                        # 切换失败：跳过此任务，由 server 超时回收重试（用其他 worker / 其他 session）
-                        last_error_type = "zip_switch_failed"
-                        last_error_detail = f"current={session.zip_code} target={target_zip}"
-                        attempt = max_retries  # 直接放弃，避免本地 worker 卡死
-                        break
+                if not await slot.ensure_zip(target_zip):
+                    # 切换失败：跳过此任务，由 server 超时回收重试（其他协程/其他 session）
+                    last_error_type = "zip_switch_failed"
+                    last_error_detail = f"current={session.zip_code} target={target_zip}"
+                    attempt = max_retries  # 直接放弃，避免本地卡死
+                    break
 
                 # 令牌桶限流
                 t_token_start = time.time()
@@ -1169,7 +1154,7 @@ class Worker:
                     last_error_type = "blocked"
                     last_error_detail = f"HTTP {resp.status_code}"
                     logger.warning(f"ASIN {asin} 被封 HTTP {resp.status_code} (尝试 {attempt}/{max_retries})")
-                    await self._rotate_session(reason="被封锁")
+                    await slot.rotate(reason="被封锁")
                     await self._submit_result(
                         task_id, None, success=False,
                         error_type=last_error_type, error_detail=last_error_detail,
@@ -1220,7 +1205,7 @@ class Worker:
                     last_error_type = "captcha"
                     last_error_detail = "validateCaptcha / Robot Check"
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
-                    await self._rotate_session(reason="页面拦截")
+                    await slot.rotate(reason="页面拦截")
                     continue
 
                 if title == "[API封锁]":
@@ -1230,7 +1215,7 @@ class Worker:
                     last_error_type = "blocked"
                     last_error_detail = "api-services-support@amazon.com"
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
-                    await self._rotate_session(reason="页面拦截")
+                    await slot.rotate(reason="页面拦截")
                     continue
 
                 if title in ["[页面为空]", "[HTML解析失败]"]:
@@ -1239,7 +1224,7 @@ class Worker:
                     last_error_type = "parse_error"
                     last_error_detail = title
                     logger.warning(f"ASIN {asin} {title} (尝试 {attempt}/{max_retries})")
-                    await self._wait_for_rotation_before_retry(asin, reason=title)
+                    await slot.rotate_on_empty(asin, reason=title)
                     continue
 
                 # 标题为空视为软拦截（降级页面），触发 session 轮换后重试
@@ -1249,7 +1234,7 @@ class Worker:
                     last_error_type = "parse_error"
                     last_error_detail = "标题为空"
                     logger.warning(f"ASIN {asin} 标题为空 (尝试 {attempt}/{max_retries})")
-                    await self._wait_for_rotation_before_retry(asin, reason="标题为空")
+                    await slot.rotate_on_empty(asin, reason="标题为空")
                     continue
 
                 # variant 偏移检测：多属性产品偶发返回兄弟 variant 的页面
@@ -1286,7 +1271,7 @@ class Worker:
                         last_error_type = "parse_error"
                         last_error_detail = f"非美国价格: {price}"
                         logger.warning(f"ASIN {asin} 非美国价格 '{price}' (尝试 {attempt}/{max_retries})")
-                        await self._rotate_session(reason="非美国区域数据")
+                        await slot.rotate(reason="非美国区域数据")
                         continue
 
                 # 核心字段缺失检测：有标题但价格/库存/品牌全为空 → 页面降级，重试
@@ -1303,8 +1288,49 @@ class Worker:
                     last_error_type = "parse_error"
                     last_error_detail = "解析不完整（核心字段全部缺失）"
                     logger.warning(f"ASIN {asin} 核心字段全部缺失，疑似降级页面 (尝试 {attempt}/{max_retries})")
-                    await self._wait_for_rotation_before_retry(asin, reason="核心字段缺失")
+                    await slot.rotate_on_empty(asin, reason="核心字段缺失")
                     continue
+
+                # Tier 2a：邮编验证折叠——on_fetch 模式下切邮编不发独立验证 GET，
+                # 改用刚采到的这张商品页 HTML 自身的 glow 挂件判定目标邮编是否生效。
+                #   True  → 生效，正常写库（省掉了一次验证 GET）
+                #   False → 明确未生效（glow 显示别的邮编/非美国区）→ 轮换换 IP 重采，不写脏数据
+                #   None  → 商品页未暴露 glow 邮编 → 无法判定，宽松放行（非美国区已被上面的货币校验拦掉）
+                if (getattr(config, "ZIP_VERIFY_MODE", "standalone") == "on_fetch"
+                        and target_zip):
+                    zip_eff = zip_effective_in_html(target_zip, resp.text)
+                    if zip_eff is False:
+                        self._zip_onfetch["mismatch"] += 1
+                        self._controller.record_result(req_elapsed, False, False, resp_bytes)
+                        attempt += 1
+                        last_error_type = "zip_not_effective"
+                        last_error_detail = f"商品页邮编未生效: target={target_zip}"
+                        # 先在同一 session 上重发一次邮编 POST（代价远小于冷轮换）；
+                        # 重发预算用尽或重发失败才回退到冷轮换换 IP（冷轮换后清零预算）。
+                        _repost_cap = getattr(config, "ZIP_REPOST_MAX_TRIES", 2)
+                        if zip_repost_tries < _repost_cap and await slot.repost_zip(target_zip):
+                            zip_repost_tries += 1
+                            logger.warning(
+                                f"ASIN {asin} 邮编未生效（目标 {target_zip}），同 session 重发 POST "
+                                f"[{zip_repost_tries}/{_repost_cap}] 后重采 (尝试 {attempt}/{max_retries})"
+                            )
+                        else:
+                            logger.warning(
+                                f"ASIN {asin} 邮编未生效（目标 {target_zip}），冷轮换换 IP "
+                                f"(尝试 {attempt}/{max_retries})"
+                            )
+                            await slot.rotate(reason="邮编未生效")
+                            zip_repost_tries = 0
+                        continue
+                    # True=命中，None=商品页无 glow（宽松放行）。周期性汇总命中分布。
+                    self._zip_onfetch["match" if zip_eff is True else "unknown"] += 1
+                    _zt = sum(self._zip_onfetch.values())
+                    if _zt % 100 == 0:
+                        logger.info(
+                            f"📍 on_fetch 命中分布 | 生效:{self._zip_onfetch['match']} "
+                            f"未生效:{self._zip_onfetch['mismatch']} "
+                            f"无glow:{self._zip_onfetch['unknown']} (共 {_zt})"
+                        )
 
                 # v3: No Featured Offer 产品请求 AOD AJAX 端点补充价格/运费/配送/FBA
                 if result_data.get("current_price") == "No Featured Offer":
@@ -1330,6 +1356,24 @@ class Worker:
                     except Exception as e:
                         logger.debug(f"NFO {asin} offer-listing 请求失败: {e}")
 
+                # 软降级页兜底：亚马逊对可疑请求返回"降级"页——商品明明可售(FBA/In Stock)
+                # 却删掉了配送区(配送 ETA + 变体报价)，导致 delivery_date=N/A。换 IP 重采
+                # 尝试拿到完整页（顺带救回变体/报价）。有上限，用尽仍无配送才接受 N/A。
+                _dret_cap = getattr(config, "DELIVERY_RETRY_MAX", 2)
+                _degraded = self._looks_degraded_delivery(result_data)
+                if _degraded and _dret_cap > 0 and delivery_retry_tries < _dret_cap:
+                    delivery_retry_tries += 1
+                    self._controller.record_result(req_elapsed, False, False, resp_bytes)
+                    logger.warning(
+                        f"ASIN {asin} 疑似降级页（可售但无配送区），轮换换 IP 重采 "
+                        f"[{delivery_retry_tries}/{_dret_cap}]"
+                    )
+                    await slot.rotate(reason="降级页无配送区")
+                    continue
+                if _degraded:
+                    # 重采用尽/已关闭仍降级：接受 N/A 结果，同时按需 dump 原始 HTML 供排查
+                    await self._dump_degraded_html(asin, zip_code, resp.text)
+
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes)
                 await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
@@ -1351,10 +1395,10 @@ class Worker:
                         html_content=resp.text,
                     )
 
-                # 主动轮换：每 N 次成功请求更换 session 防止被检测
-                self._success_since_rotate += 1
-                if self._success_since_rotate >= self._rotate_every:
-                    await self._rotate_session(reason=f"主动轮换 (已完成 {self._success_since_rotate} 次)")
+                # 主动轮换：每 N 次成功请求更换本 slot 的 session 防止被检测
+                slot.note_success()
+                if slot.should_rotate_proactive():
+                    await slot.rotate(reason="主动轮换")
 
                 return (True, False, resp_bytes)
 
@@ -1386,10 +1430,10 @@ class Worker:
 
     SELLER_MAX_PAGES = 75  # Amazon /s?me=... 列表上限约 75 页
 
-    async def _process_seller_task(self, task: Dict):
+    async def _process_seller_task(self, task: Dict, slot: "SessionSlot"):
         """处理 discover_seller 类型任务：翻页扫描卖家所有商品并提交 ASIN 列表。
 
-        - 复用全局 session、token bucket、信号量、CAPTCHA 自解 等基础设施
+        - 复用本协程私有的 SessionSlot、token bucket、信号量、CAPTCHA 自解 等基础设施
         - 失败用现有 _submit_result(success=False) 触发重试 / 终态失败
         - 成功用 _submit_seller_result 走专用端点，触发 server 端
           accept_seller_discovery_result：写发现表 + 按需衍生详情任务
@@ -1412,23 +1456,15 @@ class Worker:
         attempt = 0
         while page <= self.SELLER_MAX_PAGES:
             try:
-                if not self._session_ready.is_set():
-                    try:
-                        await asyncio.wait_for(self._session_ready.wait(), timeout=30)
-                    except asyncio.TimeoutError:
-                        attempt += 1
-                        if attempt >= max_retries:
-                            last_error_type = "session_not_ready"
-                            break
-                        continue
-                if self._session is None or not self._session.is_ready():
+                # 本协程私有 slot：卖家翻页复用同一个 session（无需切邮编）
+                if not await slot.ensure_ready():
                     attempt += 1
                     if attempt >= max_retries:
                         last_error_type = "session_not_ready"
                         break
                     await asyncio.sleep(2)
                     continue
-                session = self._session
+                session = slot.session
 
                 if self._rate_limiter:
                     await self._rate_limiter.acquire()
@@ -1464,7 +1500,7 @@ class Worker:
                     self._stats["blocked"] += 1
                     last_error_type = "blocked"
                     last_error_detail = f"page={page} HTTP {resp.status_code}"
-                    await self._rotate_session(reason="卖家列表被封")
+                    await slot.rotate(reason="卖家列表被封")
                     if attempt >= max_retries:
                         break
                     continue
@@ -1482,7 +1518,7 @@ class Worker:
                     self._stats["blocked"] += 1
                     last_error_type = "blocked"
                     last_error_detail = f"page={page} parse:{page_info}"
-                    await self._rotate_session(reason=f"列表页 {page_info}")
+                    await slot.rotate(reason=f"列表页 {page_info}")
                     if attempt >= max_retries:
                         break
                     continue
@@ -1506,10 +1542,10 @@ class Worker:
                 page += 1
                 attempt = 0  # 翻页成功后重置该页重试计数
 
-                # 主动轮换：每 N 页换一次 session
-                self._success_since_rotate += 1
-                if self._success_since_rotate >= self._rotate_every:
-                    await self._rotate_session(reason="卖家翻页主动轮换")
+                # 主动轮换：每 N 页换一次本 slot 的 session
+                slot.note_success()
+                if slot.should_rotate_proactive():
+                    await slot.rotate(reason="卖家翻页主动轮换")
 
             except Exception as e:
                 attempt += 1
@@ -1912,19 +1948,14 @@ class Worker:
         await self.stop()
 
     async def _soft_restart(self):
-        """软重启：重建 session（新指纹、新 cookies），不停止采集协程"""
-        try:
-            # 关闭当前 session
-            if self._session:
-                await self._session.close()
-                self._session = None
-            # 关闭备用 session
-            if hasattr(self, '_standby_session') and self._standby_session:
-                await self._standby_session.close()
-                self._standby_session = None
+        """软重启：让各采集协程重建自己的 session（新指纹、新 cookies），不停止协程。
 
-            # 重建 session
-            await self._init_session()
+        会话已下沉到每协程私有的 SessionSlot，这里只 bump _restart_epoch：各 slot
+        在下次 ensure_ready 时感知到 epoch 变化，主动关闭并重建自己的 session。
+        """
+        try:
+            # 通知所有 SessionSlot 重建 session（epoch 递增即触发）
+            self._restart_epoch += 1
 
             # 重置 AIMD 控制器
             old_c = self._controller._concurrency
@@ -1938,11 +1969,11 @@ class Worker:
                 "accepted": 0, "stale": 0,
                 "start_time": self._stats.get("start_time"),
             }
-            self._success_since_rotate = 0
-            self._empty_title_count = 0
-            self._rotation_epoch += 1
 
-            logger.info(f"🔄 软重启完成: 新 session 已就绪, 并发重置为 {config.INITIAL_CONCURRENCY}")
+            logger.info(
+                f"🔄 软重启完成: 各协程将重建 session (epoch={self._restart_epoch}), "
+                f"并发重置为 {config.INITIAL_CONCURRENCY}"
+            )
         except Exception as e:
             logger.error(f"🔄 软重启失败: {e}")
 
@@ -2003,9 +2034,7 @@ class Worker:
                 await self._batch_submitter_task
             except asyncio.CancelledError:
                 pass
-        # 关闭 Session
-        if self._session:
-            await self._session.close()
+        # 采集 session 由各协程私有 SessionSlot 在 _worker_loop 退出时各自关闭，此处无需处理
         # 停止截图子进程
         await self._stop_screenshot_process()
 

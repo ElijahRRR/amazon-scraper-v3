@@ -46,9 +46,6 @@ _DELIVERY_DATE_RE = re.compile(
     r'Oct(?:ober)?\.?\s+\d+|Nov(?:ember)?\.?\s+\d+|Dec(?:ember)?\.?\s+\d+)',
     re.IGNORECASE,
 )
-# 会员专享（"Prime members get..."/"Join Prime"）更快配送选项的判定关键词。
-# 采集会话非 Prime，这类日期非会员实际拿不到，应排除，改报标准配送日期。
-_PRIME_GATED_KW = ("prime member", "join prime")
 
 
 class AmazonParser:
@@ -569,28 +566,24 @@ class AmazonParser:
         except Exception:
             return None
 
-    def _pick_delivery(self, candidates: List[Tuple[str, bool]]) -> Tuple[str, str]:
-        """从配送候选里选最终配送日期/时长。
+    def _pick_delivery(self, candidates: List[str]) -> Tuple[str, str]:
+        """从配送候选文本里选**页面上能看到的最快**配送日期/时长（含 Prime 会员专享）。
 
-        candidates: [(文本, 是否会员专享)]。文本可以是 data-csa-c-delivery-time 的属性
-        值（权威），也可以是回退用的整段配送文本；从中用正则抽日期。
-        优先取**非会员专享**里最快的（采集会话非 Prime，会员专享日期非会员拿不到）；
-        仅当全部候选都是会员专享时才回退用会员日期（好过 N/A）。
+        candidates: 配送文本列表——data-csa-c-delivery-time 属性值（权威），或回退
+        用的整段配送文本。从中用正则抽出所有日期，取距今天数最小者。
         """
         today = datetime.now()
-        best = {False: (None, 999), True: (None, 999)}  # gated -> (date_raw, days)
-        for text, gated in candidates:
+        best_raw, best_days = None, 999
+        for text in candidates:
             for m in _DELIVERY_DATE_RE.finditer(text):
                 raw = m.group(1)
                 days = self._delivery_raw_to_days(raw, today)
                 if days is None or days < 0:
                     continue
-                if days < best[gated][1]:
-                    best[gated] = (raw, days)
-        for gated in (False, True):  # 先非会员，后会员
-            raw, days = best[gated]
-            if raw is not None:
-                return raw, str(days)
+                if days < best_days:
+                    best_raw, best_days = raw, days
+        if best_raw is not None:
+            return best_raw, str(best_days)
         return "N/A", "N/A"
 
     def _slx_parse_delivery(self, tree) -> Tuple[str, str]:
@@ -598,13 +591,11 @@ class AmazonParser:
             # 优先直接读 data-csa-c-delivery-time 属性（权威、格式稳定 "Weekday, Month Day"），
             # 比抓子元素文本鲁棒：有的模板日期是属性所在 span 的直接文本节点，
             # 旧的 '[attr] *' 选择器抓不到任何子元素 → 返回 N/A。
-            candidates: List[Tuple[str, bool]] = []
+            candidates: List[str] = []
             for n in tree.css('[data-csa-c-delivery-time]'):
                 raw = (n.attributes.get('data-csa-c-delivery-time') or "").strip()
-                if not raw:
-                    continue
-                gated = any(k in n.text(strip=True).lower() for k in _PRIME_GATED_KW)
-                candidates.append((raw, gated))
+                if raw:
+                    candidates.append(raw)
 
             # 回退：页面不带该属性时，用整段配送文本 + 正则（覆盖老/异形模板）。
             if not candidates:
@@ -615,7 +606,7 @@ class AmazonParser:
                     if t:
                         texts.append(t)
                 if texts:
-                    candidates.append((" ".join(texts), False))
+                    candidates.append(" ".join(texts))
 
             if candidates:
                 return self._pick_delivery(candidates)
@@ -1932,19 +1923,13 @@ class AmazonParser:
 
     def _parse_delivery(self, tree) -> Tuple[str, str]:
         try:
-            # 与 selectolax 路径一致：优先直接读 data-csa-c-delivery-time 属性值，
-            # 并用节点子树文本判断是否会员专享；无属性时回退整段配送文本。
-            candidates: List[Tuple[str, bool]] = []
+            # 与 selectolax 路径一致：优先直接读 data-csa-c-delivery-time 属性值；
+            # 无属性时回退整段配送文本。
+            candidates: List[str] = []
             for el in tree.xpath('//*[@data-csa-c-delivery-time]'):
                 raw = (el.get('data-csa-c-delivery-time') or "").strip()
-                if not raw:
-                    continue
-                try:
-                    sub = (el.text_content() or "").lower()
-                except Exception:
-                    sub = ""
-                gated = any(k in sub for k in _PRIME_GATED_KW)
-                candidates.append((raw, gated))
+                if raw:
+                    candidates.append(raw)
 
             if not candidates:
                 texts = self._get_all_text(tree,
@@ -1952,7 +1937,7 @@ class AmazonParser:
                     '//div[contains(@class,"delivery-message")]//text() | '
                     '//div[@id="deliveryBlockMessage"]//text()')
                 if texts:
-                    candidates.append((" ".join(texts), False))
+                    candidates.append(" ".join(texts))
 
             if candidates:
                 return self._pick_delivery(candidates)

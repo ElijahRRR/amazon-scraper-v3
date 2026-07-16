@@ -94,6 +94,16 @@ class SessionSlot:
         verify = getattr(config, "ZIP_VERIFY_MODE", "standalone") != "on_fetch"
         return await self.session.change_zip_code(target_zip, verify=verify)
 
+    async def repost_zip(self, target_zip: str) -> bool:
+        """on_fetch 邮编未生效时：在同一 session 上重发一次邮编 POST（不冷轮换）。
+
+        返回 True 表示重发成功、可原地重采（复用 session 的 IP 预算）；返回 False
+        表示无 session 或重发失败，调用方应回退到冷轮换换 IP。
+        """
+        if not target_zip or self.session is None:
+            return False
+        return await self.session.resend_zip_code()
+
     def note_success(self):
         self._success_since_rotate += 1
 
@@ -282,7 +292,8 @@ class Worker:
         logger.info(f"   截图功能: {'开启' if self._enable_screenshot else '关闭'}")
         logger.info(f"   代理模式: TPS")
         logger.info(f"   邮编验证模式: {getattr(config, 'ZIP_VERIFY_MODE', 'standalone')} "
-                    f"(on_fetch=省验证GET) | 会话初始化并发: "
+                    f"(on_fetch=省验证GET，未生效先重发POST×"
+                    f"{getattr(config, 'ZIP_REPOST_MAX_TRIES', 2)}再冷轮换) | 会话初始化并发: "
                     f"{getattr(config, 'SESSION_INIT_CONCURRENCY', 3)}")
 
         self._running = True
@@ -1020,6 +1031,7 @@ class Worker:
         last_error_type = "network"
         last_error_detail = ""
         attempt = 0
+        zip_repost_tries = 0  # on_fetch 邮编未生效时的同 session 重发计数（冷轮换后清零）
         while attempt < max_retries:
             try:
                 # === Session 获取（本协程私有 slot，独立 session）===
@@ -1235,8 +1247,22 @@ class Worker:
                         attempt += 1
                         last_error_type = "zip_not_effective"
                         last_error_detail = f"商品页邮编未生效: target={target_zip}"
-                        logger.warning(f"ASIN {asin} 邮编未生效（目标 {target_zip}）(尝试 {attempt}/{max_retries})")
-                        await slot.rotate(reason="邮编未生效")
+                        # 先在同一 session 上重发一次邮编 POST（代价远小于冷轮换）；
+                        # 重发预算用尽或重发失败才回退到冷轮换换 IP（冷轮换后清零预算）。
+                        _repost_cap = getattr(config, "ZIP_REPOST_MAX_TRIES", 2)
+                        if zip_repost_tries < _repost_cap and await slot.repost_zip(target_zip):
+                            zip_repost_tries += 1
+                            logger.warning(
+                                f"ASIN {asin} 邮编未生效（目标 {target_zip}），同 session 重发 POST "
+                                f"[{zip_repost_tries}/{_repost_cap}] 后重采 (尝试 {attempt}/{max_retries})"
+                            )
+                        else:
+                            logger.warning(
+                                f"ASIN {asin} 邮编未生效（目标 {target_zip}），冷轮换换 IP "
+                                f"(尝试 {attempt}/{max_retries})"
+                            )
+                            await slot.rotate(reason="邮编未生效")
+                            zip_repost_tries = 0
                         continue
                     # True=命中，None=商品页无 glow（宽松放行）。周期性汇总命中分布。
                     self._zip_onfetch["match" if zip_eff is True else "unknown"] += 1

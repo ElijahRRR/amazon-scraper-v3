@@ -298,6 +298,22 @@ class AmazonSession:
         logger.info(f"📍 邮编切换成功: {old_zip} → {new_zip}")
         return True
 
+    async def resend_zip_code(self) -> bool:
+        """在同一 session 上重发一次当前邮编的 POST（不换 session、不重建、不验证）。
+
+        on_fetch 模式下商品页 glow 显示邮编未生效时使用：TPS 代理下未生效多因设置
+        POST 落的 IP 与后续抓页 IP 不一致，重发一次 POST（配合下一次抓页换新 IP）
+        通常即可让 glow 命中，代价远小于冷轮换（关 session + report_blocked，喂给
+        代理 429/被封计数）。返回 True 表示 POST 已成功发出、可原地重采。
+        """
+        if not self._initialized or self._session is None:
+            return False
+        try:
+            return await self._set_zip_code()
+        except Exception as e:
+            logger.warning(f"📍 邮编重发异常: {e}")
+            return False
+
     def _build_headers(self, referer: str = None) -> Dict[str, str]:
         """构建反指纹请求头"""
         headers = {

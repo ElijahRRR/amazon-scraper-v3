@@ -63,6 +63,8 @@ class FakeSession:
         self.closed = False
         self.change_zip_calls = []
         self.change_zip_ok = True
+        self.resend_calls = 0
+        self.resend_ok = True
 
     def is_ready(self):
         return self._ready and not self.closed
@@ -72,6 +74,10 @@ class FakeSession:
         if self.change_zip_ok:
             self.zip_code = target
         return self.change_zip_ok
+
+    async def resend_zip_code(self):
+        self.resend_calls += 1
+        return self.resend_ok
 
     async def close(self):
         self.closed = True
@@ -168,14 +174,21 @@ class SessionSlotTests(unittest.TestCase):
         self.assertEqual(slot.session.change_zip_calls, [])  # 无 POST
 
     def test_ensure_zip_different_zip_posts(self):
-        w = FakeWorker(zip_code="10001")
-        slot = SessionSlot(w)
-        run(slot.ensure_ready())
-        ok = run(slot.ensure_zip("90210"))
-        self.assertTrue(ok)
-        # 默认 standalone 模式：change_zip_code(verify=True)
-        self.assertEqual(slot.session.change_zip_calls, [("90210", True)])
-        self.assertEqual(slot.session.zip_code, "90210")
+        # 显式固定 standalone，不依赖全局默认（默认已改为 on_fetch）
+        import common.config as appcfg
+        old = getattr(appcfg, "ZIP_VERIFY_MODE", "on_fetch")
+        appcfg.ZIP_VERIFY_MODE = "standalone"
+        try:
+            w = FakeWorker(zip_code="10001")
+            slot = SessionSlot(w)
+            run(slot.ensure_ready())
+            ok = run(slot.ensure_zip("90210"))
+            self.assertTrue(ok)
+            # standalone 模式：change_zip_code(verify=True)
+            self.assertEqual(slot.session.change_zip_calls, [("90210", True)])
+            self.assertEqual(slot.session.zip_code, "90210")
+        finally:
+            appcfg.ZIP_VERIFY_MODE = old
 
     def test_ensure_zip_on_fetch_mode_skips_verify(self):
         import common.config as appcfg
@@ -207,6 +220,41 @@ class SessionSlotTests(unittest.TestCase):
         ok = run(slot.ensure_zip(""))
         self.assertTrue(ok)
         self.assertEqual(slot.session.change_zip_calls, [])
+
+    # ── repost_zip（on_fetch 未生效时同 session 重发 POST）─────────────────────
+    def test_repost_zip_success_reuses_session(self):
+        w = FakeWorker(zip_code="90210")
+        slot = SessionSlot(w)
+        run(slot.ensure_ready())
+        old = slot.session
+        ok = run(slot.repost_zip("90210"))
+        self.assertTrue(ok)
+        self.assertIs(slot.session, old)          # 不换 session
+        self.assertEqual(slot.session.resend_calls, 1)
+        self.assertEqual(w.proxy_manager.blocked_reports, 0)  # 不上报被封
+
+    def test_repost_zip_failure_returns_false(self):
+        w = FakeWorker(zip_code="90210")
+        slot = SessionSlot(w)
+        run(slot.ensure_ready())
+        slot.session.resend_ok = False
+        ok = run(slot.repost_zip("90210"))
+        self.assertFalse(ok)
+        self.assertEqual(slot.session.resend_calls, 1)
+
+    def test_repost_zip_no_session_returns_false(self):
+        w = FakeWorker()
+        slot = SessionSlot(w)  # 未 ensure_ready，session=None
+        ok = run(slot.repost_zip("90210"))
+        self.assertFalse(ok)
+
+    def test_repost_zip_empty_target_returns_false(self):
+        w = FakeWorker()
+        slot = SessionSlot(w)
+        run(slot.ensure_ready())
+        ok = run(slot.repost_zip(""))
+        self.assertFalse(ok)
+        self.assertEqual(slot.session.resend_calls, 0)
 
     # ── 主动轮换计数 ─────────────────────────────────────────────────────────
     def test_note_success_proactive_threshold(self):

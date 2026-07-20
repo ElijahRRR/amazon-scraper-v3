@@ -18,3 +18,6 @@ playwright>=1.40.0
 
 # Shared
 python-dotenv>=1.0.0
+# 内存管理：Chromium RSS 封顶 + MEM_DIAG 诊断需要读进程树 RSS（跨平台）。
+# 缺失时不报错，仅降级为"按渲染张数重启浏览器 + 无 RSS 诊断"。
+psutil>=5.9.0

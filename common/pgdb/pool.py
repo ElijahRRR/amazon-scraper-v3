@@ -383,6 +383,25 @@ class ConnProxy:
         self._allow_tx = allow_tx
         self._label = label
         self._tx: Optional[asyncpg.transaction.Transaction] = None
+        # 单条连接上的**语句级**串行化，复刻 aiosqlite 的内部排队。
+        #
+        # 为什么必须有：D-2 让 ``_db`` 是**一条**专用写连接。aiosqlite 把每个
+        # 操作丢到该连接自己的工作线程上排队，所以两个协程同时用同一条连接是
+        # 合法的；asyncpg 不排队，直接
+        #   InterfaceError: cannot perform operation: another operation is in progress
+        #
+        # 仓库里确实存在"不持 _write_lock 就碰 _db"的路径，它们在 SQLite 下
+        # 完全合法，因此不能改（equivalence-first）：
+        #   common/pgdb/batches.py  list_callback_due —— _callback_dispatcher 定时调用
+        #   server/app.py:1298 / 2230 / 2281 / 2289 / 2294 / 2309 —— 裸 _db 读
+        # 这些与任意持锁写路径并发就会 raise。黄金夹具看不见（它把 4 个后台
+        # 协程 no-op 掉了，且 TestClient 是顺序的），但**真实服务**必然撞上。
+        #
+        # 语义与 aiosqlite 逐条对齐：锁只包住**一条**语句，不包住事务。
+        # 于是"另一个协程的 SELECT 插进某个开着的事务中间"这件事，两个后端
+        # 的行为一致（同一条连接 = 同一个事务，都能读到未提交的改动）。
+        # 不会与 _write_lock 形成环：持有 _op_lock 期间绝不去拿 _write_lock。
+        self._op_lock = asyncio.Lock()
 
     # ---- 原生连接（需要 asyncpg 专有能力时用，例如 copy / listen）----
     @property
@@ -399,7 +418,8 @@ class ConnProxy:
 
     async def executemany(self, sql: str, seq_of_parameters) -> Cursor:
         stmt = translate_sql(sql)
-        await self._conn.executemany(stmt, [tuple(p) for p in seq_of_parameters])
+        async with self._op_lock:
+            await self._conn.executemany(stmt, [tuple(p) for p in seq_of_parameters])
         # asyncpg 的 executemany 不返回任何计数。谁要"实际插入了几行"，
         # 必须改用单条 set-based INSERT ... ON CONFLICT DO NOTHING 读命令标签
         # （见 OWNERSHIP.md 的 total_changes 条目），不要指望这里的 rowcount。
@@ -409,20 +429,34 @@ class ConnProxy:
         """多语句 DDL。asyncpg 的简单查询协议支持，但**不能带参数**。"""
         if "?" in script:
             raise ValueError("executescript 不接受占位符参数")
-        await self._conn.execute(script)
+        async with self._op_lock:
+            await self._conn.execute(script)
         return Cursor((), -1, script)
 
+    async def begin(self):
+        async with self._op_lock:
+            await self._exec_tx_control("begin")
+
     async def commit(self):
-        await self._exec_tx_control("commit")
+        async with self._op_lock:
+            await self._exec_tx_control("commit")
 
     async def rollback(self):
-        await self._exec_tx_control("rollback")
+        async with self._op_lock:
+            await self._exec_tx_control("rollback")
 
     async def close(self):
         return None
 
     # ---- 内部 ----
     async def _run(self, sql: str, params: Sequence[Any]) -> Cursor:
+        # 语句级串行化（见 __init__ 里 _op_lock 的说明）。锁只包一条语句，
+        # 行是即时取完的，所以 ``async with conn.execute(...) as cur`` 迭代
+        # 期间并不持锁。
+        async with self._op_lock:
+            return await self._run_unlocked(sql, params)
+
+    async def _run_unlocked(self, sql: str, params: Sequence[Any]) -> Cursor:
         norm = normalize_stmt(sql)
 
         # (a) 事务控制
@@ -652,8 +686,23 @@ class PoolMixin:
         proxy = self._write_proxy
         if proxy is None:
             raise RuntimeError("数据库未连接")
-        async with proxy.raw.transaction():
+        # 走代理自己的事务控制（而不是 proxy.raw.transaction()），有两个原因：
+        # 1) BEGIN/COMMIT 也必须过 _op_lock。raw.transaction() 直接在裸连接上
+        #    发语句，会绕开语句级串行化，于是"另一个协程正在 fetch"时开事务
+        #    就抛 InterfaceError —— 这正是 _callback_dispatcher 撞上的那条路径。
+        # 2) 与 execute("BEGIN") 共用同一个 proxy._tx 状态位，两套事务写法
+        #    因此可以互相看见（嵌套 BEGIN 仍会被显式挡下）。
+        await proxy.begin()
+        try:
             yield proxy
+        except BaseException:
+            # BaseException 而非 Exception：CancelledError 也必须回滚，
+            # 否则那条唯一的写连接会永远卡在事务里
+            # （catalog_sync_audit.md:130 记的就是这个故障）。
+            await proxy.rollback()
+            raise
+        else:
+            await proxy.commit()
 
     # ---------------- 供 mixin 使用的小工具 ----------------
     @staticmethod

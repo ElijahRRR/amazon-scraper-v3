@@ -164,6 +164,7 @@ def _pg_scratch_db():
     临时 DB_PATH 拿到这份隔离，PG 侧只能靠"一次运行一个库"。
     """
     import asyncio
+    import uuid
     import asyncpg
     from urllib.parse import urlsplit, urlunsplit
 
@@ -171,7 +172,9 @@ def _pg_scratch_db():
 
     base = os.environ.get("PG_DSN") or config.PG_DSN
     parts = urlsplit(base)
-    name = f"scraper_golden_{os.getpid()}"
+    # pid 在容器里会被回收，而下面第一句就是 DROP ... WITH (FORCE)：
+    # 撞名等于把另一次运行的库当场强拆。加一段随机后缀彻底消掉这个竞争。
+    name = f"scraper_golden_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     admin_dsn = urlunsplit(parts._replace(path="/postgres"))
     scratch_dsn = urlunsplit(parts._replace(path="/" + name))
 

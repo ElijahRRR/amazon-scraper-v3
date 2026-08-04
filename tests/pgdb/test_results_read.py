@@ -230,8 +230,16 @@ GET_RESULTS_CASES = [
     dict(limit=3),
     dict(limit=3, cursor_id=6),
     dict(limit=3, cursor_id=3, direction="prev"),
+    dict(direction="prev"),
+    dict(direction="prev", limit=2),
     dict(limit=100),
     dict(limit=0),
+    # 限长：>10 个词只取前 10；>500 字符先整体截断；单词 >100 字符再截
+    dict(search=",".join(f"t{i}" for i in range(15))),
+    dict(search="GoldenBrand," + ",".join(f"zz{i}" for i in range(20))),
+    dict(search="x" * 600),
+    dict(search="GoldenBrand" + "z" * 200),
+    dict(search="a" * 120 + ",Wireless"),
     # ASCII 大小写折叠（SQLite 的 LIKE 和 FTS5 trigram 都折 ASCII）
     dict(search="GoldenBrand"), dict(search="goldenbrand"),
     dict(search="GOLDENBRAND"), dict(search="GoLdEnBrAnD"),

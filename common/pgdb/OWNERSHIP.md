@@ -44,13 +44,17 @@ async def test_xxx(pgdb):     # pgdb 夹具 = 一个全新的临时库，用完�
 | `common/pgdb/admin.py` | ✅ 已完成（4 个 no-op） | 骨架 |
 | `common/pgdb/__init__.py` | ✅ 已完成（Database 组装 + 导入期自检） | 骨架 |
 | `common/dbfactory.py` | ✅ 已完成（DB_BACKEND 开关） | 骨架 |
-| `common/pgdb/batches.py` | ⬜ 待实现 | **agent C** |
-| `common/pgdb/tasks.py` | ⬜ 待实现 | **agent D** |
-| `common/pgdb/results_write.py` | ⬜ 待实现 | **agent E** |
-| `common/pgdb/results_read.py` | ⬜ 待实现 | **agent F** |
-| `common/pgdb/media.py` | ⬜ 待实现 | **agent G** |
+| `common/pgdb/batches.py` | ✅ 已完成 | agent C |
+| `common/pgdb/tasks.py` | ✅ 已完成 | agent D |
+| `common/pgdb/results_write.py` | ✅ 已完成 | agent E |
+| `common/pgdb/results_read.py` | ✅ 已完成 | agent F |
+| `common/pgdb/media.py` | ✅ 已完成 | agent G |
 | `tests/pgdb/helpers.py` + `conftest.py` | ✅ 已完成（临时库夹具） | 骨架 |
 | `tests/pgdb/test_skeleton.py` | ✅ 已完成（21 条契约自检） | 骨架 |
+| `tests/pgdb/test_concurrency.py` | ✅ 已完成（单写连接并发回归） | 收口 |
+
+**Phase 1 状态：完工。** 两个后端各自 `64 步与基线完全一致`，
+`pytest tests/ -q` 全绿。收口阶段做的事见 §3 的 D-13 / D-14。
 
 **没人碰 `common/database.py`。** 每个 agent 只碰自己那一个文件 + 自己的
 `tests/pgdb/test_<domain>.py`。骨架文件（pool / schema / __init__ / _shared /
@@ -146,6 +150,8 @@ tasks.py   欠 results_write : fail_task(...) -> {"accepted": bool, "stale": boo
 | **D-10** | 每个 text 列都带 `COLLATE "C"`，建库也用 `LC_COLLATE=C` | 双保险。scraper_dev 恰好是 C.UTF-8 所以现在看不出问题，但生产库若用 en_US.UTF-8 建，`iter_results` 的 keyset（`ba.asin > $n ORDER BY ba.asin`）会重排导出行序。逐列 COLLATE 能扛住"恢复进另一台 collation 不同的库"。 |
 | **D-11** | 黄金夹具在 `DB_BACKEND=postgres` 时**每次运行建一个新库** | 基线钉死了自增 id 的**烧号**（batch id 1/3、task id 1,3,7,8），复用脏库序列不从 1 开始，64 步无法重放。SQLite 路径完全没动（该分支有 `is_postgres()` 守卫）。 |
 | **D-12** | NUL 字节默认**不剔除**（`PG_STRIP_NUL=1` 可开） | 剔除会改变落库数据，进而改变 `content_hash` / `title_bullets_hash` / `asin_changes`；不剔除则一条脏标题会让整批上传 500（SQLite 没有这个故障模式）。黄金定不了这件事，留给人拍板；做成开关，翻一行即可。 |
+| **D-13** | `ConnProxy` 内置**语句级** `asyncio.Lock`（`_op_lock`），复刻 aiosqlite 的连接内排队 | D-2 让 `_db` 是**一条**连接。aiosqlite 把操作排进该连接的工作线程，所以并发使用合法；asyncpg 不排队，直接抛 `InterfaceError: another operation is in progress`。而仓库里确实有"不持 `_write_lock` 就碰 `_db`"的合法路径（`list_callback_due`、app.py:1298/2230/2281/2289/2294/2309），它们在 SQLite 下完全正常、按 equivalence-first **不能改**。黄金结构性看不到这件事（4 个后台协程被 no-op、TestClient 顺序执行），但**真实服务**必然撞上——实测 `_callback_dispatcher` 与写路径并发 100% 复现。锁只包**一条**语句、不包事务，所以"另一个协程的 SELECT 插进开着的事务中间"两个后端行为一致。回归由 `tests/pgdb/test_concurrency.py` 守。 |
+| **D-14** | `run_startup_optimize` 回到 `_write_lock("optimize")` + `self._db`，与 SQLite 逐字一致 | 早先为绕开上面那个 `InterfaceError` 改走了读池且不拿锁，代价是活着的 PG 服务在 `/api/_debug/lock-stats` 里比 SQLite **少一个 `optimize` caller key**（实测差异）。D-13 修掉根因后这个绕行就没必要了。走读池反而有 SQLite 没有的风险：导出会长时间占用池连接，池满时 ANALYZE 会举着 `_write_lock` 干等，拖死所有写路径。<br>**注意** `maintenance_loop` 仍然没有 `checkpoint` 这个 caller key——那不是取舍，是 PG 里根本不存在对应操作，为了让指标"看起来一样"去空转一个锁等于伪造观测数据。 |
 
 ### 明确推迟到 Phase 1.5 / Phase 2 的（**别在 Phase 1 顺手做**）
 - `get_results` 的 COUNT 崩溃（D-8）与 COUNT(*) 重构。
@@ -185,6 +191,16 @@ tasks.py   欠 results_write : fail_task(...) -> {"accepted": bool, "stale": boo
     变体展开、回调机制、批量删除、`DELETE /api/database`、`get_batch_failures`）
     只能靠自己的用例兜。**不要**扩 `tests/golden/scenario.py`、**不要**重录基线——
     基线是不变式。
+
+### 规格书里两处**已证伪**的说法（别照着"修 bug"）
+
+移植规格书（以及本文件早先的措辞）有两处与实际行为不符。两处都已在 SQLite
+原实现上实测确认，PG 侧照抄的是**真实行为**而不是规格书的描述：
+
+| 说法 | 实测（SQLite，唯一真源） |
+|---|---|
+| `get_progress` 遇到未知 status 会 `KeyError` | **不会。** 那行是 `stats[row["status"]] = row["cnt"]`，赋值不是取值。未知 status 会往返回的 dict（= HTTP 响应体）里**多塞一个 key**，且不计入 `total`。为"保留 bug"去加 `raise` 才是真的引入回归。 |
+| `get_batches` 对零任务批次返回 `completed/failed/pending/processing = NULL` | **返回 int `0`。** `LEFT JOIN` 产出一行全 NULL 的 `t.*`，`CASE` 走 `ELSE 0`，`SUM` over 单行 = 0。两个后端一致。 |
 
 ---
 

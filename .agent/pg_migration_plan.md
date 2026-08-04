@@ -302,15 +302,26 @@ CREATE TABLE scraper.sync_meta (k text PRIMARY KEY, v text NOT NULL);
 
 | 原表 | PG 下 | 变化 |
 |---|---|---|
-| `asin_data` | `scraper.products` | 列基本原样；`crawl_time`/`created_at`/`updated_at` 改 `timestamptz`；`content_hash`/`title_bullets_hash` 保留不动（`asin_changes` 依赖它） |
+| `asin_data` | `scraper.products` | 列基本原样；~~`crawl_time`/`created_at`/`updated_at` 改 `timestamptz`~~ → **保持 `text`**（见下方修订说明与 D-1）；`content_hash`/`title_bullets_hash` 保留不动（`asin_changes` 依赖它） |
 | `asin_changes` | `scraper.asin_changes` | 原样 |
 | `tasks` | `scraper.tasks` | 原样移植；`lease_epoch` 机制**先保留**，Phase 1.5 再评估改 `FOR UPDATE SKIP LOCKED` |
 | `batches` / `batch_asins` / `screenshots` / `seller_discoveries` | 同名 | 原样 |
 | `asin_data_fts`（FTS5 trigram） | **删除**，改 `pg_trgm` + GIN | 见 §3.2 |
 
-**SQLite workaround 直接删除的部分**：`_write_lock` / `TimedLock`、只读连接池 `_read_pool`、
-`maintenance_loop` 的 WAL checkpoint、`run_startup_optimize`、全部 `PRAGMA`、
-`wal_checkpoint` 端点、`/api/_debug/lock-stats`（可保留为 PG 版指标，但内容全变）。
+**SQLite workaround 直接删除的部分**：只读连接池 `_read_pool`（由 asyncpg.Pool 顶替）、
+`maintenance_loop` 的 WAL checkpoint、全部 `PRAGMA`、`wal_checkpoint` 的实际动作。
+四个公开方法（`_open_read_pool` / `run_startup_optimize` / `maintenance_loop` /
+`start_maintenance` / `wal_checkpoint`）**签名与 sync/async 性质必须保留**——
+app.py:171/174/306 与 harness 都按名字调用，`start_maintenance` 还是**同步**方法。
+
+> ⚠ **修订（D-3）**：原文把 `_write_lock` / `TimedLock` 与 `/api/_debug/lock-stats`
+> 列入"直接删除"，**这是错的**。黄金基线 step 56 把该端点的 key 集合钉死了：
+> `waits`/`holds` = {accept_results_batch, other, pull_tasks}，
+> `stage_timings` = {commit, save_result, total_in_lock, update_tasks_lease}，
+> 且 `_summary` 对空样本返回形状不同的 `{"count": 0}`。删掉 = 七个 key 同时"字段消失"，
+> 64 步校验必挂。因此 pgdb **从 `common.database` 共享同一个 `TimedLock` 与
+> `LOCK_STATS` 对象**（不是拷贝——app.py:2625 是按模块全局对象 import 的），
+> 命名调用点与五处 `record_stage()` 全部原地保留。
 
 ### 2.3 `marketplace` 的取值规则
 
@@ -377,17 +388,21 @@ DDL 的默认值只在「插入时不带该列」时生效，而 worker 路径�
 
 `common/database.py` 2486 行 + `server/app.py` 里的直连 SQL。逐项：
 
-| 项 | SQLite | PG |
-|---|---|---|
-| 占位符 | `?` | `$1, $2, ...`（机械但量大，最易漏） |
-| 自增主键 | `INTEGER PRIMARY KEY AUTOINCREMENT` | `bigint GENERATED ALWAYS AS IDENTITY` |
-| upsert | `INSERT OR IGNORE` | `ON CONFLICT DO NOTHING` |
-| 时间 | `TEXT` `'%Y-%m-%d %H:%M:%S'` | `timestamptz`，**全部 UTC** |
-| 布尔 | `0/1` | `boolean` |
-| 全文搜索 | FTS5 trigram 虚拟表 + 触发器 | `pg_trgm` + `GIN (title gin_trgm_ops)` 等，见 §3.2 |
-| 并发控制 | 全局 `_write_lock` + 单写连接 | 删除；靠事务 + 行锁 |
-| 读写隔离 | 独立只读连接池 | 连接池 + 只读事务 |
-| 维护 | WAL checkpoint / optimize / VACUUM | autovacuum，全删 |
+> ⚠ **本表有四行已被黄金基线证伪，下面是修订后的版本。**
+> 原表写于基线录制之前。以 `common/pgdb/OWNERSHIP.md` 的决策台账为准
+> （D-1 / D-2 / D-3），Phase 1 已按修订版实现并通过 64/64 校验。
+
+| 项 | SQLite | PG | 备注 |
+|---|---|---|---|
+| 占位符 | `?` | `$1, $2, ...` | pgdb 内部仍写 `?`，由 `translate_sql` 统一改写（D-6） |
+| 自增主键 | `INTEGER PRIMARY KEY AUTOINCREMENT` | `bigint GENERATED ALWAYS AS IDENTITY` | 烧号行为一致，基线钉死（batch id 1/3、task id 1,3,7,8） |
+| upsert | `INSERT OR IGNORE` | `ON CONFLICT DO NOTHING` | 绝不预过滤冲突行，否则烧号偏移 |
+| 时间 | `TEXT` `'%Y-%m-%d %H:%M:%S'` | ~~`timestamptz`~~ → **保持 `text`** | **已修正（D-1）**：app.py:487/1168 对该值做 `strptime(x[:19], ...)`，datetime 对象不可下标，会 TypeError |
+| 布尔 | `0/1` | ~~`boolean`~~ → **保持 `integer` 0/1** | **已修正（D-1）**：基线里 `/api/batches` 的 `needs_screenshot` 是 int `0`；asyncpg 会把 boolean 列返回成 `True/False`，FastAPI 序列化成 `true/false` |
+| 全文搜索 | FTS5 trigram 虚拟表 + 触发器 | `pg_trgm` + GIN | 谓词用 `ascii_lower(x) LIKE ascii_lower(y)`，**不是 ILIKE**（D-5：ILIKE 折全 Unicode，实测 9 处与 SQLite 不一致） |
+| 并发控制 | 全局 `_write_lock` + 单写连接 | ~~删除~~ → **Phase 1 保留原样** | **已修正（D-2）**：删掉就得给每个方法单独取连接，而 app.py 那 7 个 `async with db._write_lock: ... db._db.execute('BEGIN')` 块会立刻错乱。真正的写并发是 Phase 1.5（前提：先抽干净 app.py 的裸 SQL） |
+| 读写隔离 | 独立只读连接池 | asyncpg 连接池 | 读侧已走池，"重读阻塞写"这个真正的痛点已解决 |
+| 维护 | WAL checkpoint / optimize / VACUUM | autovacuum | 四个公开方法保留为 no-op/等价物（app.py 与 harness 都按名字调用） |
 
 **语义必须逐字保持**，包括 lease 校验、变动检测的 baseline 逻辑、
 `_is_parse_failure` 的判定（即使它有 bug——移植阶段不修 bug，Phase 4 再修）。

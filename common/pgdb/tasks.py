@@ -80,7 +80,12 @@ release_tasks
 get_progress
   * {pending, processing, done, failed, total, completion_rate, success_rate}。
     比率在 **Python** 里算，不要挪进 SQL（PG 的除法会返回 numeric → Decimal
-    → JSON 字符串）。出现未知 status 字符串时会 KeyError，这是现状，照抄。
+    → JSON 字符串）。
+  * ⚠ 规格书（和本文件早先的注释）说"未知 status 会 KeyError"——**是错的**。
+    那行是 ``stats[row["status"]] = row["cnt"]``，赋值不是取值，不会抛。
+    实测两个后端一致：未知 status 会往返回的 dict 里**塞一个额外的 key**
+    （而这个 dict 就是 HTTP 响应体），且不计入 ``total``。
+    照抄这个行为；**不要**为了"保留 bug"去加 raise —— 那是真的引入回归。
 
 get_batch_failures
   * 键：asin, status, error_type, error_detail, retry_count, worker_id, updated_at。
@@ -487,7 +492,9 @@ class TasksMixin:
         stats = {"pending": 0, "processing": 0, "done": 0, "failed": 0, "total": 0}
         async with self.read() as rc, rc.execute(sql, params) as c:
             async for row in c:
-                # 未知 status 字符串会 KeyError —— 这是现状，照抄
+                # 赋值，不是取值：未知 status 不会 KeyError，而是往返回的 dict
+                # 里多塞一个 key（该 dict 直接就是 HTTP 响应体），且不计入
+                # total。与 SQLite 实测一致，照抄。
                 stats[row["status"]] = row["cnt"]
         stats["total"] = sum(stats[k] for k in ["pending", "processing", "done", "failed"])
         finished = stats["done"] + stats["failed"]

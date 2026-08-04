@@ -19,6 +19,7 @@
 | 失败/降级采集 | **进流**，带 `outcome` 枚举 | 用户确认 |
 | ack 契约 | 做，排后期，非阻塞 | 用户确认 |
 | 日采集量 | 当前 10 万/天，未来可能几十万，绝大多数是重复采集 | 用户确认 |
+| `marketplace` 表示法 | **域名形式**，当前值域是单元素集 `{'amazon.com'}` | 用户确认 |
 | 拉取节奏 | 建议 5 分钟 / 每页 1000 | 本文建议 |
 
 **PG 版本要求**：≥ 14（推荐 16/17）。声明式分区、`FOR UPDATE SKIP LOCKED`、
@@ -127,7 +128,8 @@ CREATE TABLE scraper.scrape_events (
     asin          text        NOT NULL,
 
     -- 采集参数（需求 3）
-    marketplace   text        NOT NULL,   -- 规范化常量，值域见 §5
+    marketplace   text        NOT NULL
+                  CHECK (marketplace IN ('amazon.com')),   -- 封闭集，加站点时改这一行
     zip_requested text        NOT NULL,   -- 5 位补零，worker 实际请求的邮编
     zip_observed  text,                   -- 页面 glow-ingress-line2 抽出，Phase 4 前为 NULL
     zip_verify    text        NOT NULL,   -- confirmed|assumed|mismatch|unverified
@@ -198,6 +200,27 @@ CREATE TABLE scraper.sync_meta (k text PRIMARY KEY, v text NOT NULL);
 **SQLite workaround 直接删除的部分**：`_write_lock` / `TimedLock`、只读连接池 `_read_pool`、
 `maintenance_loop` 的 WAL checkpoint、`run_startup_optimize`、全部 `PRAGMA`、
 `wal_checkpoint` 端点、`/api/_debug/lock-stats`（可保留为 PG 版指标，但内容全变）。
+
+### 2.3 `marketplace` 的取值规则
+
+**值域：域名形式的封闭集，当前只有 `'amazon.com'`。** 由 `CHECK` 约束在写入端强制。
+
+现状是同一个概念有三个字面量：`worker/parser.py:1333` 写 `"site": "US"`、
+`common/database.py:513` 列默认 `'amazon.com'`、`common/models.py:69` dataclass 默认
+`'amazon.com'`。实际落库的永远是 `"US"`——`_default_result` 带了这个键且非空，写入时必定覆盖；
+DDL 的默认值只在「插入时不带该列」时生效，而 worker 路径从不如此。
+
+**实现要求：事件流的 `marketplace` 不得透传 parser 的 `site` 字段。**
+那个 `"US"` 是硬编码常量，不从任何东西推导（`worker/session.py:45`
+`AMAZON_BASE = "https://www.amazon.com"` 同样是无配置项的类常量——系统在结构上就是单站点的）。
+应由 relay 从**实际抓取使用的域名**推导并规范化，落在封闭集内，集外的值直接拒绝并告警。
+
+**为什么必须是封闭集而不是自由文本**：`marketplace` 是分组键
+`(asin, marketplace, zip_requested)` 的一部分。一旦值发生漂移（一部分行 `US`、
+一部分行 `amazon.com`），同一个商品会裂成两组，「取最新值」静默返回错误的价格序列，
+且从数据上看不出异常。
+
+沃尔玛侧若需 SP-API 的 marketplace ID，那是消费侧一张二十来行的映射表，不由采集侧承担。
 
 ---
 
@@ -539,8 +562,9 @@ Phase 4 可与试点并行，Phase 6 上线后补。
 
 | # | 事项 | 影响 |
 |---|---|---|
-| 1 | `marketplace` 值域：`amazon.com` / `US` / marketplace ID？ | 它是分组键的一部分，值域必须先钉死 |
-| 2 | 切换时 `crawl_time` 从 UTC+8 改为带时区 UTC —— erpAPI 能否接受？ | 这会改变现有端点的响应内容，是本计划里唯一一处非纯加性的变更 |
-| 3 | PG 部署形态：与 scraper 同机还是独立？备份策略？ | 影响连接配置与恢复演练 |
-| 4 | 拉取节奏最终定几分钟 | 建议 5 分钟 / 每页 1000 |
-| 5 | erpAPI 端点清单 | 决定 T13 黄金样本的覆盖面；在此之前「零影响」不可测量 |
+| 1 | ~~`marketplace` 值域~~ | **已定：域名形式，`CHECK (marketplace IN ('amazon.com'))`**。规则见 §2.3 |
+| 2 | **`catalog.products` 的主键：`asin` 还是 `(marketplace, asin)`？（需转给沃尔玛侧）** | ASIN 是按站点分配的，同一 ASIN 字符串在不同站点可以是不同商品。单列主键只在单站点前提下安全。**现在做成复合主键成本是零**（值域只有一个值）；等表里堆了几十万行、挂上审核结论与上架资产之后再改主键会很痛 |
+| 3 | 切换时 `crawl_time` 从 UTC+8 改为带时区 UTC —— erpAPI 能否接受？ | 这会改变现有端点的响应内容，是本计划里唯一一处非纯加性的变更 |
+| 4 | PG 部署形态：与 scraper 同机还是独立？备份策略？ | 影响连接配置与恢复演练 |
+| 5 | 拉取节奏最终定几分钟 | 建议 5 分钟 / 每页 1000 |
+| 6 | erpAPI 端点清单 | 决定 T13 黄金样本的覆盖面；在此之前「零影响」不可测量 |

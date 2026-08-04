@@ -27,6 +27,7 @@ import openpyxl
 
 from common import config
 from common.database import Database
+from common.dbfactory import create_database
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,7 +155,9 @@ def _register_worker(worker_id: str, enable_screenshot: bool = None, ip: str = N
 @asynccontextmanager
 async def lifespan(app):
     global db, _callback_send_queue
-    db = Database()
+    # 存储后端由 DB_BACKEND 决定（默认 sqlite，此时与移植前完全相同：
+    # 同一个 common.database.Database 类、同一个无参构造）。见 common/dbfactory.py
+    db = create_database()
     await db.connect()
     _load_settings()
     os.makedirs(config.EXPORT_DIR, exist_ok=True)

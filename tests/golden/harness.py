@@ -156,17 +156,67 @@ _PATCHED_LOOPS = (
 )
 
 
+def _pg_scratch_db():
+    """DB_BACKEND=postgres 时：建一个本次运行专用的库，返回 (dsn, drop_fn)。
+
+    黄金场景把 **自增 id 的烧号**钉死在基线里（golden_batch_b 是 id 3 不是 2，
+    task id 是 1,3,7,8），所以每次重放都必须从全新的序列开始 —— SQLite 侧靠
+    临时 DB_PATH 拿到这份隔离，PG 侧只能靠"一次运行一个库"。
+    """
+    import asyncio
+    import asyncpg
+    from urllib.parse import urlsplit, urlunsplit
+
+    from common import config
+
+    base = os.environ.get("PG_DSN") or config.PG_DSN
+    parts = urlsplit(base)
+    name = f"scraper_golden_{os.getpid()}"
+    admin_dsn = urlunsplit(parts._replace(path="/postgres"))
+    scratch_dsn = urlunsplit(parts._replace(path="/" + name))
+
+    async def _create():
+        conn = await asyncpg.connect(admin_dsn)
+        try:
+            await conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+            # LC_COLLATE=C：TEXT 的字节序 = SQLite 的 BINARY 排序。
+            # 建表时每列还额外带 COLLATE "C"，双保险。
+            await conn.execute(
+                f'CREATE DATABASE "{name}" TEMPLATE template0 '
+                f"LC_COLLATE 'C' LC_CTYPE 'C' ENCODING 'UTF8'")
+        finally:
+            await conn.close()
+
+    async def _drop():
+        conn = await asyncpg.connect(admin_dsn)
+        try:
+            await conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        finally:
+            await conn.close()
+
+    asyncio.run(_create())
+    return scratch_dsn, lambda: asyncio.run(_drop())
+
+
 @contextmanager
 def isolated_server():
     """产出 (client, ctx)。ctx.tmp_root 是被 scrub 成 <TMP> 的临时根目录。"""
     from starlette.testclient import TestClient
 
     import common.config as config
-    import common.database as database
+    import common.database as database  # noqa: F401  （restore 表里要用）
     import server.app as srv
+    from common.dbfactory import get_database_class, is_postgres
+
+    # 打补丁的目标必须是 DB_BACKEND 实际选中的那个 Database 类：
+    # 补到 SQLite 类上、跑的却是 PG 类，那两个后台任务就没被 no-op 掉，
+    # 样本会因为回收/重试/回调而不可重复。
+    db_cls = get_database_class()
 
     tmp_root = tempfile.mkdtemp(prefix="golden_")
     saved: Dict[str, Any] = {}
+    pg_drop = None
+    pg_env_before = os.environ.get("PG_DSN")
 
     async def _noop():
         return None
@@ -197,10 +247,16 @@ def isolated_server():
             saved[f"srv.{name}"] = getattr(srv, name)
             setattr(srv, name, _noop)
 
-        saved["db.start_maintenance"] = database.Database.start_maintenance
-        saved["db.run_startup_optimize"] = database.Database.run_startup_optimize
-        database.Database.start_maintenance = _noop_maintenance
-        database.Database.run_startup_optimize = _noop_optimize
+        if is_postgres():
+            saved["config.PG_DSN"] = config.PG_DSN
+            dsn, pg_drop = _pg_scratch_db()
+            config.PG_DSN = dsn
+            os.environ["PG_DSN"] = dsn
+
+        saved["db.start_maintenance"] = db_cls.start_maintenance
+        saved["db.run_startup_optimize"] = db_cls.run_startup_optimize
+        db_cls.start_maintenance = _noop_maintenance
+        db_cls.run_startup_optimize = _noop_optimize
 
         # 进程级注册表在同进程内跨用例残留，会让样本依赖执行顺序
         srv._worker_registry.clear()
@@ -216,8 +272,14 @@ def isolated_server():
     finally:
         for key, value in saved.items():
             mod, _, attr = key.partition(".")
-            target = {"config": config, "srv": srv, "db": database.Database}[mod]
+            target = {"config": config, "srv": srv, "db": db_cls}[mod]
             setattr(target, attr, value)
+        if pg_drop is not None:
+            if pg_env_before is None:
+                os.environ.pop("PG_DSN", None)
+            else:
+                os.environ["PG_DSN"] = pg_env_before
+            pg_drop()
         shutil.rmtree(tmp_root, ignore_errors=True)
 
 

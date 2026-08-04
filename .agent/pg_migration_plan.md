@@ -21,8 +21,10 @@
 | 日采集量 | 当前 10 万/天，未来可能几十万，绝大多数是重复采集 | 用户确认 |
 | `marketplace` 表示法 | **域名形式**，当前值域是单元素集 `{'amazon.com'}` | 用户确认 |
 | `crawl_time` 时区 | **改为带时区 UTC**，erpAPI 可接受 | 用户确认 |
-| PG 部署 | **与 scraper 同机**（DMIT VPS 1C / 2GB / 20GB SSD，README.md:8, 24, 546） | 用户确认 |
+| PG 部署 | **与 scraper 同机** | 用户确认 |
+| 目标机器 | **2 核 / 4GB / 80GB SSD**（新机，非现有的 1C/2GB/20GB） | 用户确认 |
 | 备份策略 | **不做本地备份**；沃尔玛侧中心库即持久副本，需要时从那边拉 | 用户确认 |
+| 截图持久化 | **不需要**。截图是一次性的，取用后即可清理，接受随机器丢失 | 用户确认 |
 | 拉取节奏 | **5 分钟** / 每页 1000 | 用户确认 |
 
 **PG 版本要求**：≥ 14（推荐 16/17）。声明式分区、`FOR UPDATE SKIP LOCKED`、
@@ -35,52 +37,65 @@
 
 **schema 布局**：采集侧自建 `scraper` schema，与沃尔玛侧的 `catalog` 完全无关，两边不共享数据库。
 
-### 0.1 同机部署的资源约束（承重）
+### 0.1 目标机器与资源规划
 
-机器实测规格：**DMIT VPS 1C / 2GB / 20GB SSD**，10 个 worker 分布在别处
-（README.md:8「Worker 可部署多台」、README.md:24、README.md:546）。
-现在 Postgres 要和 uvicorn 挤在这一台上。
+**目标机器：2 核 / 4GB / 80GB SSD**（新机，不是现有那台 1C/2GB/20GB 的 DMIT VPS，
+README.md:8, 24, 546 记的是旧规格）。10 个 worker 仍分布在别处，本机只跑 server + PG。
 
-**绑定约束是 1 vCPU，不是内存。** 现有 SQLite 版已经因为单核而把 xlsx 序列化挪进独立线程；
-PG 迁移后，PG 后端进程与 uvicorn 争抢同一个核。峰值 83 ASIN/s（README.md:551）下这是
-最可能先撞墙的地方。**Phase 5 必须实测这一项，不达标就升配，别硬扛。**
+相对旧机的两倍 CPU / 两倍内存 / 四倍磁盘，把之前按 1C/2GB/20GB 做的所有资源结论都翻掉了：
 
-建议的 `postgresql.conf`（2GB 且与应用同机，比标准 25% 建议保守）：
+| 原结论（旧机） | 新机下 |
+|---|---|
+| 绑定约束是 1 vCPU，PG 与 uvicorn 抢同一个核 | **2 核，两者可真正并行。仍需在 Phase 5 实测，但不再是预判的瓶颈** |
+| `shared_buffers` 只能给 256MB（12.5%） | **可以给到标准的 25% = 1GB** |
+| 必须关并行查询（`max_parallel_workers_per_gather = 0`） | **可以开到 1**，让大导出用上第二个核 |
+| 20GB 盘只够 7 天保留期（几十万/天时） | **80GB 盘下保留期不再是约束**，见 §0.2 |
+| 建议开 `synchronous_commit = off` 缓解单核 fsync 压力 | **建议保持默认 `on`**，见下 |
+
+建议的 `postgresql.conf`（4GB，与应用同机）：
 
 ```conf
-shared_buffers = 256MB                    # 常规建议是 25%，同机共存下取 12.5%
-effective_cache_size = 768MB
-work_mem = 4MB                            # 连接数 × work_mem 是内存尖峰的来源
-maintenance_work_mem = 64MB
-max_connections = 20                      # 每个后端进程基线约 5-10MB
-max_parallel_workers_per_gather = 0       # 单核上并行查询只会加剧争抢
-autovacuum_max_workers = 2
+shared_buffers = 1GB                      # 标准 25%
+effective_cache_size = 2GB                # 扣掉应用常驻后的诚实估计，不是 75%
+work_mem = 8MB                            # 峰值 ≈ max_connections × work_mem × 每查询排序数
+maintenance_work_mem = 256MB              # 利于 autovacuum 与建索引
+max_connections = 30
+max_parallel_workers_per_gather = 1       # 2 核：留一个核给 uvicorn
+max_parallel_workers = 2
+autovacuum_max_workers = 3
 random_page_cost = 1.1                    # SSD
 checkpoint_completion_target = 0.9
+default_toast_compression = lz4           # PG14+；比 pglz 快得多，压缩率略低。
+                                          # 事件表的 jsonb payload 全部走 TOAST，这一项直接影响写入 CPU
 ```
 
-`asyncpg` 连接池上限必须 ≤ `max_connections` 并留出维护余量（建议池 = 12）。
+`asyncpg` 连接池上限须 ≤ `max_connections` 并留维护余量（建议池 = 20）。
 
-**可选：`synchronous_commit = off`。** 崩溃会丢失最后约 0.2 秒的已提交事务。
-在本系统里这个取舍是成立的——数据可重采（用户已确认「重采几小时就够」），
-且 outbox 行与结果写在同一事务，一起丢不产生不一致。收益是在单核上显著降低 fsync 压力。
-**但这是有意识的取舍，必须写进 runbook，不能默默开着。**
+**`synchronous_commit` 保持默认 `on`。** 旧机上建议关掉是为了缓解单核 fsync 压力；
+2 核 + 4GB 下这个压力不再突出，而关掉的代价（崩溃丢最后约 0.2 秒已提交事务）是实打实的。
+**只有当 Phase 5 实测确认 fsync 是瓶颈时才考虑关**，并写进 runbook——不要默认开着。
 
-### 0.2 磁盘决定保留期（不是天数决定）
+### 0.2 保留期：80GB 下不再是约束
 
-20GB 总盘，现有 SQLite 库 2.4GB + 截图 + 导出。事件表按 jsonb payload 约 2KB/条估：
+事件表按 jsonb payload 约 2KB/条估（TOAST + lz4 后）：
 
-| 日采集量 | 日增长 | 7 天 | 14 天 | 30 天 |
+| 日采集量 | 日增长 | 14 天 | 30 天 | 90 天 |
 |---|---|---|---|---|
-| 10 万 | 200 MB | 1.4 GB | 2.8 GB | 6 GB |
-| 50 万 | 1 GB | 7 GB | 14 GB | 30 GB ✗ |
+| 10 万 | 200 MB | 2.8 GB | 6 GB | 18 GB |
+| 50 万 | 1 GB | 14 GB | 30 GB | 90 GB ✗ |
 
-**结论：当前 10 万/天下 14-30 天都宽裕；涨到几十万/天时 20GB 盘只够 7 天左右。**
-所以保留期必须由「剩余磁盘下限 + 分区行数上限」驱动，天数只是观测结果。
-`/status` 必须暴露 `observed_daily_insert_rate` 和 `free_disk_bytes`。
+80GB 盘扣掉系统、`scraper.products`/`tasks`、截图与导出，事件表可用空间约 50-60GB。
 
-**好消息**：既然中心库是持久副本（见 §0.3），采集侧保留期**可以做得很短**——
-7-14 天完全够用，磁盘约束因此不构成阻塞。
+**结论：10 万/天下 90 天绰绰有余；涨到 50 万/天时 30 天仍然安全。**
+既然中心库是持久副本（§0.3），**实际建议取 30 天**——足够覆盖任何合理的消费侧故障窗口，
+又留了三倍以上的增长余量。
+
+保留期仍然由「剩余磁盘下限 + 分区行数上限」驱动、天数只作观测结果这一点不变
+（`/status` 必须暴露 `observed_daily_insert_rate` 与 `free_disk_bytes`），
+但它从「随时可能咬人的硬约束」降级为「兜底护栏」。
+
+> 2KB/条仍是估计值。审计里我在合成语料上测得 zlib-1 约 3.5x；PG 的 TOAST + lz4 压缩率略低。
+> 80GB 下即使估错 2 倍也不影响结论，所以**不必为此阻塞开工**，Phase 5 实测后回填真实值即可。
 
 ### 0.3 「中心库即备份」恢复什么、不恢复什么
 
@@ -100,16 +115,24 @@ checkpoint_completion_target = 0.9
 |---|---|
 | `tasks` 队列 | 当前 113 万行，含在途租约。重装后所有排队与在途任务归零 |
 | `batches` / `batch_asins` | 批次元数据、`external_id`、callback 状态。调用方的批次追踪断链 |
-| **截图文件** | `server/static/screenshots/` 下的实体文件**从不进中心库**。VPS 盘丢 = 永久丢失 |
+| **截图文件** | `server/static/screenshots/` 下的实体文件**从不进中心库**，也不可重建。**已决策：接受丢失**，不做独立持久化——截图是一次性的，取用后即清理 |
 | `screenshots` 表 | 截图任务追踪状态 |
 | `asin_changes` | 变动历史 |
 | `seller_discoveries` | 卖家店铺发现结果 |
 | 调度与运行时设置 | `data/schedules/`、`runtime_settings.json` |
 | 最后 ≤5 分钟 + 未 relay 的窗口 | 尚未被拉走的部分 |
 
-按用户「重采几小时就够」的口径，前面几项都可接受（重传 ASIN 表即可）。
-**唯一需要单独决策的是截图文件**——它不可重建（页面已变），也不在中心库里。
-若截图在上架后仍有留证价值，需要独立的对象存储或定期同步；否则明确接受丢失。
+按用户「重采几小时就够」的口径，以上各项均可接受（重传 ASIN 表即可）。
+截图已明确决策为接受丢失，不引入对象存储。
+
+**由此产生一条必须写进契约的条款：`screenshot_path` 是易失引用。**
+截图会被常规清理，所以中心库 `catalog.snapshots` 里存下来的路径**随时可能指向已删除的文件**。
+它仍然放进 `payload`（那是「一次完整采集结果」的一部分），但契约里必须写明：
+**消费侧不得依赖该路径可解引用，也不得据此判断截图是否曾经存在。**
+需要截图时走采集侧的现有导出接口现取，取不到就是没有了。
+
+（顺带：现有 `asin_data.screenshot_path` 今天就已经存在悬空路径的情况，
+这不是新问题，只是首次被写进对外契约。）
 
 **连带影响：`ack` 契约的语义变得明确。** `ack_seq` = 「持久副本已经拿到这个位置」，
 保留期裁到 `ack_seq` 之下就是安全的。这让 Phase 6 从「nice to have」变成
@@ -655,6 +678,6 @@ Phase 4 可与试点并行，Phase 6 上线后补。
 | 3 | ~~PG 部署形态 / 备份策略~~ | **已定**：与 scraper 同机；中心库即持久副本。资源与恢复边界见 §0.1-0.3 |
 | 4 | ~~拉取节奏~~ | **已定**：5 分钟 / 每页 1000 |
 | 5 | **`catalog.products` 的主键：`asin` 还是 `(marketplace, asin)`？（需转给沃尔玛侧）** | ASIN 是按站点分配的，同一 ASIN 字符串在不同站点可以是不同商品。单列主键只在单站点前提下安全。**现在做成复合主键成本是零**（值域只有一个值）；等表里堆了几十万行、挂上审核结论与上架资产之后再改主键会很痛 |
-| 6 | **截图文件是否需要独立持久化？** | 它不在中心库里，也不可重建（页面已变）。VPS 盘丢 = 永久丢失。若上架后仍有留证价值，需要对象存储或定期同步；否则明确接受丢失（§0.3） |
-| 7 | erpAPI 端点清单 | 决定 T13 黄金样本的覆盖面；在此之前「零影响」不可测量 |
-| 8 | 是否开 `synchronous_commit = off` | 收益是单核上显著降低 fsync 压力，代价是崩溃丢最后约 0.2 秒已提交事务。本系统数据可重采，取舍成立，但须明确决定并写进 runbook（§0.1） |
+| 6 | ~~截图是否需要独立持久化~~ | **已定**：不需要，接受随机器丢失。由此产生「`screenshot_path` 是易失引用」的契约条款（§0.3） |
+| 7 | ~~是否开 `synchronous_commit = off`~~ | **已定**：保持默认 `on`。2 核 / 4GB 下 fsync 压力不再突出，仅当 Phase 5 实测确认是瓶颈时再议（§0.1） |
+| 8 | erpAPI 端点清单 | 决定 T13 黄金样本的覆盖面；在此之前「零影响」不可测量。**这是唯一还在阻塞验收标准定义的一项** |

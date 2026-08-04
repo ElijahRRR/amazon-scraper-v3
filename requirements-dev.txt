@@ -1,0 +1,8 @@
+# 开发/测试依赖。
+# 只装 server 端跑得起来所需的部分——worker 侧的 curl_cffi / selectolax / lxml /
+# dateparser / playwright 都很重，而黄金样本走的是 HTTP，不需要真 worker。
+-r requirements.txt
+
+httpx>=0.27.0          # starlette TestClient 的传输层
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

@@ -28,16 +28,36 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 # ── 只桩掉 engine 模块级需要、但本环境未装的重依赖子模块 ────────────────────
+# 记录被我们改动过的 sys.modules 条目，模块结束时原样还原。
+# 不还原会让整个测试进程被污染：本文件的桩件对后续用例仍然生效，
+# 谁先被 import 谁说了算，测试结果变成收集顺序的函数。
+# （test_delivery_parse.py 里那段 `sys.modules.pop("worker.parser")` 就是被这个
+#  坑过一次之后的手工绕行；桩件泄漏还会让黄金样本夹具拿到假的 httpx。）
+_SAVED_MODULES = {}
+
+
 def _stub(name, **attrs):
+    _SAVED_MODULES.setdefault(name, sys.modules.get(name))
     m = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(m, k, v)
     sys.modules[name] = m
     return m
 
-_stub("aiofiles")
-_stub("httpx", AsyncClient=object)
+
+def _stub_if_missing(name, **attrs):
+    """真依赖装了就用真的——桩件的用意是「补上没装的」，不是「顶掉装了的」。"""
+    try:
+        __import__(name)
+    except ImportError:
+        _stub(name, **attrs)
+
+
+_stub_if_missing("aiofiles")
+_stub_if_missing("httpx", AsyncClient=object)
 # worker / common 用真实包（空 __init__）；common.config 只依赖 os，直接用真实的。
+# 这几个是【有意】顶掉的：目的是在不拉起 curl_cffi/selectolax 的前提下
+# 加载真实的 engine.py，所以无条件桩。
 _stub("worker.proxy", get_proxy_manager=lambda: object())
 _stub("worker.session", AmazonSession=object)
 _stub("worker.parser", AmazonParser=object)
@@ -46,7 +66,18 @@ _stub("worker.adaptive", AdaptiveController=object, TokenBucket=object)
 
 # 屏蔽 basicConfig 噪声
 import logging
+_SAVED_LOG_LEVEL = logging.root.manager.disable
 logging.disable(logging.CRITICAL)
+
+
+def tearDownModule():
+    """还原 sys.modules 与 logging，避免污染同进程内的其他测试。"""
+    for name, original in _SAVED_MODULES.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+    logging.disable(_SAVED_LOG_LEVEL)
 
 from worker.engine import SessionSlot, Worker  # noqa: E402
 

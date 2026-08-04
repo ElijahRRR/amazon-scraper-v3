@@ -341,11 +341,37 @@ DDL 的默认值只在「插入时不带该列」时生效，而 worker 路径�
 
 ### Phase 0 — 骨架与验证基线（1d）
 
-| 项 | 内容 |
+**黄金样本部分 ✅ 已完成**（PG 环境待 Phase 1 开始时一并起）。
+
+| 项 | 状态 |
 |---|---|
-| 环境 | PG 16 容器化 + `scraper` schema + `asyncpg` 池 |
-| **回归基线（关键，不可跳过）** | 仓库现有测试只有 3 个单元测试（`test_ziputil` / `test_delivery_parse` / `test_session_slot`），**无任何 HTTP 层测试**。移植一个 5000 行的存储层而没有对照，等于闭眼重写。先建一个**录制/回放夹具**：对现有 SQLite 系统跑一组固定请求序列（upload → pull → result → results 翻页 → export xlsx/csv → status → webhook），把请求与响应逐字节存盘作为黄金样本 |
-| 验收 | 黄金样本可对 SQLite 版重放通过 |
+| **黄金样本夹具** | ✅ `tests/golden/`，**64 步**覆盖对外全部主要端点，基线在 `samples/sqlite_baseline.json` |
+| 场景确定性自检 | ✅ 两次独立运行完全一致 |
+| **变异测试**（夹具自身的验收） | ✅ 见下 |
+| 依赖与入口 | ✅ `requirements-dev.txt` + `pytest.ini`；`pytest tests/` 45 passed / 4 skipped |
+| PG 16 + `scraper` schema + `asyncpg` 池 | ⏳ Phase 1 |
+
+用法与规范化原则见 `tests/golden/README.md`。
+
+**变异测试结论**——抓不到回归的夹具等于没有，所以实测了两种：
+
+| 变异 | 结果 |
+|---|---|
+| 给 `asin_data` 加一列 | ✅ 捕获 21 处差异。**实锤了审计 §2.17 的判断**：`SELECT d.*` 无 `response_model`，任何新加的列都会泄进 erpAPI 的响应。P1 里「不给 `asin_data` 加列」这条不变式因此是有牙齿的 |
+| 静默删掉 `accept_success_result` 的 lease 校验 | ✅ 捕获 45 处差异，头三行直指根因 |
+
+**第二个变异第一次没抓到，暴露的是场景自己的缺陷**（已修）：原来的 stale 测试拿一个
+**已 done** 的任务去试，而 lease 校验的 WHERE 同时含 `lease_epoch=?` 与
+`status='processing'`——status 条件本身就让 rowcount=0，**lease 校验被完全遮蔽，
+那一步从来没测到 lease 门**。现改用一个仍处于 `processing` 的专用探针任务，双向断言：
+过期 lease 必须被拒且该 ASIN 查不到（404）；正确 lease 必须被受理
+（否则「一律拒绝」也能骗过第一条）。
+
+**顺带修掉一个既有缺陷**：`tests/test_session_slot.py` 无条件把 `httpx`/`aiofiles`
+桩进 `sys.modules` 且从不还原，污染整个测试进程，使结果变成收集顺序的函数
+（`test_delivery_parse.py` 里那句 `sys.modules.pop("worker.parser")` 就是被它坑过一次
+之后的手工绕行）。现改为「真依赖装了就用真的」+ `tearDownModule` 还原；
+`unittest discover` 的原有跑法不受影响（47 tests OK）。
 
 ### Phase 1 — 存储层移植（5-8d）
 

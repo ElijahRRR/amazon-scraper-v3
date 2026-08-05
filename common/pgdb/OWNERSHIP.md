@@ -278,3 +278,39 @@ tasks.py   欠 results_write : fail_task(...) -> {"accepted": bool, "stale": boo
 | 单域 | `pytest tests/pgdb/test_<domain>.py -q` | 各 agent 自己的门 |
 | 回归 | `python -m tests.golden.run verify` | `✅ 64 步与基线完全一致` |
 | **完工** | `DB_BACKEND=postgres python -m tests.golden.run verify` | `✅ 64 步与基线完全一致` |
+
+---
+
+## D-27 —— 解析器修复（B5）改变了一个**已导出字段**，且影响两个后端
+
+`worker/parser.py` 的 `_slx_parse_long_description` 原先用 selectolax 的
+`Node.traverse()`。它不受子树约束（文档原话是 "all child **and next** nodes"），
+于是 `long_description` 吸进了容器之外的价格 / 库存 / 评分 / BSR / CDN 图片 URL。
+修法见提交 `24c498a`：新增 `_slx_iter_subtree` / `_slx_iter_descendants` 两个受限
+遍历助手，并顺带修掉同一函数里另两处引擎分歧（叶子判定误用 `Node.iter()`、
+`text(deep=True, strip=True)` 逐节点 strip 导致的词粘连）。
+
+**这条要单独记一个 D 号，是因为它有三个容易被漏掉的连带影响：**
+
+1. **它是既有的生产数据质量缺陷，不是迁移引入的。** `long_description` 是导出
+   字段（在 `EXPORTABLE_FIELDS` 里），所以现有消费方一直在收着混了价格库存文本的
+   商品描述。修它是净改善，但它**改变了对外数据**。
+
+2. **「SQLite 路径未改动」这句话从此只对存储层成立，对产品不成立。**
+   `common/database.py` 与黄金基线确实逐字节未变（已验证），但 `worker/parser.py`
+   是两个后端共用的。绿色的黄金门**不能**被读成「SQLite 部署完全没变」——
+   黄金夹具喂的是合成的结果字典，实测（MetaPathFinder）确认 64 步里
+   `worker.parser` 从未被 import，所以它结构性地看不到这个改动。
+
+3. **首轮重采会让近乎全语料的 `slow_hash` 同时翻转一次**，而 `hash_ver` 不变，
+   所以「版本升级走双输出」那条保护不覆盖这次。已写进 `docs/sync_contract.md`
+   §6.5 的警示框，交付沃尔玛侧。`review_hash` 不含 `long_description`，
+   实测修复前后同值，**复审门不受影响**。
+
+**回归防线的实际强度（实测，不是估计）**：这条修复的 24 个用例在没装 selectolax
+的 venv 里 23 个 skip。拿五种变异去打：只有**字面上重新引入 `.traverse()` 这个
+token** 的两种被抓到（且是靠 AST 源码守卫抓的），叶子守卫回退 / 词粘连回退 /
+配送属性读取回退三种全部 `6 passed, 28 skipped` 一路绿灯。
+因此 `selectolax` 与 `dateparser` 已加入 `requirements-dev.txt` —— 同一条命令
+从 6 passed/28 skipped 变成 31 passed/3 skipped。**不装生产引擎，解析器测试跑的
+就不是生产路径。**

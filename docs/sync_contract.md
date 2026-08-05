@@ -467,6 +467,35 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
 `hash_ver` 升级时采集侧会走「过渡期双输出」：同时输出 v1 和 v2，
 你侧继续用 v1 把门、后台回填 v2，回填完再切。不会有一次性全语料复审风暴。
 
+> ⚠ **一次性事件：首次上线后的第一轮重采会让近乎全语料的 `slow_hash` 同时翻转。**
+> `hash_ver` 不变，所以上面那条「双输出」的保护**不覆盖这次**。
+>
+> 原因是采集侧修掉了一个既有的解析缺陷（`worker/parser.py`
+> `_slx_parse_long_description` 用了 selectolax 的 `Node.traverse()`，而它不受
+> 子树约束）。`long_description` 因此长期吸进了容器之外的文本——价格、库存、
+> 评分、BSR、CDN 图片 URL 都在里面：
+>
+> ```
+> 修复前 long_description: '…for any desk. [image: …71xrpjis8ll…jpg] $549.99 in stock 2431 ratings…'
+> ```
+>
+> 也就是说这个字段过去**每次采集都在变**（价格一动它就动），`long_description`
+> 又在 `slow_hash` 的字段集里，所以 `slow_hash` 在生产引擎下一直是纯噪声：
+> 实测 30 天序列里翻转 29/29 次，而 `review_hash` 只翻 7 次（正确值）。
+>
+> 修复后两个解析引擎对同一页面逐字节一致，`slow_hash` 恢复成真正的慢变信号。
+> 代价是**修复前后的 `slow_hash` 不可比**：部署后第一轮重采，凡是页面在描述
+> 容器之后还有任何内容的商品（实测语料里只有「容器就是最后一个元素」那种不变），
+> `slow_hash` 都会变一次。
+>
+> **对你侧的要求**：`slow_hash` 不是复审门（门是 `review_hash`，它不含
+> `long_description`，因此**不受这次影响**），所以这次翻转不该触发复审风暴。
+> 但如果你把 `slow_hash` 变化用作任何别的信号（例如「慢变属性变了」的告警），
+> 请为首轮重采准备一次性的抑制，或者干脆在部署后重新基线化一次。
+>
+> `review_hash` 在修复前后**不变**（实测两个引擎下均为同一值），因为
+> `long_description` 只属于 `slow_hash`。
+
 ### 6.6 `payload`
 
 一次采集的完整结果，JSON 对象（**不是**被引号包起来的字符串）。

@@ -643,8 +643,22 @@ async def sync_status():
 
     return JSONResponse(content={
         "contract_version": CONTRACT_VERSION,
-        "gen": stats.get("gen"),
-        "instance_id": stats.get("instance_id"),
+        # gen / instance_id 一律取【库里】的 sync_meta，不取进程内存。
+        #
+        # stats.get("gen") 来自 event_relay_metrics() -> _ev()["gen"]，那是
+        # connect() 时 _bootstrap_identity 写进内存、此后**再不刷新**的值。
+        # /records、/counts、/ack 三个兄弟端点都读 sync_meta，只有这里读内存，
+        # 于是滚动重启（B2 专门修出来支持的那种部署）期间可以出现：
+        #   实例 A 仍在跑，库被回滚 -> 实例 B 连上后重放检测器铸了新 gen
+        #   -> A 的 /status 报旧 gen，A 的 /records 报新 gen，自相矛盾
+        # 而 §7 的两条硬停探针（gen 变化 / max_seq 倒退）此时**都不会触发**，
+        # 唯一会响的是 POST /ack 的 409 gen_mismatch，偏偏契约伪代码把它丢掉了。
+        # gen 存在的意义就是抓这一种场景，所以它必须是库里那个权威值。
+        #
+        # 注意这只修了 Phase 3 这一半。另一半——relay 用从不刷新的 _ev()["gen"]
+        # 给每一行盖戳（common/pgdb/relay.py）——属于 Phase 2 的账，见 F-GEN。
+        "gen": meta.get("gen") or stats.get("gen"),
+        "instance_id": meta.get("instance_id") or stats.get("instance_id"),
         "min_available_seq": min_available_seq,
         "max_seq": max_seq,
         "ack_seq": ack_seq,                       # 从没 ack 过就是 null，不是 0

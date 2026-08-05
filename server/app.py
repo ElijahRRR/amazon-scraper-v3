@@ -246,6 +246,19 @@ app = FastAPI(title="Amazon Scraper v3", version="3.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
 
+# Phase 3 —— catalog_sync 拉取契约（GET/POST /api/v1/sync/*）。
+#
+# * **无条件挂载，两个后端都挂**。SQLite 上四个端点如实回 503 而不是消失：
+#   不挂 = 404，而消费者会把 404 读成"暂无数据"并静默停摆（计划 §Phase 3）。
+#   路由表在 import 时定型、DB_BACKEND 是运行期变量，条件挂载必然骗人。
+# * ``include_in_schema=False`` 在 router 上，所以 ``/openapi.json``（黄金基线
+#   step 5，逐字节钉死）不变 —— 有用例钉住这一条。
+# * import 方向是单向的：sync.py **不在模块级** import server.app
+#   （那是循环导入，启动即崩、整个 erpAPI 下线），它在每个 handler 里惰性取 db。
+from server.api import sync as _sync_api  # noqa: E402
+
+app.include_router(_sync_api.router)
+
 
 def _cst_filter(value):
     """Jinja 过滤器 `| cst`：把 UTC 时间字符串转中国时间（Asia/Shanghai, UTC+8）显示。

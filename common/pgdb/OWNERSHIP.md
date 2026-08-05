@@ -186,6 +186,36 @@ tasks.py   欠 results_write : fail_task(...) -> {"accepted": bool, "stale": boo
 | **D-26** | `start_event_relay` 在三个 `await` 点上重查 `stopping` / `start_epoch`；`stop_event_relay` 第一句就置 `stopping = True` | **实测泄漏**，不是防御性编程。`lifespan` 是 `create_task(relay)` → `yield` → `await stop()`，进程刚起来就关时（配置错误、健康检查失败、同进程内起停一次服务器）stop 跑到的时候 relay 还卡在 `asyncpg.connect()` 里，而 `relay_task` / `relay_conn` 要到 start 最后才被赋值 —— stop **什么都看不见、空转返回**，`db.close()` 之后 relay 才起来：<br>`关服之后：relay_state='running'  库上残留会话=1  残留 advisory lock=1`<br>`第二个实例 start_event_relay() -> False  state='refused'`<br>一条泄漏的连接 + 一把没人放的单例锁，而且同进程内再起的服务器被永久拒之门外、事件流静默不工作。修完 0 残留、第二个实例正常启动。回归由 `tests/pgdb/test_event_stream_wiring.py` 守（撤掉 `stopping` 标志即失败）。<br>连带：`relay_state` 增加 `starting` / `failed`，把「还没起来」「已经死了」「干净停了」分开——观测端点存在的唯一理由就是让停摆变响，三者同名等于没有观测。 |
 | **D-27** | 新增 `tests/conftest.py`：每个用例跑完把「当前事件循环」补回去 | `tests/test_session_slot.py:147` 用的是已废弃的 `asyncio.get_event_loop().run_until_complete(...)`，而 `asyncio.run(...)`（黄金夹具建/删临时库、事件流抽干）与 pytest-asyncio 都会把当前循环置空。原本 `tests/pgdb/conftest.py` 有一份同样的修复，靠的是 pgdb 用例**恰好排在** `test_session_slot` 前面；Phase 2 新增的两个 `tests/` 根文件按字母序落在中间，那份修复就够不着了——实测 26 个用例转红。提到全树级别，新测试文件不必各自记得。`tests/pgdb/conftest.py` 那份保留原样（带着自己的来龙去脉，重复无代价）。正解是把 `test_session_slot.py` 从 `get_event_loop()` 迁走，31 个用例的改动，与 Phase 2 无关，不在这里顺手做。 |
 
+### Phase 2 验证后的修复决策（B1-B8，落点 `relay.py` / `schema.py`）
+
+> 来源：`.agent/phase2/verify*.md` 的四份验证报告 + 修复者的实测报告。
+> 每一条都有反事实（在 `fea7395` 上重跑同一探针）。
+
+| # | 决策 | 理由 |
+|---|---|---|
+| **D-28** | 新分区 `LIKE` **父表** + **显式**建 source_id 唯一索引；并在 `ensure_event_partitions` 里做一次自愈式 `_repair_foreign_range_checks()` | `LIKE <上一个分区> INCLUDING ALL` 会连**模板自己的 range CHECK** 一起抄过来：p0 没有 range CHECK 所以 p1 干净，p1→p2 抄来 `scrape_events_p1_range`，此后每个分区都带一条**自相矛盾**的边界，一行也写不进去。生产默认 SPAN 下 `connect()` 一跑完就复现。<br>验证报告建议的 `EXCLUDING CONSTRAINTS` **不成立**：它同时丢掉父表的 `marketplace` CHECK，而 `ATTACH PARTITION` 要求子表**已经带着**它 —— `DatatypeMismatchError: child table is missing constraint "scrape_events_marketplace_check"`。所以改成模板父表 + 显式补索引，与 p0 的配方逐字一致，分区局部的垃圾在结构上不可继承。<br>光改 DDL 不够：p1/p2 是在 `connect()` 期建的，**任何被 Phase 2 代码碰过的库都已经带着一个中毒的 p2**，所以要一次目录查询驱动的自愈（干净时零 DDL）。 |
+| **D-29** | `run_event_relay()` 是**重试循环**（`RELAY_RETRY_SECONDS`，默认 5s）；`refused` 是**瞬态**，不是终态 | 滚动重启会留下**一个 relay 都不剩**：新实例起来时旧的还握着单例锁 → `refused` → 任务直接结束；旧实例随后退出、锁释放，而新实例已经不会再试了。实测 `t3: NEW.state=refused holders=0 {'outbox': 6, 'events': 0}` —— 事件流静默停摆。改成重试循环后 `t3: NEW.state=running holders=1 {'outbox': 0, 'events': 6}`。 |
+| **D-30** | relay 连续 `RELAY_RECOVER_AFTER` 次 tick 失败后**自己重连**并重新抢单例锁；抢不到就 `refused` 并退出；重连不上就 `failed` | 原来的 `failed` 只覆盖「主循环异常逃出」，不覆盖「每个 tick 都抛但循环还在转」。`pg_terminate_backend` 之后实测：行不丢（都在 outbox 里等着），但 relay 每秒吐一个 `InterfaceError`，而 `relay_state` 一直报 `running` —— 单实例部署上事件流永久停摆，偏偏那个为了让停摆变响而设的字段报的是健康。`consec_tick_fail` 一并进 `event_relay_metrics()`，让先兆在状态翻转之前就可见。 |
+| **D-31** | 回退判据从 `max(seq)` 换成**序列水位**（`_seq_high_water()`，认 `is_called`） | `COALESCE(max(seq),0) < max_seq_ever` 有一条 Phase 6 一定会踩的假阳性：保留期一旦把 `scrape_events` 清空，一次**普通重启**就铸新 gen，消费侧按契约 §5.5 硬停 + 全量对账。bigserial 不随分区 DROP 回退，所以「水位 < ever」才真正等价于「seq 会被重发」。实测 A（retention DELETE）gen 不变、B（`setval(1,false)`）照常铸新 gen。 |
+
+### Phase 3 决策（同步 API，落点 `server/api/sync.py`）
+
+| # | 决策 | 理由 |
+|---|---|---|
+| **D-32** | 四个端点在**两个后端上都挂**，SQLite 下回 **503 + `error: event_stream_unavailable`**，而不是「不挂路由」 | 计划允许二选一。选 503 有三个理由：(a) 路由表在 `import server.app` 时定型，而 `DB_BACKEND` 是运行期变量 —— 条件挂载会让「路由存不存在」变成 import 时序的函数，而本仓库的测试与黄金夹具都在 import 之后改后端；(b) 不挂 = 404，而 404 正是契约里最危险的码：消费者把它读成「暂无数据」，游标永不推进、静默停摆；(c) 与既有的 `/api/_debug/event-stream` 口径一致（SQLite 上如实回 `enabled: false`，运维拿同一个 URL 探两种部署）。黄金不受影响：64 步不碰 `/api/v1/*`，且 `include_in_schema=False` 让 `/openapi.json` 逐字节不变（`test_openapi_json_does_not_change` 带反向哨兵钉住）。 |
+| **D-33** | 空流 / 被裁空的流上，`min_available_seq` = `max_seq + 1`、`max_seq` = `max(max(seq), max_seq_ever)`（`sync._window()`），**不是** `COALESCE(..., 0)` | 计划只给了非空表的语义。照直取 0 有两个静默故障：(a) `min_available_seq = 0` 让 `after_seq + 1 < min` **永假** —— 一个数据被裁光的消费者拿到 200 空，于是永远等下去，两侧都不告警；(b) `max_seq = 0` 会触发消费侧自己的 `max_seq < stored_max_seq_ever` **硬停**（§5.5 第 2 行），一次正常的保留期裁剪就让全网全量对账。表非空时两式与朴素写法**逐字相等**（relay 每批 bump `max_seq_ever`，保留期只从底部裁），所以这不改变常态语义。反事实：把 `_window` 换回 `COALESCE(...,0)`，4 个用例转红。 |
+| **D-34** | `MIN`/`MAX`/页查询在**一个** `REPEATABLE READ READ ONLY` 事务里，页查询后**再复核一次下界并取较大者** | 计划 §5.1 明确要求前半句。后半句在 RR 下是零成本断言 —— 它守的是「有人把隔离级别降下来」这类未来改动。反事实实测（把 `_snapshot` 默认改成 `read_committed`）：`ERROR 同步快照不稳定：页查询前后的 min_available_seq 不同（10 -> 12）…按保守方向返回 409`，也就是复核确实是最后一道网。方向永远选**多一个 409**：多一次全量对账 vs. 静默丢一段数据。 |
+| **D-35** | `/ack` 走**池连接**（不是 D-2 的写连接），且事务显式降到 **READ COMMITTED** | 走写锁的话，这个由**远端消费者**触发的端点就成了采集入库路径上一个外部可触发的排队面。`sync_meta` 本来就在写锁之外被写（relay 用自己的连接 bump `max_seq_ever`），所以这不是新先例。降到 READ COMMITTED 是实测逼出来的：RR 下两个并发 ack 打同一行直接 `SerializationError: could not serialize access due to concurrent update`（= 500）。单调性由**一条** `ON CONFLICT DO UPDATE SET v = GREATEST(...)` 保证，READ COMMITTED 下 ON CONFLICT 会重读被更新的行再算 GREATEST，语义正确且并发安全（`test_ack_is_monotonic_under_concurrency`）。 |
+| **D-36** | `/ack` 对 `ack_seq > max_seq` 回 **409 `ack_ahead_of_stream`**（计划外新增） | 计划只写了 `gen` 不符回 409。但 Phase 6 的保留期下界是 `max(磁盘下界, min(时间下界, ack_seq))` —— 收下一个本实例从没发出过的 `ack_seq`，等于**授权裁掉消费者其实没拿到的数据**。这是数据丢失向量，必须响。 |
+| **D-37** | `completeness_ok` 由**服务端**算好放进每条记录；位 3（值 8）= MEASURED，`completeness_ok := (c & 8) != 0 AND (c & 7) == 7` | Phase 2 收口时把「契约必须显式规定消费侧拿 `completeness = 0` 怎么办」列为 Phase 3 的必答题。放服务端算是因为 §4.3 的合取式有一个反直觉点（`7` 也是 false，因为没标 MEASURED），让每个消费者各拼一遍就是等着有人拼错。**连带的契约条款**：Phase 4 之前 `completeness` 恒为 0，所以按算法字面执行**没有一行会进 `catalog.products`** —— 这一条在 `docs/sync_contract.md` §6.4 用整段写明，包括「不要把 `0` 当 ok 写死进代码」。 |
+| **D-38** | `next_after_seq` **只推进到真正投递过的那一条**；空页不推进。`outcomes` 因此不适合放进拉取循环，契约里明确禁止 | 另一个选项是空页时把游标推到流头 —— 那样带 `outcomes` 的循环不会原地打转，但会**跳过**被过滤掉的行。宁可重扫，不可跳过：这是唯一会丢数据的方向。`has_more` 用 `LIMIT n+1` 精确判定（而不是 `next_after_seq < max_seq`），否则带过滤时会谎报「还有」。 |
+
+> **D-27 已作废。** 那份 `tests/conftest.py` 的 autouse 夹具在 B6 修复中被删除：
+> `conftest.py` 只有 pytest 读，`unittest discover`（本仓库最早的 runner）不读，
+> 于是同一个缺陷 pytest 绿、unittest 红 26 个。根因已迁走
+> （`tests/test_session_slot.py` 的 `run()` 自持事件循环），
+> 约束由 `tests/test_runner_parity.py` 看守，它是 unittest 用例，两个 runner 都跑。
+
 ### 明确推迟到 Phase 1.5 / Phase 2 的（**别在 Phase 1 顺手做**）
 - `get_results` 的 COUNT 崩溃（D-8）与 COUNT(*) 重构。
 - 真正的写并发：抽走 app.py 的 24 处裸 SQL → 换 `TimedNoLock` → 每个方法自己取连接

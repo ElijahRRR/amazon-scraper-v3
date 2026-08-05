@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 CONTRACT_VERSION = 1
 
 MAX_LIMIT = 1000
-DEFAULT_LIMIT = 200
+DEFAULT_LIMIT = 500          # 契约 v1 定的默认值
 
 #: 沃尔玛侧的 marketplace 值域，当前恒 "US"（对方已在 db_schema / schema.sql /
 #: 契约三处同步为默认 'US'，复合主键 (marketplace, asin)）。
@@ -154,6 +154,64 @@ def _category_path(payload: Dict[str, Any]) -> List[str]:
 
 # ============================================================ record 映射
 
+#: 不进 `raw` 的键：内部字段（下划线前缀由调用方约定）、以及已经在
+#: slow/fast/scrape_params 里给过一遍的大文本。`raw` 是「备查」不是「全量镜像」，
+#: 把 long_description/image_urls 再存一遍会让 jsonb 体积翻倍而没有新信息。
+_RAW_DROP = frozenset({
+    "long_description", "image_urls", "bullet_points",
+    "content_hash", "title_bullets_hash", "screenshot_path",
+})
+
+
+def _raw(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """裁剪后的原始载荷。保留采集侧原样的键值，去掉内部字段与重复大文本。"""
+    return {k: v for k, v in payload.items()
+            if not k.startswith("_") and k not in _RAW_DROP}
+
+
+def _short_hash(v: Any) -> Optional[str]:
+    """契约 v1：slow_hash 是 **sha256 前 16 位**。
+
+    采集侧内部存的是 ``"v1:<64 位十六进制>"``（带版本前缀，便于将来做
+    「过渡期双输出」而不引发全语料复审风暴）。对外按契约截成 16 位。
+    截断只损失碰撞空间（16 位十六进制 = 64 bit，对变更检测远远够用），
+    不影响「同输入同输出」这条本质。
+    """
+    if not v:
+        return None
+    s = str(v)
+    if ":" in s:
+        s = s.split(":", 1)[1]
+    return s[:16]
+
+
+def _iso_seconds(dt: Any) -> Optional[str]:
+    """契约 v1：``scraped_at`` **精确到秒**。库里的 timestamptz 带小数秒，截掉。"""
+    s = _sync._iso(dt)
+    if s is None:
+        return None
+    # '2026-08-05T09:11:02.114000Z' -> '2026-08-05T09:11:02Z'
+    return re.sub(r"\.\d+(?=Z$)", "", s)
+
+
+def _variant(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """slow.variant = {parent_asin, theme}。
+
+    theme 取变体维度名（"Color/Size"），不是取值 —— 取值属于**这一个**变体，
+    维度才是这个变体族共有的慢变属性。采集侧存的是 "Color:Red|Size:M" 形态。
+    """
+    parent = _clean(payload.get("parent_asin"))
+    raw = _clean(payload.get("variant_attributes"))
+    theme = None
+    if raw:
+        keys = [seg.split(":", 1)[0].strip()
+                for seg in re.split(r"[|;]", raw) if ":" in seg]
+        theme = "/".join([k for k in keys if k]) or None
+    if parent is None and theme is None:
+        return None
+    return {"parent_asin": parent, "theme": theme}
+
+
 def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
     payload = row.get("payload") or {}
     if isinstance(payload, str):          # asyncpg 在某些配置下回字符串
@@ -174,9 +232,12 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
         "cursor": row["seq"],
         "marketplace": DEST_MARKETPLACE,
         "asin": row["asin"],
-        "scraped_at": _sync._iso(row.get("collected_at")),
+        "scraped_at": _iso_seconds(row.get("collected_at")),
         "scrape_params": {
-            "zip": row.get("zip_requested"),
+            # 契约 v1 的键名是 `zipcode`（不是 zip / zip_code）。
+            "zipcode": row.get("zip_requested"),
+            # 以下是采集侧附加的采集参数，契约说的是「影响结果的**全部**采集参数」，
+            # 所以它们该在这里：邮编是否真的生效直接决定这条价格属不属于该邮编分组。
             "zip_observed": row.get("zip_observed"),
             "zip_verify": row.get("zip_verify"),
             # 采集来源站点。与顶层 marketplace（上架目的地）是两个概念，见文件头。
@@ -184,38 +245,92 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
             "parse_engine": row.get("parse_engine"),
         },
         "slow": {
+            # ---- 契约必填 ----
             "title": _clean(payload.get("title")),
             "brand": _clean(payload.get("brand")),
             "category_path": _category_path(payload),
             "images": _split_list(payload.get("image_urls")),
+            # ---- 契约可选，采集侧有就给 ----
+            "bullet_points": _split_list(payload.get("bullet_points"), sep="|"),
+            "description": _clean(payload.get("long_description")),
+            "weight": {
+                "package": _clean(payload.get("package_weight")),
+                "item": _clean(payload.get("item_weight")),
+            },
+            "dimensions": {
+                "package": _clean(payload.get("package_dimensions")),
+                "item": _clean(payload.get("item_dimensions")),
+            },
+            "variant": _variant(payload),
         },
         "fast": {
+            # ---- 契约必填 ----
             "price": _price(payload.get("current_price")),
             "currency": DEFAULT_CURRENCY,
             "stock_state": _stock_state(payload),
+            # ---- 契约可选 ----
+            "buybox_price": _price(payload.get("buybox_price")),
+            "buybox_seller": _clean(payload.get("seller_name")),
+            "buybox_seller_id": _clean(payload.get("seller_id")),
+            # 采集侧**不采**优惠券与秒杀，恒为 null。给出键是为了让「没这个字段」
+            # 和「这次没采到」不被混淆——真要用需要先在采集侧加抓取。
+            "coupon": None,
+            "deal": None,
         },
         # ---- 契约「建议带」 ----
-        "slow_hash": row.get("slow_hash"),
+        # 契约描述的是「字段排序后 sha256 前 16 位」。这里给的是 16 位十六进制，
+        # **但算法是采集侧那一套**（common/slowhash.py：NFKC + 空白折叠 + 哨兵值
+        # 全等归一 + 列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256）。
+        # ⚠ **当作不透明值用，不要自己按 `slow` 对象重算再比对**——两边算法不同，
+        # 必然不等。它保证的是「同一个页面跨进程、跨引擎稳定；慢变字段真变了才变」。
+        "slow_hash": _short_hash(row.get("slow_hash")),
+
+        # ---- 契约「可选」：裁剪后的原始载荷，沃尔玛侧存 jsonb 备查 ----
+        "raw": _raw(payload),
 
         # ---- 采集侧附加，契约未要求，收着无害 ----
         # outcome != 'ok' 的记录**只进 snapshots，不要 upsert products**。
         # 这类记录的 slow/fast 基本为空，那是「本次没采到」不是「值变了」。
         "outcome": row.get("outcome"),
         "completeness_ok": complete,
-        "review_hash": row.get("review_hash"),
-        "hash_ver": row.get("hash_ver"),
-        "recorded_at": _sync._iso(row.get("recorded_at")),
+        "review_hash": _short_hash(row.get("review_hash")),
+        "recorded_at": _iso_seconds(row.get("recorded_at")),
     }
 
 
 # ============================================================ 鉴权
 
+_warned_anonymous = False
+
+
 def _check_token(token: Optional[str]) -> Optional[JSONResponse]:
+    """契约 v1：鉴权是**可选**的（「建议加上，服务器是公网 IP」）。
+
+    所以语义是：
+      * 配了 ``EXPORT_TOKEN``  -> 强制校验，不匹配/缺失即 401
+      * 没配                   -> 放行，但每次都打 WARNING
+
+    我最初实现的是 fail closed（没配就 503）。**契约是权威，这里服从契约** ——
+    否则对方按契约部署、不配 token，会得到一个它没预期的 503。
+    但「整个商品库挂在公网上、零鉴权」不该是悄无声息的，所以放行这条路径
+    一直响；要回到 fail closed 设 ``EXPORT_REQUIRE_TOKEN=1``。
+    """
+    global _warned_anonymous
     expected = os.environ.get("EXPORT_TOKEN", "").strip()
+
     if not expected:
-        # fail closed。服务器是公网 IP，"没配就放行" 等于把商品库敞在互联网上。
-        return _sync._err(503, "export_token_not_configured",
-                          "服务端未配置 EXPORT_TOKEN，增量导出关闭。")
+        if os.environ.get("EXPORT_REQUIRE_TOKEN", "").strip() in ("1", "true", "yes"):
+            return _sync._err(503, "export_token_not_configured",
+                              "EXPORT_REQUIRE_TOKEN=1 但服务端未配置 EXPORT_TOKEN。")
+        if not _warned_anonymous:
+            logger.warning(
+                "⚠ /api/export/incremental 正在【无鉴权】提供服务："
+                "未配置 EXPORT_TOKEN。服务器是公网 IP，这等于把整个商品库"
+                "敞在互联网上。设 EXPORT_TOKEN 开启校验，或设 "
+                "EXPORT_REQUIRE_TOKEN=1 让缺失配置直接关闭该端点。")
+            _warned_anonymous = True
+        return None
+
     if not token or not hmac.compare_digest(token, expected):
         return _sync._err(401, "invalid_export_token",
                           "X-Export-Token 缺失或不匹配。")

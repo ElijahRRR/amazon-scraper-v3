@@ -105,14 +105,29 @@ class ContractTests(unittest.TestCase):
                       headers={"X-Export-Token": "wrong"})
             self.assertEqual(r.status_code, 401, r.text)
 
-    def test_unconfigured_token_fails_closed(self):
-        """没配 EXPORT_TOKEN 时必须**拒绝服务**，不是放行。服务器是公网 IP。"""
+    def test_unconfigured_token_serves_anonymously_per_contract(self):
+        """契约 v1 说鉴权是**可选**的，所以没配 EXPORT_TOKEN 时必须放行。
+
+        （我最初实现的是 fail closed；契约是权威，服从契约。
+        想要 fail closed 见下一个用例的 EXPORT_REQUIRE_TOKEN。）
+        """
         os.environ.pop("EXPORT_TOKEN", None)
         with _server_with_relay() as (c, _):
-            r = c.get("/api/export/incremental", params={"cursor": 0},
-                      headers=self._hdr())
-            self.assertEqual(r.status_code, 503, r.text)
-            self.assertEqual(r.json().get("error"), "export_token_not_configured")
+            r = c.get("/api/export/incremental", params={"cursor": 0})
+            self.assertEqual(r.status_code, 200, r.text)
+
+    def test_require_token_flag_restores_fail_closed(self):
+        """运维想要「没配就关闭」时的开关。服务器是公网 IP，值得留这条路。"""
+        os.environ.pop("EXPORT_TOKEN", None)
+        os.environ["EXPORT_REQUIRE_TOKEN"] = "1"
+        try:
+            with _server_with_relay() as (c, _):
+                r = c.get("/api/export/incremental", params={"cursor": 0})
+                self.assertEqual(r.status_code, 503, r.text)
+                self.assertEqual(r.json().get("error"),
+                                 "export_token_not_configured")
+        finally:
+            os.environ.pop("EXPORT_REQUIRE_TOKEN", None)
 
     # ---- 空与边界 ----
 
@@ -204,9 +219,46 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(rec["marketplace"], "US")
             for k in ("title", "brand", "category_path", "images"):
                 self.assertIn(k, rec["slow"])
+            # 契约 v1 的可选慢变字段
+            for k in ("bullet_points", "description", "weight",
+                      "dimensions", "variant"):
+                self.assertIn(k, rec["slow"])
             for k in ("price", "currency", "stock_state"):
                 self.assertIn(k, rec["fast"])
+            # 契约 v1 的可选快变字段
+            for k in ("buybox_price", "buybox_seller", "coupon", "deal"):
+                self.assertIn(k, rec["fast"])
             self.assertIn("slow_hash", rec)
+            self.assertIn("raw", rec)
+            # scrape_params 的键名是 zipcode（契约 v1），不是 zip
+            self.assertIn("zipcode", rec["scrape_params"])
+
+    def test_slow_hash_is_16_hex_per_contract(self):
+        """契约 v1：slow_hash 是 sha256 前 16 位。内部存的是 'v1:<64 位>'。"""
+        with _server_with_relay() as (c, _):
+            _seed(c, n=1)
+            rec = c.get("/api/export/incremental",
+                        params={"cursor": 0}, headers=self._hdr()
+                        ).json()["records"][0]
+            h = rec["slow_hash"]
+            self.assertIsNotNone(h)
+            self.assertEqual(len(h), 16, f"契约要求 16 位，实际 {h!r}")
+            self.assertRegex(h, r"^[0-9a-f]{16}$")
+
+    def test_scraped_at_is_second_precision(self):
+        """契约 v1：scraped_at 精确到秒。库里带小数秒，必须截掉。"""
+        with _server_with_relay() as (c, _):
+            _seed(c, n=1)
+            rec = c.get("/api/export/incremental",
+                        params={"cursor": 0}, headers=self._hdr()
+                        ).json()["records"][0]
+            self.assertRegex(rec["scraped_at"],
+                             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_default_limit_is_500(self):
+        with _server_with_relay() as (c, _):
+            import server.api.export_incremental as m
+            self.assertEqual(m.DEFAULT_LIMIT, 500)
 
     def test_scraped_at_is_utc_iso8601(self):
         with _server_with_relay() as (c, _):

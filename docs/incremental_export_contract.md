@@ -8,38 +8,62 @@
 > 用例：`tests/test_incremental_export.py`（每个用例对应契约里的一句话）
 
 - `contract_version`: **1**
-- 端点：`GET /api/export/incremental?cursor=<int>&limit=<≤1000>`
-- 鉴权：请求头 `X-Export-Token`
+- 端点：`GET /api/export/incremental?cursor=<int>&limit=<int, ≤1000, 默认 500>`
+- 鉴权：请求头 `X-Export-Token`（**可选**，见下）
 - 返回：`{"records": [...], "next_cursor": <int>, "has_more": <bool>}`，按 `cursor` 升序
 
 ---
 
-## ⚠ 本副本是照着要点写的，有 7 处我替你做了决定
+## 对账结果（2026-08-06 拿到正式契约后逐条核过）
 
-沃尔玛侧给出的是要点摘要，`docs/scraper_migration_brief.md` §5 的完整文本采集侧没有。
-下面每一条都是**实现时不得不定、但摘要里没写死**的地方。**请逐条对照 §5 核对**，
-不一致的地方以 §5 为准，我改实现。
+已按正式契约改掉的 6 处：`limit` 默认 200→**500**；`scrape_params` 的键
+`zip`→**`zipcode`**；`scraped_at` 截到**秒**；`slow_hash` 由 `"v1:<64位>"`
+→**16 位十六进制**；补齐 `slow` 的可选字段（bullet_points / description /
+weight / dimensions / variant）与 `fast` 的可选字段（buybox_* / coupon / deal）；
+新增可选的 `raw`。鉴权由 fail-closed 改成**契约语义的可选**（见下）。
 
-| # | 我定的 | 依据 / 风险 |
+### 仍需你侧确认的 5 处
+
+| # | 情况 | 为什么要你看一眼 |
 |---|---|---|
-| 1 | `fast.currency` 恒为 `"USD"` | **采集侧根本不采币种**，这是适配器凭空补的常量。amazon.com 恒美元所以今天不出错，但它不是观测到的事实。若 §5 期望它反映真实币种，需要先在采集侧加抓取 |
-| 2 | `fast.price` 是 **number** 或 `null` | 采集侧原始值是字符串（`"19.99"` / `"N/A"`）。取不到时返回 `null` 而**不是 0** —— 0 是合法价格，拿它当哨兵会让「没采到」被读成「免费」 |
-| 3 | `fast.stock_state` 取 `in_stock` / `out_of_stock` / `unknown` | 采集侧只有自由文本 `stock_status`。三值枚举是我定的；若 §5 另有值域（例如带 `preorder`/`limited`）请给我值域 |
-| 4 | `slow.category_path` 是**字符串数组** | 采集侧存的是 `"Home > Tools > Wrenches"`，按 `>` 切分。`[]` 表示**本次没采到**（软降级页会把面包屑整块剥掉），**不表示该商品无类目**——别拿 `[]` 覆盖你侧已有的类目 |
-| 5 | `slow.images` 是 **URL 字符串数组** | 采集侧存的是逗号连接的字符串。注意是完整 URL，不是图片 ID |
-| 6 | 游标掉出保留窗口时返回 **409** `cursor_below_retention` | **§5 没定义这一种。** 但静默跳过被裁区间是不可接受的（两侧都不会察觉丢数据），所以我按 409 实现。**这条需要进 v1.1**，你侧要实现「收到 409 ⇒ 告警 + 全量对账 + 停」 |
-| 7 | 所有 `outcome` 的记录都进流，不只 `ok` | 依据是你们此前明确的「失败/降级采集要进流，否则自己也不知道产品没了」。record 里带 `outcome` 字段。**`outcome != "ok"` 的记录只进 snapshots，绝不 upsert products** |
+| 1 | **`slow_hash` 的算法和契约描述的不是一回事** | 契约写「字段排序后 sha256 前 16 位」。我给的是 16 位十六进制不假，但算法是采集侧那一套（NFKC + 空白折叠 + 哨兵值全等归一 + 列表排序 + 图片 URL 归约到 image ID + 排序键 JSON + SHA-256）。**⚠ 当不透明值用，不要按收到的 `slow` 对象自己重算再比对——两边必然不等。** 它保证的是「同页面跨进程跨引擎稳定、慢变字段真变了才变」，这正是你要的性质，但只有采集侧算得出来 |
+| 2 | **`fast.currency` 恒 `"USD"`** | 采集侧**根本不采币种**，这是适配器补的常量。amazon.com 恒美元所以今天不出错，但它不是观测到的事实 |
+| 3 | **`fast.stock_state` 的值域是我定的**：`in_stock` / `out_of_stock` / `unknown` | 契约没列举。若你侧还需要 `preorder` / `limited` 之类，给我值域 |
+| 4 | **`slow.weight` / `slow.dimensions` 我做成了对象** `{package, item}` | 契约只写了字段名。采集侧这两个各有「包装」和「本体」两个值，合成一个标量会丢信息 |
+| 5 | **游标掉出保留窗口返回 409** | 契约仍未定义这一种。静默跳过被裁区间不可接受（两侧都察觉不到丢数据），所以我按 409 实现。**建议进 v1.1**，你侧实现「收到 409 ⇒ 告警 + 全量对账 + 停」 |
 
-另外两条是**语义提醒**，不是待定项：
+### 采集侧的扩展字段（契约未要求，收着无害，不收也不影响）
 
-- **`marketplace` 是「上架目的地」，不是「采集来源站点」。** 契约里它恒为 `"US"`，
-  与你们 `(marketplace, asin)` 复合主键、默认 `'US'` 对齐。但采集侧内部还有一个
-  同名概念指**从哪个亚马逊站点采的**（当前恒 `amazon.com`）。今天两者一一对应；
-  等你们开 Walmart CA，很可能**仍然从 amazon.com 采、却要上架到 CA**，那时两者就分叉了。
-  所以我没有把内部值改名，而是显式映射，并把来源站点原样放进
-  `scrape_params.source_marketplace` —— **两个概念从第一天就是两个字段。**
-- **`cursor` 是 `bigserial` 主键，结构上不可能重复。** 所以验收项「cursor 相同多条不丢」
-  在本实现下是**平凡成立**的。我把这个事实写成了用例
+`outcome`（依你们此前「失败/降级采集要进流」的决定；**`!= "ok"` 只进 snapshots，
+绝不 upsert products**）、`completeness_ok`、`review_hash`、`recorded_at`、
+`scrape_params` 里的 `zip_observed` / `zip_verify` / `source_marketplace` /
+`parse_engine`。
+
+其中 `zip_observed` / `zip_verify` 值得一提：契约要的是「影响结果的**全部**采集参数」，
+而「请求的邮编有没有真的生效」直接决定这条价格属不属于该邮编分组——
+`zip_verify == "mismatch"` 的记录不建议写进该邮编的价格序列。
+
+### 鉴权：我按契约改了，但留了开关
+
+契约写的是**可选**（「建议加上，服务器是公网 IP」），所以：
+配了 `EXPORT_TOKEN` → 强制校验（不匹配/缺失 401）；**没配 → 放行**，但每次打
+WARNING 日志。
+
+我最初实现的是 fail-closed（没配就 503）。**契约是权威，这里服从契约**——
+否则你按契约部署、不配 token，会撞上一个没预期的 503。
+想要 fail-closed 回来：设 `EXPORT_REQUIRE_TOKEN=1`。
+
+### 两条语义提醒（不是待定项）
+
+- **`marketplace` 是「上架目的地」，不是「采集来源站点」。** 契约里恒 `"US"`，
+  与你们 `(marketplace, asin)` 复合主键对齐。采集侧内部另有一个同名概念指
+  **从哪个亚马逊站点采的**（当前恒 `amazon.com`）。今天一一对应；等你们开
+  Walmart CA，很可能**仍从 amazon.com 采、却上架到 CA**，那时两者分叉。
+  所以我没改内部值名，而是显式映射，并把来源站点原样放进
+  `scrape_params.source_marketplace`——**两个概念从第一天就是两个字段。**
+- **验收项「cursor 相同的多条记录不丢」在本实现下是平凡成立的。**
+  我们的 `cursor` 是 `bigserial` 主键，**结构上不可能重复**。说这句是为了让你
+  知道这条验收**没有真正测到什么**，别把它当证据。已写成用例
   （`test_cursor_values_are_unique_so_the_same_cursor_case_is_vacuous`），
   哪天有人把 cursor 换成时间戳之类可重复的东西，它会立刻红。
 
@@ -55,13 +79,13 @@ X-Export-Token: <token>
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `cursor` | int ≥ 0 | 0 | **独占**下界，返回 `cursor` **大于**它的记录。从头拉传 `0` |
-| `limit` | int 1..1000 | 200 | 超过 1000 返回 422 |
+| `limit` | int 1..1000 | **500** | 超过 1000 返回 422 |
 
 **鉴权**：`X-Export-Token` 与服务端 `EXPORT_TOKEN` 环境变量比对（`hmac.compare_digest`）。
 
-- 不匹配或缺失 → **401**
-- 服务端**没配** `EXPORT_TOKEN` → **503**，不是放行。
-  服务器是公网 IP，「没配就放行」等于把商品库敞在互联网上。**fail closed 是有意的。**
+- 服务端配了 `EXPORT_TOKEN`，请求头不匹配或缺失 → **401**
+- 服务端**没配** `EXPORT_TOKEN` → **放行**（契约说鉴权可选），但服务端每次打 WARNING
+- 想要「没配就关闭该端点」：服务端设 `EXPORT_REQUIRE_TOKEN=1` → **503**
 
 ## 2. 响应
 
@@ -76,45 +100,62 @@ X-Export-Token: <token>
 
 ### record
 
+下面是**真实响应**（跑一条采集抓下来的，不是手写示例）：
+
 ```jsonc
 {
-  "source_id": "a3f19c2b7e04:evt-41208001",   // 幂等键，全局唯一
-  "cursor": 41208001,                          // 单调不回跳
-  "marketplace": "US",                         // 上架目的地，当前恒 US
-  "asin": "B0CXXXXXXX",
-  "scraped_at": "2026-08-05T09:11:02Z",        // UTC ISO8601，恒带 Z
+  "source_id": "93f6b81b1f58:1c8ee3da-e70a-49d8-b4e9-5002d9187221",  // 幂等键
+  "cursor": 1,                                   // 单调不回跳
+  "marketplace": "US",                           // 上架目的地，当前恒 US
+  "asin": "B0INCR0000",
+  "scraped_at": "2026-08-05T10:00:00Z",          // UTC ISO8601，精确到秒
 
   "scrape_params": {
-    "zip": "10001",                            // 请求的邮编（分组键的一部分）
-    "zip_observed": "10001",                   // 页面上实际反映的邮编，可为 null
-    "zip_verify": "confirmed",                 // confirmed|assumed|mismatch|unverified
-    "source_marketplace": "amazon.com",        // 采集来源站点，见上文语义提醒
-    "parse_engine": "selectolax"
+    "zipcode": "10001",                          // 请求的邮编（分组键的一部分）
+    "zip_observed": null,                        // 页面实际反映的邮编，可为 null
+    "zip_verify": "unverified",                  // confirmed|assumed|mismatch|unverified
+    "source_marketplace": "amazon.com",          // 采集来源站点，见上文语义提醒
+    "parse_engine": null                         // selectolax|lxml|null
   },
 
   "slow": {
-    "title": "…",
-    "brand": "…",
+    "title": "Incr B0INCR0000",
+    "brand": "IncrBrand",
     "category_path": ["Home", "Tools", "Wrenches"],
-    "images": ["https://m.media-amazon.com/images/I/71ABC._AC_SL1500_.jpg"]
+    "images": ["https://m.media-amazon.com/images/I/71ABC._AC_SL1500_.jpg"],
+    "bullet_points": [],
+    "description": null,
+    "weight":     { "package": null, "item": null },
+    "dimensions": { "package": null, "item": null },
+    "variant": null                              // 或 {parent_asin, theme}
   },
 
   "fast": {
     "price": 19.99,
     "currency": "USD",
-    "stock_state": "in_stock"
+    "stock_state": "in_stock",                   // in_stock|out_of_stock|unknown
+    "buybox_price": null,
+    "buybox_seller": null,
+    "buybox_seller_id": null,
+    "coupon": null,                              // 采集侧不采，恒 null
+    "deal": null                                 // 采集侧不采，恒 null
   },
 
-  "slow_hash": "v1:1f0c9a…",
+  "slow_hash": "3471dc8c36e2d028",               // 16 位十六进制，**当不透明值用**
+  "raw": { /* 裁剪后的原始载荷，去掉内部字段与已在 slow/fast 给过的大文本 */ },
 
-  // 以下是采集侧附加，契约未要求，收着无害
-  "outcome": "ok",
-  "completeness_ok": true,
-  "review_hash": "v1:77ab12…",
-  "hash_ver": 1,
-  "recorded_at": "2026-08-05T09:11:07Z"
+  // 以下是采集侧扩展，契约未要求
+  "outcome": "ok",                               // ok|not_found|blocked|parse_failed|stale
+  "completeness_ok": false,
+  "review_hash": "40385603e042518d",
+  "recorded_at": "2026-08-05T16:04:27Z"
 }
 ```
+
+**空值语义（重要）**：`null` 与 `[]` 一律表示「**本次采集没取到**」，
+**不表示「该商品没有这个属性」**。软降级页会把面包屑、详情表整块剥掉，
+那时 `category_path` 就是 `[]`。**别拿空值去覆盖你侧已有的值**——
+用 `completeness_ok` 与 `outcome` 判断这条记录够不够格进 products。
 
 ## 3. 边界语义（验收会测的项）
 
@@ -133,9 +174,9 @@ X-Export-Token: <token>
 |---|---|---|
 | 200 | — | 处理并推进游标（含空结果） |
 | 401 | `invalid_export_token` | 修 token，不要重试 |
-| **409** | `cursor_below_retention` | **告警 + 全量对账 + 停**。你要的下一条已被保留期裁掉（**待写进 v1.1**，见上文第 6 条） |
+| **409** | `cursor_below_retention` | **告警 + 全量对账 + 停**。你要的下一条已被保留期裁掉（**待写进 v1.1**，见上文第 5 条） |
 | 422 | `invalid_parameter` | 修请求，不要重试 |
-| 503 | `event_stream_unavailable` / `export_token_not_configured` | 退避重试并告警 |
+| 503 | `event_stream_unavailable` / `export_token_not_configured` | 退避重试并告警。后者只在服务端设了 `EXPORT_REQUIRE_TOKEN=1` 却没配 token 时出现 |
 
 ## 4. 一条实现上的坑，写下来免得两侧都踩
 

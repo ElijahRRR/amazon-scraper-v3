@@ -40,8 +40,9 @@ forced_prune_log 非空时（罕见，意味着真的丢了数据）：
 ## 0.1 本次发布的变更清单（Phase 4 + Phase 6）
 
 > 一页看完你侧要做什么。每一行都指向本文里写详细的那一节。
-> **`contract_version` 仍然是 1** —— 下面没有一条是不兼容变更：新增字段开始有
-> 真值、旧字段语义不变。唯一需要你**动手**的是第 4 行。
+> **`contract_version` 仍然是 1**：新增字段开始有真值，顶层字段语义不变。
+> 需要你**动手**的是**第 4 行和第 11 行**——第 11 行是 `payload` 内部的一处
+> 形状反转，旧文档教过的判别式失效了，按旧规则实现的消费方会静默改变行为。
 
 | # | 变了什么 | 你侧要做的事 | 详见 |
 |---|---|---|---|
@@ -55,6 +56,7 @@ forced_prune_log 非空时（罕见，意味着真的丢了数据）：
 | 8 | 新增 `status.max_safe_overlap`；保留期保证下界比 `ack_seq` 低至少这么多 | **读它，别把 `OVERLAP=200` 硬编码。** 断言 `OVERLAP <= max_safe_overlap` | §7 硬性规则 9 |
 | 9 | 新增第五个端点 `POST /api/v1/sync/ack-prune` + `status.forced_prune_log` | 实现「非空 ⇒ 硬停 + 记录区间 + 人工确认」这条支路 | §5.1 |
 | 10 | `ack_seq: 0` 明确定义成合法空操作（采集侧从库层面拒绝存 0） | 无需改动 | §5 |
+| 11 | **`rating`/`review_count`/`seller_id`/`seller_name` 从「早退路径上缺席」改成「恒存在，取不到即 `"N/A"`」** | **必须改。**`key in payload` 不再是判别式，改判值是否为 `"N/A"`；`"N/A"` 意思是「本次没取到」而非「与上次相同」 | §6.6 |
 
 **没有变的东西**（免得你去找）：`seq` 的语义与排序权威性、`source_id` 的幂等
 锚点形状、分组键、`gen` 的硬停规则、`outcome` 的封闭集、`hash_ver`（仍是 `1`）、
@@ -651,7 +653,12 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
 > ⚠ **一次性事件：首次上线后的第一轮重采会让近乎全语料的 `slow_hash` 同时翻转。**
 > `hash_ver` 不变，所以上面那条「双输出」的保护**不覆盖这次**。
 >
-> 原因是采集侧修掉了一个既有的解析缺陷（`worker/parser.py`
+> 成因有两个（都是既有解析缺陷的修复，不是新增行为）：
+> **(a)** `manufacturer` 过去会被 "Manufacturer recommended age" 这类键名子串命中而写成
+> 年龄段（谁在文档里靠前谁赢），现在改成精确匹配；
+> **(b)** `long_description` 过去吸进了容器之外的文本。下面详述 (b)。
+>
+> 其中 (b) 是：采集侧修掉了一个既有的解析缺陷（`worker/parser.py`
 > `_slx_parse_long_description` 用了 selectolax 的 `Node.traverse()`，而它不受
 > 子树约束）。`long_description` 因此长期吸进了容器之外的文本——价格、库存、
 > 评分、BSR、CDN 图片 URL 都在里面：
@@ -684,9 +691,33 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
 
 已知的形状约束：
 
-- **lxml 回退路径与全部早退路径上，`rating` / `review_count` / `seller_id` /
-  `seller_name` 这 4 个字段在 `payload` 里是「缺席」** —— 不是 `null`，
-  更不是旧值。用 `key in payload` 判断，不要用 `payload.get(k) is None`。
+- ⚠ **本条在本次发布中反转了，如果你侧按旧版实现过，必须改。**
+
+  **旧行为（≤ 上一版）**：`rating` / `review_count` / `seller_id` / `seller_name`
+  这 4 个字段在 lxml 回退路径与全部早退路径（验证码 / 空 HTML / 404 …）上
+  **在 `payload` 里缺席**，旧文档因此教你用 `key in payload` 判断。
+
+  **新行为（本版起）**：这 4 个字段**恒定存在**。取不到时是字符串 `"N/A"`，
+  不是缺席、不是 `null`。
+
+  ```
+  验证码页    旧: key in payload -> False       新: key in payload -> True, 值 "N/A"
+  空 HTML     旧: key in payload -> False       新: key in payload -> True, 值 "N/A"
+  ```
+
+  **为什么改**：旧的「缺席」在采集侧是个 bug，不是设计。服务端写库时按
+  `if val is not None` 跳过缺席字段，于是那一行**保留上一次采集的旧值**，
+  却带着一个全新的 `crawl_time` —— 结转的陈旧数据被打扮成了新鲜观测。
+  让 4 个字段恒存在，是为了让「这次没取到」变成一个可以说出口的事实。
+
+  **你侧要做的**：`key in payload` 现在恒真，不再是判别式。改判
+  `payload.get(k)` 是否为 `"N/A"`：
+  **`"N/A"` 的含义是「本次采集没取到」，不是「和上次一样」。**
+  按旧规则实现的消费方会从「未测量，保留我存的值」静默翻转成
+  「已测量，写入 N/A」——这正是本条标⚠ 的原因。
+
+  注意这 4 个字段**不在** `review_hash` 与 `slow_hash` 的字段集里，
+  所以本条不影响复审门，也不引起哈希翻转。
 - **`screenshot_path` 是易失引用（硬性规则）。** 该键**可能缺席**（不是所有采集
   都出截图）。
   截图文件会被常规清理，采集侧**不做**独立持久化，且明确接受随机器丢失。

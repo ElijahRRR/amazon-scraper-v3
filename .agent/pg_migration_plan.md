@@ -275,21 +275,45 @@ CREATE TABLE scraper.scrape_events_p0 PARTITION OF scraper.scrape_events
     FOR VALUES FROM (MINVALUE) TO (20000000);
 -- 后续分区由维护任务提前创建（永远保持至少 2 个未来分区）
 
-CREATE UNIQUE INDEX ON scraper.scrape_events (source_id);   -- 幂等锚点，同时是坏数据的响铃
-CREATE INDEX ON scraper.scrape_events (recorded_at);        -- /counts 按时间分桶
+-- ⚠ 修订（D-21）：下面这条**被 PG 16 拒绝**，原文是错的。
+-- CREATE UNIQUE INDEX ON scraper.scrape_events (source_id);
+--   FeatureNotSupportedError: unique constraint on partitioned table must
+--   include all partitioning columns
+--   DETAIL: ... lacks column "seq" which is part of the partition key.
+-- 正确写法：唯一索引建在**分区**上，不建在父表上。每建一个新分区就带一条。
+CREATE UNIQUE INDEX scrape_events_p0_source_id_key
+    ON scraper.scrape_events_p0 (source_id);                -- 幂等锚点 + 坏数据的响铃
+
+CREATE INDEX ON scraper.scrape_events (recorded_at);        -- 父表建：自动传播到已存在的分区
+
+-- ---------- 死信（计划外新增，D-24）----------
+-- 没有它，一行畸形到过不了 NOT NULL/CHECK 的 body 会永远卡在队头，整条流停摆。
+CREATE TABLE scraper.scrape_outbox_dead (
+    id bigint PRIMARY KEY, enqueued_at timestamptz NOT NULL,
+    body jsonb NOT NULL, reason text NOT NULL,
+    dead_at timestamptz NOT NULL DEFAULT now()
+);
 
 -- ---------- 同步元数据 ----------
-CREATE TABLE scraper.sync_meta (k text PRIMARY KEY, v text NOT NULL);
--- 键：contract_version / gen / instance_id / ack_seq / ack_at / forced_prune_log
+CREATE TABLE scraper.sync_meta (k text COLLATE "C" PRIMARY KEY, v text NOT NULL);
+-- 键：contract_version / gen / instance_id / max_seq_ever / ack_seq / ack_at / forced_prune_log
 ```
 
 设计说明：
 
-- **`source_id = '{gen}:{uuid}'`**。PG 的 sequence 回滚只留空洞、永不复用，
-  所以不需要 SQLite 版那个 `{gen}:{seq}:{rid}` 的随机后缀。`gen` 每次启动新铸并**逐行落库**
+- **`source_id = '{gen}:{uuid}'`**，在**写入时**铸造（不是 relay 时——那样每次重放都会变，
+  等于没有幂等锚点）。PG 的 sequence 回滚只留空洞、永不复用，
+  所以不需要 SQLite 版那个 `{gen}:{seq}:{rid}` 的随机后缀。`gen` **逐行落库**
   （只存 meta 表的话，一次从备份恢复会把全部历史重贴上恢复后的标签）。
-- **`UNIQUE(source_id)` 建**。SQLite 版为省 WAL 放弃了它，PG 下这个成本不值一提，
+  > ⚠ **修订（D-22）**：原文「`gen` 每次启动新铸」**是错的**，与 §5.5 直接冲突——
+  > 那里把 `gen` 变化定义为消费侧硬停 + 全量对账，每次启动新铸 = 每次例行部署
+  > 都触发一次全量对账。正确规则：**复用** `sync_meta.gen`，只有全新库或检出回退
+  > （`max(seq) < max_seq_ever`）才新铸。
+- **`UNIQUE(source_id)` 建**，但**只能建在分区上**（见上方 DDL 的 D-21 修订）。
+  SQLite 版为省 WAL 放弃了它，PG 下这个成本不值一提，
   而它是「同一条记录被 relay 写了两遍」的唯一硬防线。
+  代价：**跨分区**的重复 `source_id` 抓不到。可接受——relay 的认领→落库是单事务，
+  一行不可能被 relay 处理两次；这道索引防的是「第二个 relay」，而那由单例锁挡住。
 - **`payload` 用 `jsonb`**，PG 自动 TOAST + 压缩，不需要手动 zlib。
   代价是 `jsonb` 会重排键序、丢重复键——对我们无影响（payload 是消费侧解析的，不参与哈希）。
 - **按 `seq` range 分区而非时间**：游标查询 `WHERE seq > X ORDER BY seq LIMIT n`
@@ -419,19 +443,67 @@ DDL 的默认值只在「插入时不带该列」时生效，而 worker 路径�
   导致完整采集结果被丢弃。改用 SKIP LOCKED 顺带修掉这个。
 - `/api/results` 每页做全量 `COUNT(*)` → 改 `count(*) OVER ()` 或去掉精确总数。
 
-### Phase 2 — 事件流（3-4d）
+### Phase 2 — 事件流 ✅ 已完成
 
-| 项 | 内容 |
+> ⚠ **本节原文有五处被实现证伪**，见下方「计划错在哪里」。以本节修订后的内容
+> 与 `common/pgdb/OWNERSHIP.md` 的 D-21..D-27 为准。
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| DDL | ✅ §2.1 全部，**第 278 行除外**（见下） | `common/pgdb/schema.py`（事件流 DDL 段） |
+| 写钩子 | ✅ 14 条终态路径全覆盖（S1-S4 / B1-B9 / F1-F4） | `common/pgdb/results_write.py`、`tasks.py`、`outbox.py` |
+| 失败/降级进流 | ✅ 五种 outcome 全部实测产出 | 同上 |
+| relay | ✅ 单例锁 + 1s 轮询 + 批 500 + 单事务 `DELETE…RETURNING`→`INSERT` | `common/pgdb/relay.py` |
+| 哈希 | ✅ §4 完整规格，relay 侧计算 | `common/slowhash.py`（纯 stdlib，零 `common.*` 依赖） |
+| 分区维护 | ✅ 在 relay 循环内自愈，常备 ≥2 个未来分区 | `relay.ensure_event_partitions` |
+| 指标 | ✅ `GET /api/_debug/event-stream`（`include_in_schema=False`） | `server/app.py` |
+| 进程接线 | ✅ `lifespan` 起停；SQLite 上零字节代码 | `server/app.py` |
+
+**验收结果（全部实测，非预期）**：
+
+```
+.venv/bin/python -m tests.golden.run verify                      -> ✅ 64 步与基线完全一致
+DB_BACKEND=postgres .venv/bin/python -m tests.golden.run verify  -> ✅ 64 步与基线完全一致
+.venv/bin/python -m pytest tests/ -q                 -> 427 passed,  6 skipped   （移植前 268/4）
+DB_BACKEND=postgres .venv/bin/python -m pytest tests/ -q -> 429 passed, 4 skipped
+```
+
+游标保证按 §1.2 的三环逐环钉死，且**两个方向都测**：
+`test_cursor_guarantee_under_staggered_commits` 用 8 条写连接、提交顺序完全倒置，
+96/96 条严格递增零跳过，并断言 **4032 处 inversion**（outbox id 序与 seq 序相反）——
+没有这一条，用例可能因为「根本没制造出乱序」而空过。配套的
+`test_naive_cursor_skips_committed_rows` 与 `test_two_relays_would_break_the_guarantee`
+分别证明「裸 `seq > X` 确实会永久跳行」和「单例锁是承重的」。
+
+黄金场景在 **relay 真开** 的情况下重放（`tests/test_golden_with_relay.py`）：
+64 步逐字节不变，同时产出 9 条事件、账本与场景逐条对齐。
+
+---
+
+#### 计划错在哪里（实现阶段发现，已按修订版落地）
+
+| # | 原文 | 实测 | 处置 |
+|---|---|---|---|
+| 1 | **§2.1 第 278 行** `CREATE UNIQUE INDEX ON scraper.scrape_events (source_id)` | PG 16.13 直接拒绝：<br>`FeatureNotSupportedError: unique constraint on partitioned table must include all partitioning columns`<br>`DETAIL: ... lacks column "seq" which is part of the partition key` | 改为**每个分区各建一条**唯一索引。连带两个后果：(a) relay 必须用**无目标** `ON CONFLICT DO NOTHING` —— `ON CONFLICT (source_id)` 推断不出约束，抛 `InvalidColumnReferenceError`；(b) **跨分区的重复 `source_id` 抓不到**。可接受：relay 的认领→落库是单事务，一行不可能被 relay 两次；这道索引防的是「第二个 relay」，而那由单例锁挡住。**不要**为此加一张全局去重表——那正是分区设计要消掉的不可裁剪热点。 |
+| 2 | **§2.1 设计说明** 「`gen` 每次启动新铸」 | 与 §5.5 直接冲突：那里把 `gen` 变化定义为消费侧**硬停 + 全量对账**。每次启动新铸 = 每次例行部署都触发一次全量对账。 | 按 T11 的读法：**复用** `sync_meta.gen`；只有全新库、或检出回退（`max(seq) < max_seq_ever`）才新铸。回退时同时把序列 `setval` 推过历史高水位（必要时先建分区）。`gen` **仍然逐行落库**。 |
+| 3 | **Phase 2 表** 「写钩子必须在**跨时间合并之前**快照」 | 措辞误导。那两个 `if val is not None` 的循环**不改 `data`**，它们只是让 `UPDATE` 省略缺席字段，于是**行**跨时间携带旧值。实测真正结转的只有 4 个字段（`rating` / `review_count` / `seller_id` / `seller_name`）——`content_hash` / `title_bullets_hash` 在循环之前已被无条件赋值。 | 真正的规矩是「**body 一律由提交上来的 `data` 构造，绝不回读 `asin_data`**」+「钩子与写入同一失败域」。落点仍是两处 hash 赋值之后、第一条可能失败的语句之前（`results_write.py` 的 `_save_result_inner_unlocked` 内）。**连带的契约条款**：lxml 回退路径与全部早退路径上，那 4 个字段在 `payload` 里是**缺席**——不是 null，更不是旧值。 |
+| 4 | 隐含假设：需要 `attempt` 就给租约 `UPDATE` 加 `RETURNING` | 实测这会毁掉全系统安全性最高的谓词：<br>`普通 UPDATE，租约不匹配: rowcount=0  -> 门 rowcount==0 触发？True`<br>`同一条 + RETURNING     : rowcount=-1 -> 门 rowcount==0 触发？False`<br>`ConnProxy` 见到 RETURNING 就走 `returns_rows` 分支返回 `Cursor(rows, -1)`，`-1 == 0` 为 False，**每一条过期结果都会被接收**。 | 租约 UPDATE 一个字不许改。要服务端事实就在同一事务里另发一条普通 `SELECT`（走 PK 索引，事务持有者自己的读不改道）。已写进 `results_write.py` / `tasks.py` 的文件头红线。 |
+| 5 | §2.1 只说 `outcome<>'ok'` 时 `review_hash` 写 NULL | `not_found` 的 payload 有 30/40 个占位符，对它算 `slow_hash` 得到的是「好页→404→好页」每次都翻转的值——正是 §4.3 那道合取门要防的误复审模式。 | **收紧**：`outcome <> 'ok'` 时 `review_hash` 与 `slow_hash` **都**写 NULL。在 `common/slowhash.compute_hashes` 与 relay 两层各实现一次（纵深，不是重复）。 |
+
+#### 计划没写、但实现必须处理的
+
+| 项 | 结论 |
 |---|---|
-| DDL | §2.1 全部 |
-| 写钩子 | 在结果写入的同一事务内 `INSERT INTO scrape_outbox`。落点对应 SQLite 版的 `_save_result_inner_unlocked`，**必须在「跨时间合并」之前快照**——否则「每条记录 = 一次完整采集结果」不成立 |
-| 失败/降级进流 | `outcome ∈ {ok, not_found, blocked, parse_failed, stale}`，全部入 outbox。`outcome<>'ok'` 的 `review_hash` 写 NULL |
-| relay | 后台 asyncio 任务；`pg_try_advisory_lock` 单例保护；1s 轮询；批 500；`DELETE ... RETURNING` + `INSERT` 同事务 |
-| 哈希 | §4 的完整规格，在 relay 里算（不占提交热路径） |
-| 分区维护 | 提前创建未来分区的定时任务 |
-| 指标 | outbox 深度、relay 滞后、每分钟事件数 |
-
-验收：并发压测下 relay 输出的 `seq` 严格递增；杀掉 relay 中途重启，outbox 零丢失、`scrape_events` 零重复。
+| `scraper` 不在 search_path | `pool.connect()` 把 `search_path` 钉在 `public`（`verify_schema()` 与 trigram 对象都依赖它）。事件流的每一处引用都必须 schema 限定。**不要**去改 search_path。 |
+| 不建 `DEFAULT` 分区 | 溢出时 `CheckViolationError: no partition of relation "scrape_events" found for row` → relay 事务回滚 → 认领的行原样留在 outbox。**失败安全、零丢失、够响**。`DEFAULT` 分区会先收下这些行，然后**永久阻止**为该区间建正确的分区。 |
+| `seq` **有空洞是设计的一部分** | 序列非事务性，回滚的 relay 批次会烧号（实测 `40000001` 在失败插入后被烧掉）。没有任何东西依赖它连续——但 Phase 3 的 `409 cursor_below_retention` 判据 `after_seq + 1 < min_available_seq` **会在保留期边界的空洞上误报**。留给 Phase 3。 |
+| 建分区不能用 `CREATE TABLE … PARTITION OF` | 实测它取 `ACCESS EXCLUSIVE`，有写事务开着时**阻塞 >3s**；`ATTACH PARTITION` 不阻塞。而且 `LIKE <父表> INCLUDING ALL` **静默漏掉** per-partition 的 `source_id` 唯一索引（那条索引在 p0 上，不在父表上）——照抄父表得到的是一个**没有重复防护、也不报错**的分区。必须 `LIKE <p0>`，并在 attach 后断言索引存在。 |
+| 死信表 `scraper.scrape_outbox_dead`（**计划外新增**） | 没有它，一行畸形到过不了 `NOT NULL`/`CHECK` 的 body 会永远卡在 `ORDER BY id` 队头，**整条流停摆**。策略：分区溢出与连接故障**绝不**隔离（保留计划要的「响亮停摆、零丢失」），只有批量已缩到 1 且连续失败 `RELAY_QUARANTINE_AFTER` 次才把队头搬走，body 逐字节保留 + ERROR 日志 + 计数器。 |
+| 事件流 DDL 由 `SchemaMixin.init_tables()` 建，不由 relay 启动时建 | 被两个约束夹死：黄金必须 no-op 掉 relay 循环（否则录制期后台任务改状态），但**写钩子在 PG 黄金重放里照常触发**——建表若放在 relay 启动路径上，写钩子会在事务里撞上缺表。`verify_schema` / `EXPECTED_COLUMNS` 一个字没动：它们只看 `table_schema='public'`，`scraper.*` 对它们不可见。 |
+| `completeness` 全为 `0` | Phase 2 观测不到 §4.3 要的 HTML 区块存在性，**不许**从已解析字段瞎凑一个值。`0` = 「未测量」。**Phase 3 契约必须显式规定消费侧拿 `completeness = 0` 怎么办**，否则按 §5.5 的 `completeness_ok` 门，没有一行进得了 `catalog.products`，沃尔玛侧会一直是空的。建议保留位 3（值 8）作 MEASURED，`completeness_ok := (completeness & 8) <> 0 AND (completeness & 7) = 7`。 |
+| `stale` **发事件**，且**自带事务** | `reclaim_dead_worker_tasks` 对「只是慢但活着」的 worker 同样 bump epoch，于是被丢掉的是一次**完整真实**的采集，不是重复提交。S1/F1 判定 stale 之后立刻 `ROLLBACK`（那两条语句一个字没改），事件在其后另开一个事务发出，仍在 `_write_lock` 内。唯一代价：`ROLLBACK` 与 `COMMIT` 之间硬崩会丢这一条——写进契约，那个窗口里租约本来就没了。 |
+| `hash_ver` 是 `int`，`HASH_VER` 是 `'v1'` | 两者类型本就不同（后者同时是哈希串前缀 `'v1:<sha256>'`），由 `parse_hash_ver` 显式转换。别把 `'v1'` 塞进 int 列。 |
+| `accept_seller_discovery_result` **不进流** | 不同域（`seller_discoveries`，无 `asin_data` 写入、无商品 payload）。要的话是**第二条流**，不是混进这一条。契约里要写明，免得「缺卖家任务事件」被读成数据丢失。 |
 
 ### Phase 3 — 导出 API（2-3d）
 

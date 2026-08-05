@@ -49,6 +49,7 @@ OWNS:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, List
 
 logger = logging.getLogger(__name__)
@@ -363,6 +364,247 @@ CLEARED_TABLES = ["asin_changes", "asin_data", "batch_asins",
                   "tasks", "screenshots", "batches"]
 
 
+# ==================================================================
+# 事件流（Phase 2）—— schema ``scraper``，与上面的遗留表**完全分开**
+# ==================================================================
+#
+# 为什么单开一个 schema 而不是塞进 public：
+#   * ``verify_schema()`` / ``EXPECTED_COLUMNS`` 比对的是
+#     ``table_schema='public'``，它存在的理由是「``SELECT d.*`` 没有
+#     response_model，多一列少一列都会改 erpAPI 看到的响应」。事件流的表放在
+#     ``scraper`` 下，对那道闸门天然不可见，也**必须**保持不可见。
+#   * ``pool.connect()`` 把连接的 search_path 钉死成 ``public``
+#     （pool.py:849/855），所以**每一处引用都必须 schema 限定**：DDL、写钩子、
+#     relay，一处都不能漏。不要去改 search_path——trigram / ascii_lower
+#     那一套全都假设 public。
+#
+# 与 `.agent/pg_migration_plan.md` §2.1 的两处**实测修正**（见 §3.1/§3.2）：
+#   1. 计划里的 ``CREATE UNIQUE INDEX ON scraper.scrape_events (source_id)``
+#      在 PG 16 上直接报错：
+#        FeatureNotSupportedError: unique constraint on partitioned table must
+#        include all partitioning columns
+#      改成**逐分区**建唯一索引（见 EVENT_PARTITION_SOURCE_ID_INDEX_SQL）。
+#      代价：跨分区的重复 source_id 抓不到。可以接受——relay 的
+#      DELETE...RETURNING → INSERT 是同一个事务，同一条 outbox 行不可能被
+#      relay 两次；这道索引防的是「第二个 relay 实例」，而那由
+#      pg_try_advisory_lock 挡住，且真发生时也落在同一个 2000 万行窗口里。
+#      **不要**为此再加一张全局去重表——那正好把设计去掉的
+#      「不分区、不可裁剪、单点热行」结构又请回来。
+#   2. 因此 relay 的 INSERT 只能用**无目标**的 ``ON CONFLICT DO NOTHING``；
+#      ``ON CONFLICT (source_id)`` 推断不出约束，直接 raise
+#      （InvalidColumnReferenceError）。
+#
+# **没有 DEFAULT 分区**，这是刻意的。实测溢出行为：
+#     CheckViolationError: no partition of relation "scrape_events" found for row
+#     DETAIL: Partition key of the failing row contains (seq) = (40000001)
+# 它会让 relay 事务整体回滚 → DELETE 一起回滚 → 认领的行**全部留在 outbox**。
+# 零丢失、很吵、会停摆。DEFAULT 分区则会把行照单全收，然后**永久**挡住给那个
+# 区间建正确分区。宁可要那次吵闹的停摆。
+
+EVENT_SCHEMA = "scraper"
+EVENT_OUTBOX_TABLE = "scraper.scrape_outbox"
+EVENT_DEAD_TABLE = "scraper.scrape_outbox_dead"
+EVENT_EVENTS_TABLE = "scraper.scrape_events"
+EVENT_SYNC_META_TABLE = "scraper.sync_meta"
+EVENT_PARTITION_PREFIX = "scrape_events_p"
+
+#: 每个分区覆盖的 seq 跨度。计划 §2.1：2000 万行一个分区
+#: （10 万/天 ≈ 200 天，几十万/天 ≈ 40 天）。
+#: 环境变量只为测试留口子——生产别动它：改小之后老分区的边界不会跟着变，
+#: 新分区从「当前最高上界」往后接，所以改动是安全的、但没有意义。
+EVENT_PARTITION_SPAN = int(os.environ.get("PG_EVENT_PARTITION_SPAN", "20000000"))
+
+#: 永远保持至少这么多个「未来分区」（下界 > 当前 last_value）。计划 §2.1。
+EVENT_FUTURE_PARTITIONS = int(os.environ.get("PG_EVENT_FUTURE_PARTITIONS", "2"))
+
+#: 契约版本。写进 sync_meta，Phase 3 的 /api/v1/sync/status 要回它。
+EVENT_CONTRACT_VERSION = "1"
+
+#: outcome 封闭集（计划 §2.1 的注释 + 设计规格 §2.2）。
+#: 故意**不**做成 CHECK 约束：一个越界值就会让 relay 事务永久回滚、整条流停摆，
+#: 而 relay 侧已经在 Python 里归一化过了（未知值 -> parse_failed 并计数）。
+EVENT_OUTCOMES = ("ok", "not_found", "blocked", "parse_failed", "stale")
+
+#: marketplace 封闭集。计划 §2.3：**绝不**透传 parser 的 ``site``（那是 "US"）。
+EVENT_MARKETPLACES = ("amazon.com",)
+EVENT_DEFAULT_MARKETPLACE = "amazon.com"
+
+EVENT_STREAM_DDL: List[str] = [
+    "CREATE SCHEMA IF NOT EXISTS scraper",
+
+    # ---------------- outbox：写侧入口，全并发，短命 ----------------
+    # 常驻行数 ≈ 一秒的产出量，不分区、不加索引（PK 够了）。
+    # enqueued_at 用 now()（= 事务开始时刻）而不是 clock_timestamp()：
+    # 它就是 scrape_events.recorded_at，「一次 accept_results_batch 共享一个
+    # 时间戳」是对的——那一批确实是在同一个提交里被记录下来的。
+    """
+    CREATE TABLE IF NOT EXISTS scraper.scrape_outbox (
+        id          bigserial   PRIMARY KEY,
+        enqueued_at timestamptz NOT NULL DEFAULT now(),
+        body        jsonb       NOT NULL
+    )
+    """,
+
+    # ---------------- 死信：relay 反复插不进去的毒丸 ----------------
+    # 存在的理由：没有它，一条 body 畸形到连 NOT NULL / CHECK 都过不去的行
+    # 会永远排在 ``ORDER BY id`` 的队头，让**整条事件流**永久停摆（每 tick
+    # 认领它、失败、回滚，循环往复）。有了它，那种情况降级成「一行被隔离 +
+    # 一条 ERROR 日志 + 一个计数器」，人可以事后捞出来重放。
+    # 绝不静默丢弃：行原封不动搬过来，连 id 和 enqueued_at 都留着。
+    """
+    CREATE TABLE IF NOT EXISTS scraper.scrape_outbox_dead (
+        id             bigint      PRIMARY KEY,
+        enqueued_at    timestamptz NOT NULL,
+        quarantined_at timestamptz NOT NULL DEFAULT now(),
+        failure        text COLLATE "C" NOT NULL,
+        body           jsonb       NOT NULL
+    )
+    """,
+
+    # ---------------- 事件流：只追加，唯一写入者是 relay ----------------
+    # 逐列照抄计划 §2.1，只补了 D-10 的 COLLATE "C"（字节序，扛得住
+    # 「恢复进另一台 collation 不同的库」）。
+    """
+    CREATE TABLE IF NOT EXISTS scraper.scrape_events (
+        seq           bigserial   NOT NULL,
+        source_id     text COLLATE "C" NOT NULL,
+        gen           text COLLATE "C" NOT NULL,
+        asin          text COLLATE "C" NOT NULL,
+
+        marketplace   text COLLATE "C" NOT NULL
+                      CHECK (marketplace IN ('amazon.com')),
+        zip_requested text COLLATE "C" NOT NULL,
+        zip_observed  text COLLATE "C",
+        zip_verify    text COLLATE "C" NOT NULL,
+
+        collected_at  timestamptz NOT NULL,
+        recorded_at   timestamptz NOT NULL,
+
+        outcome       text COLLATE "C" NOT NULL,
+        completeness  int         NOT NULL DEFAULT 0,
+        error_type    text COLLATE "C",
+        error_detail  text COLLATE "C",
+        batch_id      bigint,
+        task_id       bigint,
+        worker_id     text COLLATE "C",
+        attempt       int         NOT NULL DEFAULT 0,
+        parse_engine  text COLLATE "C",
+
+        review_hash   text COLLATE "C",
+        slow_hash     text COLLATE "C",
+        hash_ver      int         NOT NULL DEFAULT 1,
+
+        payload       jsonb       NOT NULL,
+        PRIMARY KEY (seq)
+    ) PARTITION BY RANGE (seq)
+    """,
+
+    # ---------------- 同步元数据 ----------------
+    # 键：contract_version / gen / instance_id / max_seq_ever / ack_seq / ...
+    """
+    CREATE TABLE IF NOT EXISTS scraper.sync_meta (
+        k text COLLATE "C" PRIMARY KEY,
+        v text COLLATE "C" NOT NULL
+    )
+    """,
+]
+
+#: 父表级索引（会自动传播到每个分区）。**在 p0 建好之后再建**，
+#: 这样 p0 也会拿到它。/counts 按时间分桶要用。
+EVENT_PARENT_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS scrape_events_recorded_at_idx "
+    "ON scraper.scrape_events (recorded_at)"
+)
+
+
+def event_partition_name(index: int) -> str:
+    return f"{EVENT_PARTITION_PREFIX}{index}"
+
+
+def event_partition_source_id_index(index: int) -> str:
+    """逐分区的 source_id 唯一索引名。
+
+    ⚠ 这一条不能建在父表上（PG 16 会以 FeatureNotSupportedError 拒绝，
+    因为唯一约束必须包含分区键 seq）。所以每个分区自己带一条。
+    """
+    return f"{event_partition_name(index)}_source_id_key"
+
+
+def event_create_first_partition_sql(span: int = None) -> List[str]:
+    """p0：``FROM (MINVALUE) TO (span)``，外加它自己的 source_id 唯一索引。
+
+    p0 必须用 ``PARTITION OF`` 直建（此刻还没有可 LIKE 的模板分区）。
+    这只在建库时发生，那时不可能有 relay 在写，所以
+    ``PARTITION OF`` 会拿的 ACCESS EXCLUSIVE 不会挡住任何人。
+    后续分区一律走 create-then-ATTACH，见 event_next_partition_sql()。
+    """
+    span = EVENT_PARTITION_SPAN if span is None else span
+    p0 = event_partition_name(0)
+    return [
+        f"CREATE TABLE IF NOT EXISTS scraper.{p0} "
+        f"PARTITION OF scraper.scrape_events "
+        f"FOR VALUES FROM (MINVALUE) TO ({span})",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {event_partition_source_id_index(0)} "
+        f"ON scraper.{p0} (source_id)",
+    ]
+
+
+def event_next_partition_sql(index: int, lo: int, hi: int,
+                             template: str) -> List[str]:
+    """新分区的三步配方。实测（part_probe.py / part_probe2.py）：
+
+    * ``CREATE TABLE ... PARTITION OF`` 会对父表拿 **ACCESS EXCLUSIVE**，
+      有写事务开着时**阻塞** > 3s —— 也就是会卡死 relay 自己。
+      ``ATTACH PARTITION`` 只拿 SHARE UPDATE EXCLUSIVE，实测不阻塞。
+      所以是 create standalone → ATTACH，不是 PARTITION OF。
+    * ``LIKE <父表> INCLUDING ALL`` 会**静默漏掉** source_id 唯一索引
+      （那条索引长在 p0 上，不在父表上）：
+        LIKE parent INCLUDING ALL -> ['..._pkey', '..._recorded_at_idx']   ← 少一条
+        LIKE p0     INCLUDING ALL -> ['..._pkey', '..._recorded_at_idx', '..._source_id_idx']
+      抄父表得到的是一个**没有重复保护**的分区，而且不报错。
+      所以模板必须是**某个已存在的分区**。
+    * 先手工挂上等价的 CHECK，ATTACH 时就能跳过全表校验扫描。
+    """
+    name = event_partition_name(index)
+    return [
+        f"CREATE TABLE IF NOT EXISTS scraper.{name} "
+        f"(LIKE scraper.{template} INCLUDING ALL)",
+        f"ALTER TABLE scraper.{name} ADD CONSTRAINT {name}_range "
+        f"CHECK (seq >= {lo} AND seq < {hi})",
+        f"ALTER TABLE scraper.scrape_events ATTACH PARTITION scraper.{name} "
+        f"FOR VALUES FROM ({lo}) TO ({hi})",
+    ]
+
+
+#: 已挂载分区的名字与范围上界。``pg_get_expr`` 产出形如
+#: ``FOR VALUES FROM (MINVALUE) TO ('20000000')``，边界值会被引号包起来。
+EVENT_LIST_PARTITIONS_SQL = """
+SELECT c.relname AS name, pg_get_expr(c.relpartbound, c.oid) AS bound
+  FROM pg_class c
+  JOIN pg_inherits i ON i.inhrelid = c.oid
+  JOIN pg_class p    ON p.oid = i.inhparent
+  JOIN pg_namespace n ON n.oid = p.relnamespace
+ WHERE n.nspname = 'scraper' AND p.relname = 'scrape_events'
+ ORDER BY c.relname
+"""
+
+#: 事件表的列集/列序。不进 verify_schema()（那道闸门只看 public），
+#: 由 relay.init_event_stream() 自查——列顺序在这里不是 API 契约，
+#: 但「少了一列」必须立刻炸而不是等到第一次 INSERT。
+EVENT_EXPECTED_COLUMNS: Dict[str, List[str]] = {
+    "scrape_outbox": ["id", "enqueued_at", "body"],
+    "scrape_outbox_dead": ["id", "enqueued_at", "quarantined_at", "failure", "body"],
+    "scrape_events": [
+        "seq", "source_id", "gen", "asin", "marketplace", "zip_requested",
+        "zip_observed", "zip_verify", "collected_at", "recorded_at", "outcome",
+        "completeness", "error_type", "error_detail", "batch_id", "task_id",
+        "worker_id", "attempt", "parse_engine", "review_hash", "slow_hash",
+        "hash_ver", "payload",
+    ],
+    "sync_meta": ["k", "v"],
+}
+
+
 class SchemaMixin:
     """DDL。只依赖 PoolMixin 提供的 ``self._db`` / ``self._pool``。"""
 
@@ -403,6 +645,26 @@ class SchemaMixin:
                 logger.info("数据库迁移: 回填 %d 个老批次为 completed", n)
         except Exception as e:  # noqa: BLE001
             logger.warning("老批次 backfill 异常: %s", e)
+
+        # ---- 事件流（Phase 2）：scraper schema 下的四张表 + 分区 + gen ----
+        #
+        # ⚠ 这一处偏离设计规格 §3.2 的「不要从 init_tables() 建事件流表」，
+        # 理由是被另外两条约束逼出来的，不是随手加的：
+        #   * 规格 §1.4 要求把 relay 的入口名加进 tests/golden/harness.py 的
+        #     _PATCHED_LOOPS —— 也就是**黄金重放时 relay 任务被 no-op 掉**。
+        #   * 而写钩子（results_write.py，规格 §1.1）在 `DB_BACKEND=postgres`
+        #     的黄金重放里**照样每写一条结果就 INSERT 一次 outbox**。
+        # 于是「建表只发生在 relay 启动时」= 黄金 PG 重放第一次写结果就
+        # `UndefinedTableError: relation "scraper.scrape_outbox" does not exist`，
+        # 并且那条错误发生在写事务里，会连同整批结果一起回滚。
+        # init_tables() 是我唯一够得着的 connect() 期入口（pool.py:860），
+        # 所以建表挂在这里。EXPECTED_COLUMNS / verify_schema() 一个字没动，
+        # scraper.* 对那道闸门仍然不可见（它比对的是 table_schema='public'）。
+        #
+        # hasattr 守卫：允许有人把 SchemaMixin 单独拼进一个没有事件流的
+        # Database 里（tests/pgdb/test_skeleton.py 就在直接调 init_tables）。
+        if hasattr(self, "init_event_stream"):
+            await self.init_event_stream()
 
     async def verify_schema(self, strict: bool = True) -> List[str]:
         """比对实际列序与 EXPECTED_COLUMNS。返回问题列表（空 = 一致）。

@@ -153,6 +153,12 @@ _PATCHED_LOOPS = (
     "_auto_scrape_scheduler",
     "_completion_watcher",
     "_callback_dispatcher",
+    # Phase 2 事件流 relay。它会持续把 scraper.scrape_outbox 抽干进
+    # scraper.scrape_events，那两张表在基线里不可见，但后台任务本身会持有
+    # 一条连接、每秒开一次事务——录制期必须像其余四个循环一样静音。
+    # 事件流的**建表**不在这里，在 connect() 期（common/pgdb/schema.py 的
+    # init_tables 末尾），所以 no-op 掉这个循环不会让写钩子撞上缺表。
+    "_scrape_event_relay",
 )
 
 

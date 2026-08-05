@@ -52,9 +52,23 @@ async def test_xxx(pgdb):     # pgdb 夹具 = 一个全新的临时库，用完�
 | `tests/pgdb/helpers.py` + `conftest.py` | ✅ 已完成（临时库夹具） | 骨架 |
 | `tests/pgdb/test_skeleton.py` | ✅ 已完成（21 条契约自检） | 骨架 |
 | `tests/pgdb/test_concurrency.py` | ✅ 已完成（单写连接并发回归） | 收口 |
+| **Phase 2 —— 事件流（PG 独有，SQLite 上零字节）** | | |
+| `common/slowhash.py` | ✅ 已完成（§4 哈希规格，纯 stdlib，零 `common.*` 依赖） | agent hash |
+| `common/pgdb/relay.py` | ✅ 已完成（`EventStreamMixin`：`_emit_outbox` / 引导 / relay / 分区 / 指标） | agent schema-relay |
+| `common/pgdb/outbox.py` | ✅ 已完成（写钩子侧胶水：payload 定形、`EventContext`、stale 独立事务） | agent write-hooks |
+| `common/pgdb/schema.py` 的事件流 DDL 段 | ✅ 已完成（追加在 `SchemaMixin` 之前；遗留 DDL / `EXPECTED_COLUMNS` / `verify_schema` 一个字没动） | agent schema-relay |
+| `tests/pgdb/test_relay.py` / `test_write_hooks.py` / `test_event_stream_wiring.py` | ✅ 74 条 | 各自 + 收口 |
+| `tests/test_slowhash.py` / `test_event_stream_endpoint.py` / `test_golden_with_relay.py` | ✅ 87 条（放 `tests/` 根，不进 `tests/pgdb/`——那里的 conftest 会 `importorskip("asyncpg")`，而这几条必须在无 PG 的机器上也跑） | 各自 + 收口 |
+| `tests/conftest.py` | ✅ 新增（全树事件循环修复，见 D-27） | 收口 |
 
 **Phase 1 状态：完工。** 两个后端各自 `64 步与基线完全一致`，
 `pytest tests/ -q` 全绿。收口阶段做的事见 §3 的 D-13 / D-14。
+
+**Phase 2 状态：完工。** 两个后端各自 `64 步与基线完全一致`；
+`pytest tests/ -q` = 427 passed / 6 skipped，`DB_BACKEND=postgres` 下 429 / 4。
+事件流的公开方法**一个都不在 `PUBLIC_API` 里**——那个元组是与 SQLite 的对等面契约，
+事件流是 PG 独有的增量。两道导入期自检对此安全：`_assert_api_complete` 只查"少了没有"，
+`_assert_single_owner` 只遍历已在 `PUBLIC_API` 里的名字。收口阶段做的事见 D-25..D-27。
 
 **没人碰 `common/database.py`。** 每个 agent 只碰自己那一个文件 + 自己的
 `tests/pgdb/test_<domain>.py`。骨架文件（pool / schema / __init__ / _shared /
@@ -159,6 +173,18 @@ tasks.py   欠 results_write : fail_task(...) -> {"accepted": bool, "stale": boo
 | **D-17** | `server/app.py` 的 7 个裸 `BEGIN` 块 + `common/pgdb/tasks.py` 的 3 个，一律补 `except BaseException: ROLLBACK; raise` | 原版没有回滚路径（照抄自 `common/database.py`）。SQLite 下这些语句基本不会失败；PG 下失败是常态，而事务是**粘在连接上**的状态：一次失败 → 写锁随异常释放、垫片事务槽不清 → 之后每一次 `BEGIN` 都撞"嵌套 BEGIN" → **整条写路径永久焊死，读却还是 200**（健康检查全绿）。实测 `POST /api/tasks/release {"task_ids":["1"]}` 这一个请求就够。补的代码**只在错误路径上跑**，成功路径一条语句都没多，两个后端的返回值/异常类型都没变（黄金 64 步逐字不动）。<br>捕 `BaseException` 而不是 `Exception`：这些块全在 HTTP handler 里，客户端断开会让 Starlette 取消请求协程，`CancelledError` 同样必须回滚（`batches.py` 的 `_tx()` 本来就是这个口径）。SQLite 侧同样会 wedge（`cannot start a transaction within a transaction`），所以这是**双向改进**而不是偏离。<br>⚠ 尚未统一：`tasks.py` 194/289/374/436、`media.py` 219/344/540、`results_write.py` 168/289/497 仍是 `except Exception`，取消场景照旧泄漏。归 Phase 1.5。 |
 | **D-18** | 三条不确定的 `ORDER BY` 补全序 tiebreaker（`app.py:341` / `1378` / `1385`） | 这三条的排序键都不是全序，而 `updated_at` 是**秒级**精度且 `accept_results_batch` 给整次提交盖同一个时间戳——于是 `LIMIT` 返回的是不确定的**行集合**，不只是顺序。实测：260 个任务一起失败，`/api/batches/{name}/errors` 的 200 行里 **60 行**两个后端不同；`app.py:341` 的 30 行里 10 行不同；`app.py:1378` 的并列组顺序完全不同。<br>写法对齐本来就正确的 `get_batch_failures`：`ORDER BY updated_at DESC NULLS LAST, id DESC`；`error_summary` 用 `ORDER BY cnt DESC, error_type NULLS FIRST`。`NULLS LAST`(DESC) / `NULLS FIRST`(ASC) 就是 SQLite 的默认（已实测），写出来只为让 PG 对齐，**SQLite 侧是 no-op**；文本序两边都是字节序（PG 靠 D-10 的 `COLLATE "C"`）。<br>**这是一处有意的 SQLite 行为改变**：并列时 SQLite 原来的顺序是任意的，现在被钉死。黄金基线不受影响（`errors_batch_a` 那一步两个数组都是空的），实测两个后端 64/64 不变。 |
 | **D-19** | `get_pending_screenshots` 补 `ORDER BY id`；`create_batch` 补 `except IntegrityConstraintViolationError: pass` | 前者是 `LIMIT` 没有 `ORDER BY`：SQLite 全表扫走 rowid（`screenshots.id` 就是 rowid），PG 走堆序，截图 `done→pending` 重试一次堆序就漂——实测 20 行 churn 8 行、`limit=5` → sqlite `[S001..S005]` / pg `[S009..S013]`。补的是"SQLite 今天实际产出的那个序"。<br>后者：`ON CONFLICT DO NOTHING` 只吞**唯一/排他**冲突，`INSERT OR IGNORE` 吞**所有**约束冲突，于是 `create_batch(None)` 从 sqlite 的返回 `0` 变成 pg 抛 `NotNullViolationError`。异常必须逃出 `_tx()` 之后才吞（PG 事务一 abort，同事务内再发语句就是 25P02）。identity **照样烧号**，两个后端实测一致。今天 app.py 到不了 `name=None`，属于防御。 |
+
+### Phase 2 决策（事件流）
+
+| # | 决策 | 理由 |
+|---|---|---|
+| **D-21** | `UNIQUE(source_id)` 建在**分区**上，不建在父表上；relay 用**无目标** `ON CONFLICT DO NOTHING` | 计划 §2.1 第 278 行照抄会被 PG 16 直接拒绝：`FeatureNotSupportedError: unique constraint on partitioned table must include all partitioning columns`。连带：`ON CONFLICT (source_id)` 推断不出约束、抛 `InvalidColumnReferenceError`，只能用无目标形式（唯一的另一条唯一索引是 `seq` 主键，`bigserial` 撞不上）。**代价**：跨分区的重复 `source_id` 抓不到——可接受，relay 的认领→落库是单事务，一行不可能被处理两次；这道索引防的是「第二个 relay」，由单例锁挡住。**不要**为此加全局去重表，那正是分区要消掉的不可裁剪热点。 |
+| **D-22** | `gen` **复用**，只有全新库 / 检出回退才新铸 | 计划 §2.1 说「每次启动新铸」，但 §5.5 把 `gen` 变化定义为消费侧**硬停 + 全量对账**——每次启动新铸等于每次例行部署都触发一次全量对账。按 T11 的读法：`max(seq) < max_seq_ever` 才算回退，那时新铸并把序列 `setval` 推过历史高水位（必要时先建分区）。`gen` 仍然**逐行落库**：从快照恢复不得把历史重贴成新标签。`instance_id` 由 `SCRAPER_INSTANCE_ID` 配置，**永不自动铸造**（T12：它是人用来区分两个克隆的）。 |
+| **D-23** | 租约 `UPDATE` **绝不加 `RETURNING`**；要服务端事实就在同一事务里另发一条普通 `SELECT` | 实测：`普通 UPDATE 租约不匹配 -> rowcount=0，门触发 True`；`同一条 + RETURNING -> rowcount=-1，门触发 False`。`ConnProxy._run_unlocked` 见到 RETURNING 就走 `returns_rows` 分支返回 `Cursor(rows, -1)`，而 `-1 == 0` 是 False —— **租约门会放行每一条过期结果**，这是全系统安全性最高的一条谓词。`results_write.py:140/:219` 与 `tasks.py` 的那条 `FOR UPDATE` 只**加列**、不加 RETURNING（`row[0]` 仍是 `retry_count`）。 |
+| **D-24** | 新增死信表 `scraper.scrape_outbox_dead`（**计划外**） | 没有它，一行畸形到过不了 `NOT NULL`/`CHECK` 的 body 会永远卡在 `ORDER BY id` 队头，**整条流停摆**。策略是保守的：分区溢出（`23514` + "no partition"）与连接故障**绝不**隔离——那两类要保留计划要的「响亮停摆、零丢失」；只有批量已缩到 1 且连续失败 `RELAY_QUARANTINE_AFTER` 次，才把队头搬走，body 逐字节保留 + ERROR 日志 + 计数器。 |
+| **D-25** | 事件流 DDL 由 `SchemaMixin.init_tables()` 在 `connect()` 期建，**不**由 relay 启动时建 | 被两个约束夹死：黄金必须 no-op 掉 relay 循环（否则录制期后台任务改状态、样本不可重复），但**写钩子在 PG 黄金重放里照常触发**——建表若只在 relay 启动路径上，写钩子会在事务里撞上缺表。`verify_schema` / `EXPECTED_COLUMNS` 一个字没动：它们只比 `table_schema='public'`，`scraper.*` 对它们不可见，也必须保持不可见（那道门是防 `SELECT d.*` 把新列泄进 erpAPI 响应的）。 |
+| **D-26** | `start_event_relay` 在三个 `await` 点上重查 `stopping` / `start_epoch`；`stop_event_relay` 第一句就置 `stopping = True` | **实测泄漏**，不是防御性编程。`lifespan` 是 `create_task(relay)` → `yield` → `await stop()`，进程刚起来就关时（配置错误、健康检查失败、同进程内起停一次服务器）stop 跑到的时候 relay 还卡在 `asyncpg.connect()` 里，而 `relay_task` / `relay_conn` 要到 start 最后才被赋值 —— stop **什么都看不见、空转返回**，`db.close()` 之后 relay 才起来：<br>`关服之后：relay_state='running'  库上残留会话=1  残留 advisory lock=1`<br>`第二个实例 start_event_relay() -> False  state='refused'`<br>一条泄漏的连接 + 一把没人放的单例锁，而且同进程内再起的服务器被永久拒之门外、事件流静默不工作。修完 0 残留、第二个实例正常启动。回归由 `tests/pgdb/test_event_stream_wiring.py` 守（撤掉 `stopping` 标志即失败）。<br>连带：`relay_state` 增加 `starting` / `failed`，把「还没起来」「已经死了」「干净停了」分开——观测端点存在的唯一理由就是让停摆变响，三者同名等于没有观测。 |
+| **D-27** | 新增 `tests/conftest.py`：每个用例跑完把「当前事件循环」补回去 | `tests/test_session_slot.py:147` 用的是已废弃的 `asyncio.get_event_loop().run_until_complete(...)`，而 `asyncio.run(...)`（黄金夹具建/删临时库、事件流抽干）与 pytest-asyncio 都会把当前循环置空。原本 `tests/pgdb/conftest.py` 有一份同样的修复，靠的是 pgdb 用例**恰好排在** `test_session_slot` 前面；Phase 2 新增的两个 `tests/` 根文件按字母序落在中间，那份修复就够不着了——实测 26 个用例转红。提到全树级别，新测试文件不必各自记得。`tests/pgdb/conftest.py` 那份保留原样（带着自己的来龙去脉，重复无代价）。正解是把 `test_session_slot.py` 从 `get_event_loop()` 迁走，31 个用例的改动，与 Phase 2 无关，不在这里顺手做。 |
 
 ### 明确推迟到 Phase 1.5 / Phase 2 的（**别在 Phase 1 顺手做**）
 - `get_results` 的 COUNT 崩溃（D-8）与 COUNT(*) 重构。

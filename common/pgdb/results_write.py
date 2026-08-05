@@ -88,6 +88,42 @@ change_type='new' 的 asin_changes；UPDATE 分支做变动检测、且只在 is
 * UPDATE 分支写 asin_changes 时 ``batch_id`` 可能是 NULL；
   INSERT 分支的 'new'/'first_seen' 记录**只在 batch_id 为真时**才写。
 * ``val is not None`` 才进动态列 —— 空串 ``""`` 会被写进去，不是跳过。
+
+--------------------------------------------------------------------------
+五、Phase 2 事件流写钩子（本文件里所有 ``emit_*`` 调用）
+--------------------------------------------------------------------------
+实现见 ``common/pgdb/outbox.py``（模块级函数，不是 mixin —— 私有方法重名在 MRO
+下会被静默遮蔽，而 relay 由另一个人写）。SQLite 后端上本文件根本不在调用链里，
+所以"no-op"是结构性的，不是运行期守卫。
+
+不变式（规格 §2.5）：**每一次终态尝试恰好一行 outbox，且与它所描述的状态变更在
+同一个事务里**（stale 除外，见下）。重新入队的分支一行都不发。
+
+  路径          终态                       outcome              发射点
+  S1  租约不匹配                          stale                ROLLBACK 之后，独立事务
+  S2  server_reject                        parse_failed         COMMIT 之前，同一事务
+  S3  写入成功                             ok / not_found       §1.1 钩子（inner 函数内）
+  S4  写入返回 False（空 asin）             parse_failed         调用点，同一事务
+  B1  无 task_id 直写                      ok / not_found       §1.1 钩子
+  B3  批量·租约不匹配                      stale                内联，批事务
+  B4  批量·server_reject                   parse_failed         内联，批事务
+  B5  批量·写入成功                        ok / not_found       §1.1 钩子
+  B6  批量·写入返回 False                   parse_failed         内联，批事务
+  B7  批量·失败项找不到行                   stale                内联，批事务
+  B8  批量·失败项达上限                     由 error_type 映射    内联，批事务
+  B9  批量·失败项重新入队                   —— 不发
+  save_result 的解析失败早退                —— 不发（无任务、未写库；与 B1 不对称，
+                                              是从 SQLite 忠实继承的现状）
+
+三条不许碰的红线：
+  * 租约 UPDATE（:140 / :219）**绝不加 RETURNING**。加了之后 ConnProxy 走
+    ``returns_rows`` 分支返回 ``rowcount=-1``，``-1 == 0`` 为 False，
+    租约门会放行每一条过期结果。要 ``attempt`` 就另发一条 SELECT
+    （``outbox.task_facts``，走 PK 索引，事务持有者自己的读不改道）。
+  * **不加** ``record_stage("save_record", ...)``，也不加新的 ``_write_lock(name)``：
+    黄金 step 56 钉死了 stage_timings 的 4 个 key 与 waits/holds 的 3 个 caller key。
+  * body 一律由**提交上来的 data** 构造，绝不回读 ``asin_data``——那一行是跨时间
+    合并出来的，事件必须是"一次完整采集"。
 """
 from __future__ import annotations
 
@@ -109,6 +145,15 @@ from common.pgdb._shared import (  # noqa: F401
     _normalize_screenshot_path,
     record_stage,
 )
+from common.pgdb.outbox import (
+    emit,
+    emit_result_event,
+    emit_stale_event,
+    emit_stale_event_own_tx,
+    result_context,
+    scoped_context,
+)
+from common.pgdb.relay import outcome_for_error_type
 from common.pgdb.pool import text_affinity  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -145,7 +190,20 @@ class ResultsWriteMixin:
                 )
                 if cursor.rowcount == 0:
                     await self._db.execute("ROLLBACK")
+                    # S1：stale 也是一次终态尝试，必须进流（规格 §2.3）。
+                    # reclaim_dead_worker_tasks 对"只是慢"的 worker 同样 bump epoch，
+                    # 于是这里丢掉的是一次**完整的、真实的**采集，不是重复提交。
+                    # 上面那条 ROLLBACK 一个字没改，事件另开一个事务（仍在写锁内）。
+                    await emit_stale_event_own_tx(
+                        self, task_id=tid, worker_id=wid, lease_epoch=epoch,
+                        data=data, batch_id=batch_id)
                     return {"accepted": False, "stale": True}
+
+                # 事件流要的服务端事实（attempt / zip_requested / asin）。
+                # 必须在租约门**之后**取：门没过就不该读，也不该发。
+                ev = await result_context(self, task_id=tid, worker_id=wid,
+                                          lease_epoch=epoch, data=data,
+                                          batch_id=batch_id)
 
                 # Step 2: 解析失败检测
                 if _is_parse_failure(data):
@@ -157,11 +215,33 @@ class ResultsWriteMixin:
                         "error_detail='parse_failure_on_server' WHERE id=?",
                         (tid,)
                     )
+                    # S2：与那条降级 UPDATE 同一个事务
+                    await emit(
+                        self, outcome="parse_failed",
+                        asin=(asin.strip() if isinstance(asin, str) else asin),
+                        data=data, batch_id=batch_id,
+                        error_type="server_reject",
+                        error_detail="parse_failure_on_server",
+                        **(ev.as_kwargs() if ev is not None else {}))
                     await self._db.execute("COMMIT")
                     return {"accepted": True, "saved": False, "server_reject": True}
 
                 # Step 3: 写入 asin_data（事务内，不拿锁不开新事务）
-                saved = await self._save_result_inner_unlocked(data, batch_id)
+                # S3 的事件在 _save_result_inner_unlocked 内部发（规格 §1.1），
+                # ctx 只能走实例属性传进去——那个方法的签名被
+                # test_signatures_match_sqlite 逐字钉死。
+                with scoped_context(self, ev):
+                    saved = await self._save_result_inner_unlocked(data, batch_id)
+
+                if not saved:
+                    # S4：`saved is False` ⟺ payload 里没有 asin ⟺ §1.1 的钩子没发。
+                    # 这是 _save_result_inner_unlocked 唯一返回 False 的分支，判定精确。
+                    # 任务照样是 done（终态），所以必须有一条事件。
+                    await emit(
+                        self, outcome="parse_failed", asin="",
+                        data=data, batch_id=batch_id,
+                        error_detail="empty_asin",
+                        **(ev.as_kwargs() if ev is not None else {}))
 
                 await self._db.execute("COMMIT")
                 return {"accepted": True, "saved": saved}
@@ -206,11 +286,16 @@ class ResultsWriteMixin:
                     if not task_id:
                         # 无 task_id 的直接写入
                         if is_success and data:
+                            # B1：没有 tasks 行可读，zip_requested 只能退回 payload
+                            # 里的 zip_code，并在 body 里标 zip_requested_source。
+                            ev = await result_context(self, worker_id=wid, data=data)
                             _t = time.monotonic()
-                            saved = await self._save_result_inner_unlocked(data, batch_id)
+                            with scoped_context(self, ev):
+                                saved = await self._save_result_inner_unlocked(data, batch_id)
                             record_stage("save_result", (time.monotonic() - _t) * 1000)
                             if saved:
                                 accepted += 1
+                        # B2（非成功 / 无 data）：什么都没发生，也就没有终态尝试，不发事件。
                         continue
 
                     if is_success:
@@ -224,7 +309,16 @@ class ResultsWriteMixin:
                         record_stage("update_tasks_lease", (time.monotonic() - _t) * 1000)
                         if cursor.rowcount == 0:
                             stale += 1
+                            # B3：这里只是 `continue`，批事务照常在末尾提交，
+                            # 所以事件直接进本事务，不需要 S1 那个独立事务。
+                            await emit_stale_event(
+                                self, task_id=tid, worker_id=wid,
+                                lease_epoch=epoch, data=data, batch_id=batch_id)
                             continue
+
+                        ev = await result_context(self, task_id=tid, worker_id=wid,
+                                                  lease_epoch=epoch, data=data,
+                                                  batch_id=batch_id)
 
                         # 解析失败检测
                         if _is_parse_failure(data):
@@ -234,16 +328,32 @@ class ResultsWriteMixin:
                                 (tid,)
                             )
                             failed += 1
+                            # B4
+                            _asin = data.get("asin", "")
+                            await emit(
+                                self, outcome="parse_failed",
+                                asin=(_asin.strip() if isinstance(_asin, str) else _asin),
+                                data=data, batch_id=batch_id,
+                                error_type="server_reject",
+                                error_detail="parse_failure_on_server",
+                                **(ev.as_kwargs() if ev is not None else {}))
                             continue
 
                         # 写入 asin_data
                         _t = time.monotonic()
-                        saved = await self._save_result_inner_unlocked(data, batch_id)
+                        with scoped_context(self, ev):      # B5 的事件在 inner 里发
+                            saved = await self._save_result_inner_unlocked(data, batch_id)
                         record_stage("save_result", (time.monotonic() - _t) * 1000)
                         if saved:
                             accepted += 1
                         else:
                             failed += 1
+                            # B6：空 asin，钩子没发过，任务却已经是 done
+                            await emit(
+                                self, outcome="parse_failed", asin="",
+                                data=data, batch_id=batch_id,
+                                error_detail="empty_asin",
+                                **(ev.as_kwargs() if ev is not None else {}))
                     else:
                         # 失败结果：校验 lease 后标记失败/重试
                         error_type = data.get("error_type", "")
@@ -254,13 +364,23 @@ class ResultsWriteMixin:
                         # ⚠ 下面两条 UPDATE 只有 WHERE id=?（既无 lease 谓词也无
                         #   rowcount 检查），比 fail_task 更弱——**是已知 bug，照抄**。
                         #   见 .agent/catalog_sync_audit.md:167，修复排在后续阶段。
+                        # ⚠ 多选出来的 4 列**只**给事件流用：``row[0]`` 仍然是
+                        #   retry_count，下面一个字都没改。这是加列不是加 RETURNING
+                        #   ——后者会让 rowcount 变成 -1 而毁掉租约门（见文件头 §五）。
                         async with self._db.execute(
-                            "SELECT retry_count FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing' FOR UPDATE",
+                            "SELECT retry_count, asin, zip_code, batch_id AS task_batch_id, "
+                            "COALESCE(auto_retry_count, 0) AS auto_retry_count "
+                            "FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing' FOR UPDATE",
                             (tid, wid, epoch)
                         ) as c:
                             row = await c.fetchone()
                         if not row:
                             stale += 1
+                            # B7：失败项也是一次终态尝试被丢弃，同样进流。
+                            await emit_stale_event(
+                                self, task_id=tid, worker_id=wid,
+                                lease_epoch=epoch, data=data, batch_id=batch_id,
+                                error_type=error_type, error_detail=error_detail)
                             continue
                         retry_count = row[0] + 1
                         # 按 error_type 决定该任务的失败上限
@@ -274,6 +394,29 @@ class ResultsWriteMixin:
                                  self.text_affinity(error_detail), now, tid)
                             )
                             failed += 1
+                            # B8：终态失败。attempt 用**已经自增过**的值
+                            # （= 这次是第几次尝试），asin/zip 来自上面那条
+                            # SELECT ——失败 payload 里没有 asin
+                            # （worker/engine.py:1647 只发 error_type/error_detail）。
+                            # outcome 用 text_affinity 之后的值：error_type 来自
+                            # 未经校验的 JSON，`(True or "").strip()` 会
+                            # AttributeError。上一条 UPDATE 已经调用过同一个
+                            # 函数，所以这里不会引入新的失败面。
+                            await emit(
+                                self,
+                                outcome=outcome_for_error_type(
+                                    self.text_affinity(error_type)),
+                                asin=row["asin"], data=data, task_id=tid,
+                                batch_id=(batch_id if batch_id is not None
+                                          else row["task_batch_id"]),
+                                worker_id=wid,
+                                lease_epoch=epoch, attempt=retry_count,
+                                auto_retry_count=row["auto_retry_count"],
+                                zip_requested=(row["zip_code"] if row["zip_code"] is not None
+                                               else data.get("zip_code")),
+                                zip_requested_source=("task" if row["zip_code"] is not None
+                                                      else "payload"),
+                                error_type=error_type, error_detail=error_detail)
                         else:
                             await self._db.execute(
                                 "UPDATE tasks SET status='pending', retry_count=?, error_type=?, error_detail=?, "
@@ -282,6 +425,9 @@ class ResultsWriteMixin:
                                  self.text_affinity(error_detail), now, tid)
                             )
                             # 重新入队不计入 accepted；若后续需要单独统计可在此累加 requeued
+                            # B9：重新入队**不是**终态尝试，不发事件。
+                            # 这条任务将来还会再产生一次终态尝试（成功或达上限），
+                            # 那一次才有事件。规格 §2.5 的"requeue 静默"用例守着它。
 
                 _t = time.monotonic()
                 await self._db.execute("COMMIT")
@@ -318,6 +464,26 @@ class ResultsWriteMixin:
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         data["content_hash"] = _compute_content_hash(data)
         data["title_bullets_hash"] = _compute_title_bullets_hash(data)
+
+        # ================= Phase 2 事件流写钩子（规格 §1.1 的 H3）=================
+        # 位置是承重的，三条理由各自独立：
+        #   1. 它是本函数"只计算、还没碰过库"的最后一个点。**之后每一条语句都可能
+        #      失败**，钩子必须与写入处在同一个失败域里（同一事务，一起提交或
+        #      一起回滚）。
+        #   2. 它在两处 hash 赋值**之后**，所以 body 带的 content_hash /
+        #      title_bullets_hash 与这次落进 asin_data 的行完全一致。
+        #   3. 它在 `if not asin: return False` 早退**之后**，所以没有 asin 的提交
+        #      不从这里产生事件（由调用方按 S4 / B6 记 parse_failed）。
+        # body 用**提交上来的 data**，绝不回读 asin_data：下面那两个
+        # `if val is not None` 的循环不改 data，但它们会让**行**跨时间携带旧值
+        # （实测只剩 rating / review_count / seller_id / seller_name 四个字段真的
+        # 会结转，因为 content_hash / title_bullets_hash 在上面已经无条件赋过值），
+        # 而事件必须是"一次完整采集"，不是一条跨时间合并出来的记录。
+        # ⚠ 结论要写进 Phase 3 契约：lxml 回退路径与所有早退路径上，
+        #   rating / review_count / seller_id / seller_name 在 payload 里是**缺席**
+        #   （不是 null、更不是旧值）。缺席 ≠ null ≠ 旧值。
+        await emit_result_event(self, data, batch_id)
+        # =========================================================================
 
         # 查询批次是否为定时采集
         is_auto = False
@@ -486,12 +652,21 @@ class ResultsWriteMixin:
         if not asin:
             return False
         if _is_parse_failure(data):
+            # ⚠ 这条早退**不发事件**：没有任务、也没往库里写任何东西。
+            #   注意与 B1 的不对称——accept_results_batch 的无 task_id 分支
+            #   **不做** _is_parse_failure 检测，于是同样一份 payload 走 B1 会有
+            #   事件、走这里没有。这是从 SQLite 版忠实继承的现状，写下来，别顺手修。
             logger.warning(f"解析失败数据跳过: {asin}")
             return False
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
-                result = await self._save_result_inner_unlocked(data, batch_id)
+                # 无 task_id 直写：zip_requested 只能取 payload 里的 zip_code，
+                # body 里会带 zip_requested_source="payload" 标出来。
+                ev = await result_context(self, worker_id=data.get("worker_id"),
+                                          data=data)
+                with scoped_context(self, ev):
+                    result = await self._save_result_inner_unlocked(data, batch_id)
                 await self._db.execute("COMMIT")
                 return result
             except Exception:

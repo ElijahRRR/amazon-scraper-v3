@@ -175,6 +175,42 @@ def _register_worker(worker_id: str, enable_screenshot: bool = None, ip: str = N
 
 # ==================== 生命周期 ====================
 
+async def _scrape_event_relay():
+    """Phase 2 事件流 relay 的进程入口（**PostgreSQL 专属**）。
+
+    SQLite 后端下整个事件流一个字节的代码都不跑：``common.database.Database``
+    压根没有这些方法，这里直接返回。这比运行期 ``if is_postgres()`` 守卫更强
+    —— SQLite 路径上不存在可以走错的分支。
+
+    单例由 ``pg_try_advisory_lock`` 保证：滚动部署时第二个进程拿不到锁，
+    ``start_event_relay()`` 返回 False 并安静退出（见 common/pgdb/relay.py）。
+
+    ⚠ 异常必须在这里落日志。本协程是 ``asyncio.create_task`` 起来的，没人
+    ``await`` 它的结果：不接的话，relay 起不来这件事只会以一句 GC 期的
+    "Task exception was never retrieved" 出现（甚至完全不出现），而现象是
+    HTTP 全部正常、outbox 无声无息地涨到撑爆磁盘。事件流停摆必须是**响的**。
+    """
+    from common.dbfactory import is_postgres
+    if not is_postgres() or db is None or not hasattr(db, "run_event_relay"):
+        return
+    try:
+        await db.run_event_relay()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "事件流 relay 异常退出——采集与 HTTP 不受影响，但 scrape_outbox "
+            "会持续堆积且没有新事件产生。请检查 /api/_debug/event-stream。")
+
+
+async def _stop_scrape_event_relay():
+    if db is not None and hasattr(db, "stop_event_relay"):
+        try:
+            await db.stop_event_relay()
+        except Exception:
+            logger.exception("停止事件流 relay 失败（继续关闭数据库）")
+
+
 @asynccontextmanager
 async def lifespan(app):
     global db, _callback_send_queue
@@ -198,7 +234,9 @@ async def lifespan(app):
     # 启动期 optimize 改为异步：服务先就绪、worker 先能拉任务，ANALYZE 后台慢慢做
     # （此前同步执行在 2.4GB 库上会阻塞启动 2~3 分钟）
     asyncio.create_task(db.run_startup_optimize())
+    asyncio.create_task(_scrape_event_relay())
     yield
+    await _stop_scrape_event_relay()
     if db:
         await db.close()
     logger.info("服务器关闭")
@@ -2687,6 +2725,39 @@ async def api_debug_lock_stats():
         "slow_holds_recent": LOCK_STATS["slow_holds"][-50:],
         "slow_holds_count": len(LOCK_STATS["slow_holds"]),
     }
+
+
+@app.get("/api/_debug/event-stream", include_in_schema=False)
+async def api_debug_event_stream():
+    """Phase 2 事件流的可观测面：outbox 深度、relay 滞后、每分钟事件数、
+    seq 窗口、分区、死信、计数器。
+
+    三条约束决定了它长这样：
+
+    * **``include_in_schema=False``**。``/openapi.json`` 是黄金基线的第 5 步，
+      逐字节钉死；新端点只要进了 schema，64 步当场挂。同一个理由写在计划
+      §Phase 3 里（sync router 也是这么挂的）。
+    * **不动任何既有响应**。指标本来最自然的去处是 ``/api/diagnostic``，
+      但那个端点是基线 step 55，多一个 key 就是"字段出现"差异。所以另开一个
+      端点，而不是往老的里塞。
+    * **两个后端都必须能回**。SQLite 上事件流在结构上就不存在，这里如实回
+      ``enabled: false`` 而不是 404 或 500 —— 运维拿同一个 URL 探两种部署。
+    """
+    from common.dbfactory import get_backend, is_postgres
+
+    out = {"backend": get_backend(), "enabled": False}
+    if not is_postgres() or db is None or not hasattr(db, "event_stream_stats"):
+        # SQLite：事件流是 PG 专属，这不是错误状态。
+        out["reason"] = "event stream is postgres-only"
+        return out
+    out["enabled"] = True
+    try:
+        out.update(await db.event_stream_stats())
+    except Exception as e:  # noqa: BLE001
+        # 观测端点自己不许把服务搞挂：库还没引导好 / 表还没建时如实报错。
+        out["error"] = f"{type(e).__name__}: {e}"
+        out.update(db.event_relay_metrics())
+    return out
 
 
 @app.post("/api/_debug/lock-stats/reset")

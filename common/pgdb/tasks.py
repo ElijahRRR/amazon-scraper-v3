@@ -73,6 +73,26 @@ fail_task
     包括那个 FOR UPDATE 之后已经走不到的 ``rowcount == 0 -> stale`` 分支。
   * 返回 {"accepted": bool, "stale": bool}。
 
+--------------------------------------------------------------------------
+Phase 2 事件流写钩子（本文件只有 fail_task 一处）
+--------------------------------------------------------------------------
+实现在 ``common/pgdb/outbox.py``；SQLite 后端上本文件不在调用链里，所以 no-op
+是结构性的。规格 §2.1 的三条终态路径：
+
+  F1  SELECT 没找到行          任务不变      **stale**             ROLLBACK 之后，独立事务
+  F2  retry_count >= cap        failed        由 error_type 映射    COMMIT 之前，同一事务
+  F3  重新入队                  pending       ——不发（不是终态尝试）
+  F4  FOR UPDATE 之后 rowcount=0                ——不发（该分支随后就 ROLLBACK，
+      从一个即将回滚的分支里发事件在物理上做不到；补一条 logger.error 让它真发生时可见）
+
+``accept_failed_result`` 是 fail_task 的一行封装，事件全部由本文件产生，
+它自己不发（否则同一次尝试两条事件）。
+
+那条 ``SELECT retry_count ... FOR UPDATE`` 多选了 asin / zip_code /
+auto_retry_count 三列给事件流用。**这是加列，不是加 RETURNING**：给下面两条
+UPDATE 加 RETURNING 会让 ConnProxy 走 returns_rows 分支返回 rowcount=-1，
+``-1 == 0`` 为 False，租约门失效。``row[0]`` 仍然是 retry_count。
+
 release_tasks
   * 入参 [{"task_id": int, "lease_epoch": int}, ...]，按 lease_epoch 分组
     各发一条 UPDATE；空输入返回 int 0。
@@ -112,6 +132,8 @@ from common.pgdb._shared import (  # noqa: F401
     LIMITED_RETRY_ERROR_TYPES,
     _fail_cap,
 )
+from common.pgdb.outbox import emit, emit_stale_event_own_tx
+from common.pgdb.relay import outcome_for_error_type
 
 logger = logging.getLogger(__name__)
 
@@ -411,14 +433,29 @@ class TasksMixin:
             try:
                 # 在同一事务内 SELECT + UPDATE，避免 TOCTOU（与 reclaim 循环并发时旧代码会静默失配）
                 # FOR UPDATE 把 SQLite 全局写锁提供的那段原子性补回来。
+                # 多选出来的 3 列只给事件流用；row[0] 仍是 retry_count（见文件头）。
                 async with self._db.execute(
-                    "SELECT retry_count FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? "
+                    "SELECT retry_count, asin, zip_code, batch_id, "
+                    "COALESCE(auto_retry_count, 0) AS auto_retry_count "
+                    "FROM tasks WHERE id=? AND worker_id=? AND lease_epoch=? "
                     "AND status='processing' FOR UPDATE",
                     (tid, wid, epoch)
                 ) as c:
                     row = await c.fetchone()
                 if not row:
                     await self._db.execute("ROLLBACK")
+                    # F1：租约被抢走（多半是 reclaim 对"只是慢"的 worker bump 了
+                    # epoch），这次尝试被丢弃 —— 规格 §2.3 要求它进流。
+                    # 上面那条 ROLLBACK 一个字没改：事件另开一个事务，仍在写锁内。
+                    # ⚠ 传 et/ed（已经过 text_affinity）而不是原始入参：
+                    #   `error_type` 来自未经校验的 request.json()，可能是 True /
+                    #   3.5 / None。原样塞进 body 会让 relay 拿一个 jsonb 布尔去绑
+                    #   text 列（→ DataError → 死信），而 `(True or "").strip()`
+                    #   在 outcome_for_error_type 里直接 AttributeError。
+                    #   et 与写进 tasks 行的值逐字相同，事件与库因此永远一致。
+                    await emit_stale_event_own_tx(
+                        self, task_id=tid, worker_id=wid, lease_epoch=epoch,
+                        error_type=et, error_detail=ed)
                     return {"accepted": False, "stale": True}
                 retry_count = row[0] + 1
 
@@ -443,8 +480,29 @@ class TasksMixin:
                 if cursor.rowcount == 0:
                     # 极罕见：事务内 SELECT 成功但 UPDATE 失配，按 stale 处理。
                     # 加了 FOR UPDATE 之后这条分支已经走不到，但删掉它是行为改变。
+                    # F4：本分支随后立刻回滚，从一个要回滚的分支里发事件在物理上
+                    # 做不到，所以不发；补一条 ERROR 让它真发生时不至于无声无息。
+                    logger.error(
+                        "fail_task: FOR UPDATE 之后 UPDATE 仍然失配"
+                        "（task_id=%s worker_id=%r lease_epoch=%s）——"
+                        "本次尝试不会产生事件流记录", tid, wid, epoch)
                     await self._db.execute("ROLLBACK")
                     return {"accepted": False, "stale": True}
+                if retry_count >= cap:
+                    # F2：终态失败。attempt 用**已经自增过**的 retry_count；
+                    # asin / zip_code 只能来自 tasks 行 —— 失败提交的 payload 里
+                    # 没有 asin（worker/engine.py:1647）。
+                    # F3（重新入队）不发：它不是终态尝试，将来还会再有一次。
+                    # et/ed 而不是原始入参，理由同上面 F1 那一处。
+                    await emit(
+                        self, outcome=outcome_for_error_type(et),
+                        asin=row["asin"], task_id=tid, batch_id=row["batch_id"],
+                        worker_id=wid, lease_epoch=epoch, attempt=retry_count,
+                        auto_retry_count=row["auto_retry_count"],
+                        zip_requested=row["zip_code"],
+                        zip_requested_source=("task" if row["zip_code"] is not None
+                                              else "payload"),
+                        error_type=et, error_detail=ed)
                 await self._db.execute("COMMIT")
             except Exception:
                 try:

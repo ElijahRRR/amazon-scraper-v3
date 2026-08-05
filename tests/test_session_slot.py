@@ -143,8 +143,40 @@ class FakeWorker:
         return s
 
 
+# 本模块自持的事件循环。**不要**改回 asyncio.get_event_loop()。
+#
+# 原来这里是 `asyncio.get_event_loop().run_until_complete(coro)`，依赖的是
+# 「当前线程的事件循环」这个**进程级全局槽位**。任何一句 asyncio.run(...) 结束时
+# 都会关闭自己的循环并把该槽位置空，而本仓库里有好几处正当的 asyncio.run：
+#   * tests/golden/harness.py:206-207   _pg_scratch_db 建库/删库
+#   * tests/test_golden_with_relay.py:86 抽干事件流
+#   * pytest-asyncio 每个 async 用例（跑完关闭并置空）
+# 这些文件按字母序排在 tests/test_session_slot.py **之前**，于是本模块 31 个用例
+# 是否通过，变成了「收集顺序 × 后端 × runner」的函数。实测（HEAD fea7395）：
+#
+#   DB_BACKEND=postgres python -m unittest discover -s tests
+#     -> Ran 51 tests ... FAILED (errors=26, skipped=4)
+#        26 × RuntimeError: There is no current event loop in thread 'MainThread'
+#
+# SQLite 下那两个文件走 skipTest、不跑 asyncio.run，所以只有 Postgres 侧翻红。
+# pytest 侧看不见，是因为 tests/conftest.py 有一个 autouse 夹具把槽位补回来——
+# 而 **unittest 根本不读 conftest.py**，同一份代码两个 runner 两种结果（B6）。
+#
+# 修法是拿掉这个依赖本身，而不是继续在别处打补丁：本模块自己持有一个循环，
+# 谁把全局槽位置空都伤不到它。仍然调用 set_event_loop()，一是保持与原来完全一致的
+# 语义（被测代码里若有 get_event_loop() 仍拿到同一个循环），二是顺手把槽位补上。
+# 复用同一个循环（而不是每次 asyncio.run）也是刻意的：31 个用例共享一个循环是
+# 原有行为，跨循环复用 asyncio 同步原语在 3.10+ 会抛 "bound to a different
+# event loop"，换成 per-call asyncio.run 等于自找一类新故障。
+_LOOP = None
+
+
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    global _LOOP
+    if _LOOP is None or _LOOP.is_closed():
+        _LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(_LOOP)
+    return _LOOP.run_until_complete(coro)
 
 
 class SessionSlotTests(unittest.TestCase):

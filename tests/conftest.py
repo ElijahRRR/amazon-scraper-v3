@@ -1,50 +1,62 @@
-"""tests/ 全树共用的夹具。
+"""tests/ 全树共用的 pytest 配置。
 
-目前只有一件事：**每个用例跑完把"当前事件循环"补回去**。
+**这里现在是空的，这是刻意的结果，不是忘了写。** 下面记录为什么。
 
-为什么需要它（这是实测出来的，不是预防性的）：
+## 曾经有什么
 
-``tests/test_session_slot.py:147`` 用的是
-``asyncio.get_event_loop().run_until_complete(coro)``。Python 3.11 下，一旦
-当前线程的事件循环被置空，这个调用就抛
-``RuntimeError: There is no current event loop in thread 'MainThread'``，
-那 31 个用例会成片挂掉。
+这里曾有一个 autouse 夹具 ``_restore_current_event_loop``：每个用例跑完，
+把被置空的「当前线程事件循环」补回去。它服务的是唯一一个受害者——
+``tests/test_session_slot.py`` 的 ``run()`` 助手，它当时写作
+``asyncio.get_event_loop().run_until_complete(coro)``，依赖那个**进程级全局槽位**。
 
-而置空它的路径有好几条，都是正当用法：
+置空该槽位的路径都是正当用法（``asyncio.run(...)`` 结束时关闭循环并置空）：
 
-* ``asyncio.run(...)`` —— 结束时关闭循环并把当前循环置空。
-  ``tests/golden/harness.py`` 的 ``_pg_scratch_db`` 建库/删库就是这么跑的，
-  ``tests/test_golden_with_relay.py`` 抽干事件流也是。
-* ``pytest-asyncio`` —— 每个 async 用例新建一个循环，结束时关闭并置空。
+* ``tests/golden/harness.py:206-207`` ``_pg_scratch_db`` 建库/删库
+* ``tests/test_golden_with_relay.py:86`` 抽干事件流
+* ``pytest-asyncio`` 每个 async 用例
 
-于是结果变成**收集顺序的函数**：``tests/pgdb/conftest.py`` 里原本有一份同样的
-修复，靠的是 pgdb 用例排在 ``test_session_slot`` 前面、跑完顺手把循环补上。
-Phase 2 新增的 ``tests/test_event_stream_endpoint.py`` /
-``tests/test_golden_with_relay.py`` 按字母序恰好落在 ``tests/pgdb/`` 之后、
-``tests/test_session_slot.py`` 之前，那份修复就够不着了——实测 26 个用例转红：
+它们按字母序都排在 ``test_session_slot.py`` 之前，于是那 31 个用例是否通过，
+成了「收集顺序 × 后端 × runner」的函数。
 
-    DB_BACKEND=postgres pytest tests/test_golden_with_relay.py tests/test_session_slot.py
-      -> 26 failed, 6 passed        （RuntimeError: There is no current event loop）
+## 为什么这个修法是错的（B6）
 
-所以把修复提到全树级别，而不是让每个新测试文件自己记得。``tests/pgdb/conftest.py``
-里那份保持原样：它带着自己那段来龙去脉，重复一次没有代价。
+``conftest.py`` 是 **pytest 专属**的，``unittest`` 根本不读它。而
+``unittest discover -s tests`` 是本仓库最早的 runner，两个后端都必须能跑。
+结果就是同一份代码两个 runner 两种结论——实测于 HEAD ``fea7395``：
 
-正确的长远解法是把 ``test_session_slot.py`` 从已废弃的 ``get_event_loop()`` 迁走，
-但那是 31 个用例的改动，与 Phase 2 无关，不在这里顺手做。
+    DB_BACKEND=postgres python -m unittest discover -s tests
+      -> Ran 51 tests ... FAILED (errors=26, skipped=4)
+         26 × RuntimeError: There is no current event loop in thread 'MainThread'
+    DB_BACKEND=postgres python -m pytest tests/ -q
+      -> 429 passed, 4 skipped                      ← 夹具把同一个缺陷盖住了
+
+SQLite 下那两个文件走 skipTest、不跑 ``asyncio.run``，所以只有 Postgres 侧翻红。
+
+一个「只在 pytest 下生效的修复」并不能让缺陷消失，只能让它对 pytest 隐身。
+留着它，下一个依赖全局槽位的用例还会重演一遍 B6：pytest 绿、unittest 红。
+
+## 现在的修法
+
+根因消灭在源头：``tests/test_session_slot.py`` 的 ``run()`` 改为自持一个事件循环，
+不再读那个全局槽位（那里有完整注释）。全树 ``grep -rn get_event_loop tests/``
+此后只剩注释，**没有任何用例依赖当前循环槽位**。
+
+于是这份夹具成了死代码，予以删除；``tests/pgdb/conftest.py`` 里那份同样如此。
+删除是经过实测的，不是推断——把两份夹具同时停用、只留根因修复：
+
+    pytest tests/ -q                     -> 427 passed, 6 skipped
+    DB_BACKEND=postgres pytest tests/ -q -> 429 passed, 4 skipped
+
+反证同样做了（还原 ``run()``、仍停用两份夹具）：
+
+    DB_BACKEND=postgres pytest tests/ -q -> 26 failed, 403 passed, 4 skipped
+
+即：这两份夹具当年确实在干活，只是干的是「替 pytest 遮住缺陷」这份活。
+
+## 留给后来者的约束
+
+不要在测试里用 ``asyncio.get_event_loop()``。要跑协程就用 ``asyncio.run(...)``，
+或者像 ``test_session_slot.py`` 那样自己持有循环。这条约束由
+``tests/test_runner_parity.py::EventLoopOwnershipTests`` 看守，它是 unittest
+用例，两个 runner 都会执行。
 """
-from __future__ import annotations
-
-import asyncio
-
-import pytest
-
-
-@pytest.fixture(autouse=True)
-def _restore_current_event_loop():
-    yield
-    try:
-        loop = asyncio.get_event_loop_policy().get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())

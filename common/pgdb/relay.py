@@ -13,9 +13,10 @@ OWNS（都不在 ``PUBLIC_API`` 里 —— 那个元组是 SQLite 对等面的�
 
     relay
         start_event_relay()  -> bool   拿单例锁 + 拉起后台任务；拿不到返回 False
-        run_event_relay()              app.py lifespan 用：启动并一直跑到被取消
+        run_event_relay()              app.py lifespan 用：**带重试**地保证本进程
+                                       一直在排队当 relay，直到被取消 / stop
         stop_event_relay()             取消 + 解锁 + 关连接
-        ensure_event_partitions()      提前建未来分区（永远 >= 2 个）
+        ensure_event_partitions()      提前建未来分区（永远 >= 2 个）+ 修 B1 遗留
 
     指标
         event_relay_metrics()  -> dict  纯内存计数器（同步，不碰库）
@@ -133,10 +134,12 @@ from common.pgdb.schema import (
     EVENT_CONTRACT_VERSION,
     EVENT_DEFAULT_MARKETPLACE,
     EVENT_EXPECTED_COLUMNS,
+    EVENT_FOREIGN_RANGE_CHECKS_SQL,
     EVENT_FUTURE_PARTITIONS,
     EVENT_LIST_PARTITIONS_SQL,
     EVENT_MARKETPLACES,
     EVENT_OUTCOMES,
+    EVENT_OWN_RANGE_CHECK_SQL,
     EVENT_PARENT_INDEX_SQL,
     EVENT_PARTITION_PREFIX,
     EVENT_PARTITION_SPAN,
@@ -165,6 +168,16 @@ RELAY_BATCH = int(os.environ.get("PG_RELAY_BATCH", "500"))
 
 #: 事务出错后的退避（秒）。
 RELAY_ERROR_BACKOFF = float(os.environ.get("PG_RELAY_ERROR_BACKOFF", "2.0"))
+
+#: ``run_event_relay`` 两次尝试之间的间隔（秒）。见那个方法的注释（B2）：
+#: 拿不到单例锁 / 启动期连库失败都必须**继续重试**，否则滚动重启之后可能一个
+#: relay 都不剩。5s：滚动部署的接管延迟可以接受，也不会把日志刷爆。
+RELAY_RETRY_SECONDS = float(os.environ.get("PG_RELAY_RETRY_SECONDS", "5.0"))
+
+#: 连续多少个 tick 全部失败，就判定「这条连接大概率已经死了」，去重开一条并
+#: 重抢单例锁（B3）。3 次 × RELAY_ERROR_BACKOFF ≈ 6s，短到不会让流白停，
+#: 长到一次偶发的死锁/超时不会触发一轮重连。
+RELAY_RECOVER_AFTER = int(os.environ.get("PG_RELAY_RECOVER_AFTER", "3"))
 
 #: 停机时每一步的上限（秒）。见 stop_event_relay 的注释：它跑在 lifespan 的
 #: db.close() 之前，无界等待 = 进程停不下来。
@@ -624,6 +637,15 @@ SELECT count(*) AS depth,
 # EventStreamMixin
 # ============================================================
 
+class _RelayHandedOver(Exception):
+    """重连时发现单例锁已被别人拿走 —— 交班，不是故障。
+
+    单独一个类型是为了让 ``_relay_main`` 能把它与真故障分开：真故障要
+    ``relay_state='failed'`` + ``logger.exception``（该报警），交班只要
+    ``'refused'`` + 一条 WARNING（该安静地排队等下一次机会）。
+    """
+
+
 class EventStreamMixin:
     """事件流：写钩子 + 引导 + relay + 指标。
 
@@ -673,9 +695,16 @@ class EventStreamMixin:
                     "zip_padded": 0,
                     "collected_at_fallback": 0,
                     "partitions_created": 0,
+                    "range_checks_repaired": 0,
                     "gen_minted": 0,
                     "rewinds_detected": 0,
+                    # B3：tick 连续失败到阈值之后重开连接 + 重抢单例锁的次数。
+                    "relay_reconnects": 0,
+                    "relay_restarts": 0,
                 },
+                # 连续失败的 tick 数（成功一次即清零）。到 RELAY_RECOVER_AFTER
+                # 就去重开连接——见 _relay_main / _relay_recover（B3）。
+                "consec_tick_fail": 0,
                 "last_tick_ms": 0.0,
                 "outbox_depth": 0,
                 "relay_lag_s": 0.0,
@@ -782,9 +811,28 @@ class EventStreamMixin:
                 "两个克隆部署会因此无法区分（计划 T12）——请在部署里配上。")
 
         # ---- gen：复用；只有全新库 / 检出回退才新铸 ----
+        #
+        # ⚠ 判据是**序列水位**，不是 ``max(seq)``（B4）。原来写的是
+        # ``actual < ever``，那有一条 Phase 6 一定会踩的假阳性：保留期一旦把
+        # ``scrape_events`` 清空（DROP 掉全部分区、或 TRUNCATE），``max(seq)``
+        # 归零，而 ``max_seq_ever`` 还留在 meta 表里 —— 于是一次**普通重启**就铸出
+        # 新 gen，消费侧按契约 §5.5 硬停 + 全量对账。实测每次 TRUNCATE 必现：
+        #     事件流倒退：max(seq)=0 < max_seq_ever=1001 ... 铸新 gen
+        #
+        # 真正要防的是「seq 会被**重新发**一遍」：同一个 seq 第二次出现、内容却不同，
+        # 消费者的游标就永久错位。而 seq 由 bigserial 发号，**序列不随分区 DROP
+        # 回退**（也不随不带 RESTART IDENTITY 的 TRUNCATE 回退）。所以：
+        #     水位 = max(max(seq), 序列已发出的最大值)
+        #     水位 < max_seq_ever  ⇔  序列真的退回去了  ⇔  seq 会被重发 ⇔ 真回退
+        # 保留期清空 ⇒ 水位仍等于历史高点 ⇒ 不铸新 gen（正确）。
+        # 备份恢复把序列一起退回去 ⇒ 水位 < ever ⇒ 铸新 gen（正确，且照旧 setval）。
+        # 整机快照回滚（T11b）连 ever 一起退回，服务端依旧检不出来 —— 那是设计如此，
+        # 消费侧的 max_seq 单调性检查是唯一防线。
         gen = await self._meta_get(conn, "gen")
         actual = await conn.fetchval(
             "SELECT COALESCE(max(seq), 0) FROM scraper.scrape_events")
+        issued = await self._seq_high_water(conn)
+        watermark = max(int(actual or 0), issued)
         ever_raw = await self._meta_get(conn, "max_seq_ever")
         try:
             ever = int(ever_raw or 0)
@@ -795,21 +843,28 @@ class EventStreamMixin:
             gen = self._mint_gen()
             await self._meta_set(conn, "gen", gen)
             logger.info("全新事件流，铸 gen=%s", gen)
-        elif actual < ever:
+        elif watermark < ever:
             old = gen
             gen = self._mint_gen()
             await self._meta_set(conn, "gen", gen)
             self._bump("rewinds_detected")
             logger.error(
-                "事件流倒退：max(seq)=%s < max_seq_ever=%s。多半是从备份恢复了 DB。"
+                "事件流倒退：seq 水位=%s（max(seq)=%s，序列已发到 %s）< "
+                "max_seq_ever=%s。多半是从备份恢复了 DB。"
                 "铸新 gen %s -> %s（消费侧会看到 gen 变化并触发全量对账），"
                 "并把序列推到 %s 之后以保持实例内单调。",
-                actual, ever, old, gen, max(actual, ever))
-            target = max(actual, ever) + 1
+                watermark, actual, issued, ever, old, gen, ever)
+            target = ever + 1
             await self.ensure_event_partitions(conn, floor_seq=target)
             await conn.execute(
                 "SELECT setval(pg_get_serial_sequence('scraper.scrape_events','seq'),"
                 " $1, false)", target)
+        elif actual < ever:
+            # 表空了/被裁剪了，但序列没退——保留期干的活，不是回退。
+            # 记一条 INFO 而不是静默：Phase 6 上线后第一次看到它的人应该能对上账。
+            logger.info(
+                "scrape_events 里最高 seq=%s 低于 max_seq_ever=%s，但序列已发到 %s "
+                "—— 是保留期裁剪，不是回退，gen 保持 %s 不变。", actual, ever, issued, gen)
         st["gen"] = gen
 
         # max_seq_ever 至少不低于当前实际值（老库首次引导时它可能还不存在）
@@ -1064,15 +1119,114 @@ class EventStreamMixin:
             conn.terminate()
 
     async def run_event_relay(self) -> None:
-        """app.py lifespan 用的入口：启动 + 一直跑到被取消。"""
-        if not await self.start_event_relay():
-            return
+        """app.py lifespan 用的入口：**一直**保证本进程有机会成为那个 relay。
+
+        ⚠ 这是一个重试循环，不是「起一次就完」（B2）。原来的写法是
+        ``if not await start(): return``，它有两条实测过的路径能让**整个进程余生
+        都没有事件流**，而 HTTP 一路绿灯、outbox 只涨不落：
+
+          * **滚动重启。** 新实例启动时老实例还在跑，start 拿不到单例锁返回
+            False，任务当场结束；老实例随后停机，锁没人接 ——
+                t1: NEW.state=refused task.done=True
+                t2: OLD 停机。库上持锁数=0
+                t3: 4s 之后 NEW.state=refused task.done=True   持锁数=0
+                >>> 滚动重启之后还有 relay 在跑吗？ 否
+            "拿不到锁是滚动部署时的正常状态"这句话只对了一半：**当时**正常，
+            但必须继续等着接班。
+          * **启动瞬间连库失败。** 一次 `PostgresConnectionError: connection
+            refused` 让 start 抛出去，lifespan 记一条日志就完了 ——
+                _relay_open_conn 被调用 1 次；task.done=True  relay_state='failed'
+                6 秒后（库早就好了）: {'outbox': 20, 'events': 0}  持锁数=0
+
+        循环也顺带兜住 B3：``_relay_main`` 因为连接反复出错而退出（state='failed'
+        或 'refused'）之后，这里会重新拉起一次完整的 start（新连接 + 重抢锁）。
+
+        退出条件只有两个：被取消（正常关停路径），或者 ``stop_event_relay()``
+        置了 ``stopping``。**每一轮重试前都要重查 ``stopping``**，因为
+        ``start_event_relay`` 的第一句就把它清掉了 —— 那个清除是给"停完再起"用的
+        （测试、热重载），但 lifespan 里 relay 是 ``create_task`` 起来的，
+        「stop 整个跑完了 start 协程才第一次被调度」这种交错真实存在，
+        循环顶上的这一查同时堵住了那个泄漏。
+        """
         st = self._ev()
+        refusals = 0
         try:
-            await st["relay_task"]
+            while True:
+                if st["stopping"]:
+                    return
+                started = False
+                try:
+                    started = await self.start_event_relay()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    logger.error(
+                        "relay 启动失败（%s: %s）—— %.1fs 后重试。在此期间"
+                        "scraper.scrape_outbox 会堆积，但一行都不会丢。",
+                        type(e).__name__, e, RELAY_RETRY_SECONDS)
+
+                if started:
+                    refusals = 0
+                    task = st["relay_task"]
+                    if task is not None:
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            # stop_event_relay() 取消的是 relay_task，不是本协程。
+                            # 那是干净关停，不该再往上抛一个 CancelledError。
+                            if st["stopping"]:
+                                return
+                            raise
+                        except Exception:  # noqa: BLE001
+                            pass          # _relay_main 已经记过日志并置了 failed
+                    if st["stopping"]:
+                        return
+                    self._bump("relay_restarts")
+                    logger.error(
+                        "relay 主循环已退出（state=%s）—— %.1fs 后重新拉起。",
+                        st["relay_state"], RELAY_RETRY_SECONDS)
+                elif st["relay_state"] == "refused":
+                    refusals += 1
+                    self._log_relay_refusal(refusals)
+                # start 还有两种返回 False 的方式，都**不是**"锁被别人占着"：
+                # 被 stop 叫停（state='stopped'）和被更晚的一次 start 顶掉
+                # （state 还是 'starting'）。给它们记一条"单例锁被占用"的
+                # WARNING 是误导 —— 关服日志里出现"另一个实例没停干净"会让人
+                # 去查一个根本不存在的进程。循环顶上的 stopping 检查负责收场。
+
+                await self._sleep_until_stop(RELAY_RETRY_SECONDS)
         except asyncio.CancelledError:
             await self.stop_event_relay()
             raise
+
+    def _log_relay_refusal(self, n: int) -> None:
+        """拿不到单例锁的日志节流。
+
+        每 5s 一条 WARNING 会在滚动部署期间刷屏，而这件事本身是**正常**的；
+        但它也可能是"另一个实例忘了停"，所以不能一句不说。第一次、以及此后
+        每 ~1 分钟说一次。
+        """
+        every = max(1, int(60.0 / max(RELAY_RETRY_SECONDS, 0.001)))
+        if n == 1 or n % every == 0:
+            logger.warning(
+                "relay 单例锁被本库上的另一个会话持有，本进程继续等待接管"
+                "（第 %d 次尝试，每 %.1fs 重试一次）。滚动部署时这是正常的；"
+                "如果它一直不消失，说明有另一个实例没停干净。", n, RELAY_RETRY_SECONDS)
+
+    async def _sleep_until_stop(self, seconds: float) -> None:
+        """可被 stop 提前打断的睡眠。
+
+        lifespan 是 ``create_task(_scrape_event_relay())`` —— 任务句柄被丢掉了，
+        关服时只有 ``stop_event_relay()``，没人 cancel 本协程。所以重试间隔不能是
+        一觉睡到底：那样进程会拖着一个 pending task 走完关闭流程。
+        """
+        st = self._ev()
+        deadline = time.monotonic() + seconds
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or st["stopping"]:
+                return
+            await asyncio.sleep(min(0.2, left))
 
     async def stop_event_relay(self) -> None:
         """取消 relay、释放单例锁、关掉专用连接。幂等，且**有界**。
@@ -1131,14 +1285,20 @@ class EventStreamMixin:
                     n = await self._relay_tick(conn)
                 except asyncio.CancelledError:
                     raise
+                except _RelayHandedOver:
+                    raise
                 except Exception as e:  # noqa: BLE001
                     n = 0
                     self._bump("tick_errors")
                     st["consec_fail"] += 1
+                    st["consec_tick_fail"] += 1
                     self._on_relay_failure(e)
+                    if st["consec_tick_fail"] >= RELAY_RECOVER_AFTER:
+                        conn = await self._relay_recover(conn)
                     await asyncio.sleep(RELAY_ERROR_BACKOFF)
                 else:
                     st["consec_fail"] = 0
+                    st["consec_tick_fail"] = 0
                     st["batch"] = RELAY_BATCH
                 st["last_tick_ms"] = (time.monotonic() - t0) * 1000.0
                 st["counters"]["ticks"] += 1
@@ -1151,6 +1311,12 @@ class EventStreamMixin:
         except asyncio.CancelledError:
             st["relay_state"] = "stopped"
             raise
+        except _RelayHandedOver as e:
+            # 重连时发现单例锁已经被别人拿走了：这不是故障，是交班。
+            # 状态已经在 _relay_recover 里置成 'refused'，run_event_relay 会
+            # 继续按 RELAY_RETRY_SECONDS 排队等下一次接管机会。
+            logger.warning("relay 交班：%s", e)
+            return
         except BaseException:
             # 循环体外面炸了（tick 自己的异常在里面就被吃掉并退避了）。
             # 这里**必须**与"正常停下来"区分开：两者都写 'stopped' 的话，
@@ -1159,6 +1325,82 @@ class EventStreamMixin:
             st["relay_state"] = "failed"
             logger.exception("relay 主循环异常退出——事件流已停止，outbox 将持续堆积")
             raise
+
+    async def _relay_recover(self, dead: asyncpg.Connection) -> asyncpg.Connection:
+        """连续 RELAY_RECOVER_AFTER 个 tick 全挂之后：换一条连接、重抢单例锁。
+
+        修的是 B3。实测（``pg_terminate_backend`` 打掉 relay 自己那条会话）：
+
+            after kill : events=50 outbox_backlog=70 state='running' tick_errors=14
+            advisory locks still held on the singleton key : 0
+            instance #1 still reports relay_state='running'
+
+        数据是安全的（认领的行全在 outbox，零丢失，别的实例接管就能抽干），
+        但这一条 relay 会**永远**每 tick 抛一次 ``InterfaceError: connection is
+        closed``，而 ``relay_state`` 一直报 'running'。D-26 加的 'failed' 只覆盖
+        「主循环整个抛出去了」，覆盖不到「每个 tick 都抛、循环还在转」。
+        本仓库是单实例部署，所以那等于事件流永久停摆 + 唯一该报警的字段说一切正常。
+
+        三种结局，每一种都必须是**响的**：
+          * 重连成功且抢回锁 -> 继续跑，计一次 relay_reconnects；
+          * 锁已经被别人拿走 -> 抛 _RelayHandedOver，state='refused'，本实例退位；
+          * 连都连不上       -> 原样上抛，_relay_main 置 state='failed'。
+        """
+        st = self._ev()
+        logger.error(
+            "relay 连续 %d 个 tick 全部失败，判定连接已不可用：关掉旧连接、"
+            "重开一条并重抢单例锁。", st["consec_tick_fail"])
+        try:
+            await asyncio.wait_for(dead.close(), RELAY_STOP_TIMEOUT)
+        except (asyncio.TimeoutError, Exception):  # noqa: B014
+            try:
+                dead.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        if st["relay_conn"] is dead:
+            st["relay_conn"] = None
+
+        try:
+            fresh = await self._relay_open_conn()
+        except asyncio.CancelledError:
+            st["relay_state"] = "stopped"
+            raise
+        except BaseException:
+            st["relay_state"] = "failed"
+            logger.exception(
+                "relay 重连失败——事件流已停摆，scrape_outbox 会持续堆积"
+                "（行不会丢，恢复后会被重新认领）。")
+            raise
+
+        try:
+            got = await fresh.fetchval("SELECT pg_try_advisory_lock($1)",
+                                       RELAY_LOCK_KEY)
+        except asyncio.CancelledError:
+            # 与 start_event_relay 同一口径：取消途中也必须把锁和连接还回去，
+            # 否则这个库上再也起不来 relay（下一个实例只会看到 refused）。
+            await self._release_and_close(fresh)
+            st["relay_state"] = "stopped"
+            raise
+        except BaseException:
+            await self._release_and_close(fresh)
+            st["relay_state"] = "failed"
+            raise
+        if not got:
+            await self._release_and_close(fresh)
+            st["relay_state"] = "refused"
+            raise _RelayHandedOver(
+                f"重连之后单例锁 {RELAY_LOCK_KEY} 已被本库上的另一个会话持有 —— "
+                f"对方已经接管，本实例退出 relay 循环（绝不能两个写入者同时写 "
+                f"scrape_events，那样游标保证当场失效）。")
+
+        st["relay_conn"] = fresh
+        st["relay_state"] = "running"
+        st["consec_tick_fail"] = 0
+        st["consec_fail"] = 0
+        self._bump("relay_reconnects")
+        logger.warning("relay 已重连并重新持有单例锁，事件流恢复（第 %d 次重连）。",
+                       st["counters"]["relay_reconnects"])
+        return fresh
 
     def _on_relay_failure(self, exc: BaseException) -> None:
         """失败分类：是「行的错」就缩批（准备隔离），不是就只吵。"""
@@ -1346,11 +1588,12 @@ class EventStreamMixin:
         同时建同一个分区；引导期没有 relay，靠 ``IF NOT EXISTS`` + 重复建表的
         异常吞掉兜底。
 
-        配方是 create-then-ATTACH，模板是**某个已存在的分区**而不是父表 ——
-        理由见 schema.event_next_partition_sql() 的注释（LIKE 父表会静默漏掉
-        source_id 唯一索引；PARTITION OF 会拿 ACCESS EXCLUSIVE 卡死 relay）。
+        配方是 create-then-ATTACH，模板是**父表**（外加显式补一条 source_id
+        唯一索引）—— 理由见 schema.event_next_partition_sql() 的长注释：抄上一个
+        分区会把它自己的 range CHECK 一起抄过来，从 p2 起每个分区都永久不可写。
         """
         conn = conn or self._write_conn
+        await self._repair_foreign_range_checks(conn)
         parts = await self._list_partitions(conn)
         if not parts:
             raise RuntimeError("scraper.scrape_events 一个分区都没有")
@@ -1367,8 +1610,7 @@ class EventStreamMixin:
             top = max(p[2] for p in parts if p[2] is not None)
             nxt_index = max(p[3] for p in parts) + 1
             lo, hi = top, top + EVENT_PARTITION_SPAN
-            template = max(parts, key=lambda p: p[3])[0]
-            if await self._create_partition(conn, nxt_index, lo, hi, template):
+            if await self._create_partition(conn, nxt_index, lo, hi):
                 created += 1
             parts = await self._list_partitions(conn)
         else:
@@ -1380,9 +1622,8 @@ class EventStreamMixin:
                         created, last_value, EVENT_FUTURE_PARTITIONS)
         return created
 
-    async def _create_partition(self, conn, index: int, lo: int, hi: int,
-                                template: str) -> bool:
-        """建表 -> 预挂 CHECK -> ATTACH。三步各自幂等，中途崩了下次能接着做。
+    async def _create_partition(self, conn, index: int, lo: int, hi: int) -> bool:
+        """建表 -> 补唯一索引 -> 预挂 CHECK -> ATTACH。四步各自幂等，中途崩了下次能接着做。
 
         为什么要逐步容错：上一次跑到「表建好了、还没 ATTACH」就崩，
         下一次 ``CREATE TABLE IF NOT EXISTS`` 会安静地什么都不做，而
@@ -1391,9 +1632,10 @@ class EventStreamMixin:
         中断被固化成永久故障。
         """
         name = event_partition_name(index)
-        create_sql, check_sql, attach_sql = event_next_partition_sql(
-            index, lo, hi, template)
+        create_sql, index_sql, check_sql, attach_sql = event_next_partition_sql(
+            index, lo, hi)
         await conn.execute(create_sql)                    # IF NOT EXISTS，天然幂等
+        await conn.execute(index_sql)                     # IF NOT EXISTS，天然幂等
         try:
             await conn.execute(check_sql)
         except asyncpg.DuplicateObjectError:
@@ -1404,19 +1646,77 @@ class EventStreamMixin:
             logger.info("分区 %s 已经挂在父表上（多进程同时引导），跳过", name)
             return False
 
-        # 硬闸门：LIKE 抄错模板会得到一个**没有重复保护**的分区，而且不报错。
-        # 宁可现在炸，也不要静默地失去 source_id 的唯一性。
-        idx = await conn.fetch(
-            "SELECT indexdef FROM pg_indexes "
-            "WHERE schemaname = 'scraper' AND tablename = $1", name)
-        defs = [r["indexdef"] for r in idx]
-        if not any("UNIQUE" in d and "source_id" in d for d in defs):
-            raise RuntimeError(
-                f"新分区 scraper.{name} 没有 source_id 唯一索引（模板={template}），"
-                f"拒绝继续。实际索引：{defs}")
+        await self._assert_partition_is_sane(conn, name, lo, hi)
         self._bump("partitions_created")
         logger.info("事件流新分区 scraper.%s [%s, %s)", name, lo, hi)
         return True
+
+    async def _assert_partition_is_sane(self, conn, name: str,
+                                        lo: int, hi: int) -> None:
+        """新分区的硬闸门。两条，都是实测踩出来的，都**不报错地**发生：
+
+        1. **source_id 唯一索引在不在。** 那条索引长在分区上（父表建不了：PG 16
+           要求唯一约束包含分区键 seq），LIKE 抄错模板就会得到一个没有重复保护的
+           分区，而且一声不吭。
+        2. **有且只有一条属于自己的 range CHECK。** 这是 B1：
+           ``LIKE <上一个分区> INCLUDING ALL`` 会把模板自己的 range CHECK 抄进来，
+           两条互斥 CHECK 让这个分区**永远收不下任何行**，而 DDL 全部成功。
+           上一版闸门只看索引，所以整条流在 seq=40,000,000 处停摆这件事一路绿灯
+           走到了验证环节。宁可现在炸。
+        """
+        defs = [r["indexdef"] for r in await conn.fetch(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'scraper' AND tablename = $1", name)]
+        if not any("UNIQUE" in d and "source_id" in d for d in defs):
+            raise RuntimeError(
+                f"新分区 scraper.{name} 没有 source_id 唯一索引，拒绝继续。"
+                f"实际索引：{defs}")
+
+        checks = await conn.fetch(EVENT_OWN_RANGE_CHECK_SQL, name)
+        got = [(r["conname"], r["condef"]) for r in checks]
+        if len(got) != 1 or got[0][0] != f"{name}_range":
+            raise RuntimeError(
+                f"新分区 scraper.{name} 的 range CHECK 不是恰好一条自己的："
+                f"{got}。两条互斥的 CHECK = 这个分区永远收不下任何行"
+                f"（Phase 2 BLOCKER B1）。期望边界 [{lo}, {hi})。")
+
+    async def _repair_foreign_range_checks(self, conn) -> int:
+        """把「别的分区的 range CHECK」从分区身上摘掉。返回摘掉的条数。
+
+        为什么代码修好了还需要这个：B1 修的是**将来**怎么建分区，而 p1/p2 是
+        ``connect()`` 期就建出来的 —— **每一个** Phase 2 建过的库里，p2 身上都已经
+        长着一条 ``scrape_events_p1_range``，它自己永远收不下行。只改 DDL 的话，
+        已有的库（包括 scraper_dev、以及任何跑过 Phase 2 的部署）修不好。
+
+        安全性：只认 schema 自己生成的名字（``scrape_events_p<N>_range``），
+        且只摘「名字不等于自己那条」的。别人的 CHECK、父表的 marketplace CHECK
+        都不在模式内。DROP CONSTRAINT 要 ACCESS EXCLUSIVE，所以先查后改 ——
+        没有可摘的（修好之后的常态）时一条 DDL 都不发。
+        """
+        try:
+            rows = await conn.fetch(EVENT_FOREIGN_RANGE_CHECKS_SQL)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("分区 CHECK 体检失败（跳过本次修复）：%s: %s",
+                           type(e).__name__, e)
+            return 0
+        n = 0
+        for r in rows:
+            part, con = r["partition"], r["conname"]
+            try:
+                await conn.execute(
+                    f'ALTER TABLE scraper."{part}" DROP CONSTRAINT "{con}"')
+            except Exception as e:  # noqa: BLE001
+                logger.error("摘除 scraper.%s 上的越界 CHECK %s 失败：%s: %s",
+                             part, con, type(e).__name__, e)
+                continue
+            n += 1
+            logger.error(
+                "修复 B1：从分区 scraper.%s 上摘掉了属于别的分区的 CHECK %s（%s）。"
+                "在此之前这个分区永远收不下任何行，事件流会在它的区间上永久停摆。",
+                part, con, r["condef"])
+        if n:
+            self._bump("range_checks_repaired", n)
+        return n
 
     async def _seq_last_value(self, conn) -> int:
         """seq 序列已经发到哪儿了。见 SQL_SEQ_NAME 的两个陷阱。
@@ -1428,6 +1728,26 @@ class EventStreamMixin:
         if not name:
             return 0
         return int(await conn.fetchval(f"SELECT last_value FROM {name}") or 0)
+
+    async def _seq_high_water(self, conn) -> int:
+        """seq 序列**真正发出去过**的最大值（一次都没发过就是 0）。B4 的判据。
+
+        与 ``_seq_last_value`` 的区别只在一处，但那一处是要害：新建/刚 setval 过的
+        序列 ``last_value = 1`` 而 ``is_called = false``，意思是「下一个发 1」，
+        也就是**一个号都还没发**。分区维护要的是「下一个号落在哪」，用 last_value
+        正好；回退检测要的是「发出去过的最高号」，多算一个就会把一个全新的库
+        误判成「有过 seq=1」。
+        （``pg_sequences.last_value`` 在 is_called=false 时是 NULL，所以这里跟
+        ``_seq_last_value`` 一样直接读序列关系本身，见 SQL_SEQ_NAME 的注释。）
+        """
+        name = await conn.fetchval(SQL_SEQ_NAME)
+        if not name:
+            return 0
+        row = await conn.fetchrow(f"SELECT last_value, is_called FROM {name}")
+        if row is None:
+            return 0
+        last = int(row["last_value"] or 0)
+        return last if row["is_called"] else max(last - 1, 0)
 
     async def _list_partitions(self, conn) -> List[Tuple[str, Optional[int],
                                                          Optional[int], int]]:
@@ -1455,6 +1775,9 @@ class EventStreamMixin:
             "ready": st["ready"],
             "relay_state": st["relay_state"],
             "relay_batch": st["batch"],
+            # 连续失败的 tick 数。relay_state 只在到达 RELAY_RECOVER_AFTER 之后
+            # 才会变（重连 / failed / refused），在那之前这个数字是唯一的先兆。
+            "consec_tick_fail": st["consec_tick_fail"],
             "last_tick_ms": round(st["last_tick_ms"], 3),
             "outbox_depth": st["outbox_depth"],
             "relay_lag_s": round(st["relay_lag_s"], 3),

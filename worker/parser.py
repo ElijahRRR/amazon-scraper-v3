@@ -48,6 +48,51 @@ _DELIVERY_DATE_RE = re.compile(
 )
 
 
+def _slx_iter_descendants(node):
+    """前序遍历 ``node`` 的**全部后代元素**（不含 node 自身），严格限制在子树内。
+
+    为什么必须自己写：selectolax 的两个遍历 API 都不是 lxml ``Element.iter()`` 的语义。
+
+    ``Node.traverse()`` —— 文档原话是 "Iterate over all child and next nodes starting
+    from the current level"，**next 节点**指容器之后的兄弟节点，即它会越过子树边界继续
+    往下扫整篇文档。实测（selectolax 0.4.11）：
+
+        <div id="productDescription"><p>REAL DESCRIPTION TEXT HERE ok</p></div>
+        <div id="price"><span class="a-offscreen">$549.99</span></div>
+        <div id="availability"><span>In Stock</span></div>
+
+        container.traverse() 依次产出：
+            div  'REAL DESCRIPTION TEXT HERE ok'
+            p    'REAL DESCRIPTION TEXT HERE ok'
+            div  '$549.99'        <- 已经在容器外
+            span '$549.99'        <- 已经在容器外
+            div  'In Stock'       <- 已经在容器外
+            span 'In Stock'       <- 已经在容器外
+
+    ``Node.iter()`` —— "Iterate over nodes on the current level"，只产出**直接子节点**，
+    不递归。而 lxml 的 ``.iter()`` 是「自身 + 全部后代」。两者名字一样、语义不同，
+    这正是 selectolax 路径与 lxml 路径解析结果分叉的第二个来源。
+
+    所以用 ``Node.iter()``（只要直接子节点，天然不越界）自己做前序 DFS。
+    ``Node.css()`` / ``Node.css_first()`` 实测是子树受限的，不在此列。
+    """
+    stack = list(node.iter())
+    stack.reverse()
+    while stack:
+        cur = stack.pop()
+        yield cur
+        kids = list(cur.iter())
+        if kids:
+            kids.reverse()
+            stack.extend(kids)
+
+
+def _slx_iter_subtree(node):
+    """selectolax 版的 lxml ``Element.iter()``：先产出 node 自身，再按文档顺序产出后代。"""
+    yield node
+    yield from _slx_iter_descendants(node)
+
+
 class AmazonParser:
     """Amazon 商品页面解析器"""
 
@@ -681,17 +726,32 @@ class AmazonParser:
                     break
 
             if container:
-                for node in container.traverse():
+                # 必须用 _slx_iter_subtree 而不是 container.traverse()：traverse() 不受
+                # 子树约束，会把容器**之后**的价格/库存/评分/BSR/CDN 图片 URL 一并吸进
+                # long_description（详见 _slx_iter_descendants 的实测输出）。
+                # 后果是 long_description ∈ SLOW_HASH_FIELDS，slow_hash 每次采集都变，
+                # 且 long_description 是导出字段，脏值一路流到 erpAPI。
+                for node in _slx_iter_subtree(container):
                     tag = node.tag
                     if tag == 'img':
                         src = node.attributes.get('src') or node.attributes.get('data-src', '')
                         if src and "pixel" not in src and "transparent" not in src:
                             parts.append(f"\n[Image: {src.strip()}]\n")
                     elif tag in _TEXT_TAGS:
-                        # 只取叶子级文本节点，避免父子重复
-                        children_with_text = [c for c in node.iter() if c.tag in _TEXT_TAGS and c != node]
-                        if not children_with_text:
-                            text = node.text(deep=True, strip=True)
+                        # 只取叶子级文本节点，避免父子重复。
+                        # 这里也必须是**整棵子树**的后代：lxml 版用的是 lxml 语义的
+                        # node.iter()（自身+后代），而 selectolax 的 node.iter() 只有
+                        # 直接子节点。用后者会把 <div><a><span>text</span></a></div>
+                        # 判成叶子，div 与 span 各取一次文本 → 同一段文字重复两遍。
+                        # 用 any() 而非 lxml 版的列表推导：语义等价（结果只用于真值判断），
+                        # 但命中第一个后代就短路，A+ 大页上省掉整棵子树的重复扫描。
+                        has_text_descendant = any(c.tag in _TEXT_TAGS
+                                                  for c in _slx_iter_descendants(node))
+                        if not has_text_descendant:
+                            # 与 lxml 版 "".join(node.xpath('.//text()')).strip() 对齐：
+                            # 整体 strip，而不是 strip=True 的逐个文本节点 strip
+                            # （后者会把 "Hello <b>world</b> again" 拼成 "Helloworldagain"）。
+                            text = (node.text(deep=True) or "").strip()
                             if text and len(text) > 5:
                                 parts.append(text)
 

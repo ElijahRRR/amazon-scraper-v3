@@ -549,31 +549,87 @@ def event_create_first_partition_sql(span: int = None) -> List[str]:
     ]
 
 
-def event_next_partition_sql(index: int, lo: int, hi: int,
-                             template: str) -> List[str]:
-    """新分区的三步配方。实测（part_probe.py / part_probe2.py）：
+def event_next_partition_sql(index: int, lo: int, hi: int) -> List[str]:
+    """新分区的四步配方。实测（part_probe.py / v5/b1_probe.py）：
 
     * ``CREATE TABLE ... PARTITION OF`` 会对父表拿 **ACCESS EXCLUSIVE**，
       有写事务开着时**阻塞** > 3s —— 也就是会卡死 relay 自己。
       ``ATTACH PARTITION`` 只拿 SHARE UPDATE EXCLUSIVE，实测不阻塞。
       所以是 create standalone → ATTACH，不是 PARTITION OF。
-    * ``LIKE <父表> INCLUDING ALL`` 会**静默漏掉** source_id 唯一索引
-      （那条索引长在 p0 上，不在父表上）：
-        LIKE parent INCLUDING ALL -> ['..._pkey', '..._recorded_at_idx']   ← 少一条
-        LIKE p0     INCLUDING ALL -> ['..._pkey', '..._recorded_at_idx', '..._source_id_idx']
-      抄父表得到的是一个**没有重复保护**的分区，而且不报错。
-      所以模板必须是**某个已存在的分区**。
+    * 模板是**父表**，并且 source_id 唯一索引**显式**建一条 —— 与 p0 的配方逐字
+      一致（见 event_create_first_partition_sql）。这一条是修 Phase 2 的
+      BLOCKER B1 时改的，原来是 ``LIKE <上一个分区> INCLUDING ALL``：
+
+        ``INCLUDING ALL`` 蕴含 ``INCLUDING CONSTRAINTS``，于是模板分区**自己那条
+        range CHECK 被照抄进新分区**。p0 是 PARTITION OF 建的、没有 range CHECK，
+        所以 p1 干净；但 p1 → p2 抄来了 ``scrape_events_p1_range``，此后每一个
+        分区都带着一条与自己边界**矛盾**的 CHECK。实测（生产默认 SPAN，连库即现）：
+
+            scrape_events_p2  scrape_events_p1_range  CHECK (seq >= 1000 AND seq < 2000)  <- 抄来的
+            scrape_events_p2  scrape_events_p2_range  CHECK (seq >= 2000 AND seq < 3000)
+            p2 seq=2001  FAIL CheckViolationError: ... violates check constraint "scrape_events_p1_range"
+
+        两条互斥的 CHECK ⇒ 该分区**永远收不下任何行**，事件流在 seq=40,000,000
+        处永久停摆；而且那个 CheckViolationError 的文本里没有
+        ``no partition of relation``，``_is_row_fault()`` 会返回 True，
+        于是完好的行被一条一条搬进死信表。
+
+      为什么不是 ``INCLUDING ALL EXCLUDING CONSTRAINTS``（看起来只差一个词）：
+      它把父表的 ``marketplace`` CHECK 也一起排除掉了，而 ATTACH 要求子表**事先
+      具备**父表的每一条 CHECK，实测直接失败：
+
+            DatatypeMismatchError: child table is missing constraint
+                                   "scrape_events_marketplace_check"
+
+      抄父表则天然只带父表有的东西（pkey、marketplace CHECK、recorded_at 索引），
+      分区局部的 range CHECK 结构上不可能被继承 —— 这一类 bug 被根除，而不是被
+      逐条排除。代价是父表上没有 source_id 唯一索引（PG 16 不允许：唯一约束必须
+      包含分区键 seq），所以那一条显式补建。``_create_partition`` 的硬闸门会同时
+      核对「有 source_id 唯一索引」与「有且只有一条自己的 range CHECK」。
     * 先手工挂上等价的 CHECK，ATTACH 时就能跳过全表校验扫描。
     """
     name = event_partition_name(index)
     return [
         f"CREATE TABLE IF NOT EXISTS scraper.{name} "
-        f"(LIKE scraper.{template} INCLUDING ALL)",
+        f"(LIKE scraper.scrape_events INCLUDING ALL)",
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {event_partition_source_id_index(index)} "
+        f"ON scraper.{name} (source_id)",
         f"ALTER TABLE scraper.{name} ADD CONSTRAINT {name}_range "
         f"CHECK (seq >= {lo} AND seq < {hi})",
         f"ALTER TABLE scraper.scrape_events ATTACH PARTITION scraper.{name} "
         f"FOR VALUES FROM ({lo}) TO ({hi})",
     ]
+
+
+#: 一个分区身上挂着的、**属于别的分区**的 range CHECK。
+#: 只有 B1 修复之前建出来的库才会有 —— 但那是**每一个** Phase 2 建的库
+#: （p2 在 connect() 期就被建出来了），所以修 DDL 不够，还得能就地修好已有的库。
+#: 名字模式是 schema 自己定的（``{分区名}_range``），不会误伤别人的约束。
+EVENT_FOREIGN_RANGE_CHECKS_SQL = f"""
+SELECT rel.relname AS partition, con.conname AS conname,
+       pg_get_constraintdef(con.oid) AS condef
+  FROM pg_constraint con
+  JOIN pg_class rel     ON rel.oid = con.conrelid
+  JOIN pg_namespace n   ON n.oid = rel.relnamespace
+ WHERE n.nspname = '{EVENT_SCHEMA}'
+   AND con.contype = 'c'
+   AND rel.relname ~ '^{EVENT_PARTITION_PREFIX}[0-9]+$'
+   AND con.conname ~ '^{EVENT_PARTITION_PREFIX}[0-9]+_range$'
+   AND con.conname <> rel.relname || '_range'
+ ORDER BY rel.relname, con.conname
+"""
+
+
+#: 某个分区身上属于**它自己**的 range CHECK（硬闸门用：必须恰好一条）。
+EVENT_OWN_RANGE_CHECK_SQL = f"""
+SELECT con.conname, pg_get_constraintdef(con.oid) AS condef
+  FROM pg_constraint con
+  JOIN pg_class rel     ON rel.oid = con.conrelid
+  JOIN pg_namespace n   ON n.oid = rel.relnamespace
+ WHERE n.nspname = '{EVENT_SCHEMA}' AND rel.relname = $1
+   AND con.contype = 'c'
+   AND con.conname ~ '^{EVENT_PARTITION_PREFIX}[0-9]+_range$'
+"""
 
 
 #: 已挂载分区的名字与范围上界。``pg_get_expr`` 产出形如

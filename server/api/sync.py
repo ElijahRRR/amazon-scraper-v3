@@ -7,6 +7,7 @@
     GET  /api/v1/sync/status
     GET  /api/v1/sync/counts?from_seq=&to_seq=[&bucket=hour]
     POST /api/v1/sync/ack
+    POST /api/v1/sync/ack-prune          （Phase 6 加的第五个：确认强制裁剪闩锁）
 
 ------------------------------------------------------------------------
 承重约束（每一条都来自一次实测或一次事故推演，改之前先读完）
@@ -56,6 +57,12 @@
 
 8. **SQLite 上 503，而不是「不挂路由」。**
    理由见 ``_unavailable()`` 的注释。
+
+9. **保留期的东西一律走 ``db.*`` 方法，本文件不 import ``common.pgdb.retention``。**
+   理由与第 2 条同源、与 ``VALID_OUTCOMES`` 是字面量同源：本文件被 server/app.py
+   在模块级 import，而 pgdb 包会把 asyncpg 拖进每一次启动（SQLite 部署根本没装）。
+   ``db`` 在 PG 后端下就是 ``common.pgdb.Database``，它身上有 ``retention_observe``
+   / ``acknowledge_forced_prunes`` —— 用 ``hasattr`` 探一下就够，一行 import 都不要。
 """
 from __future__ import annotations
 
@@ -330,16 +337,25 @@ def _completeness_ok(value: Optional[int]) -> bool:
 
 
 def _forced_prune_log(raw: Optional[str]) -> List[Any]:
-    """Phase 6 写、Phase 3 读。持久列表，不是瞬时布尔（计划 §Phase 6）。"""
+    """闩锁里**尚未被确认**的那些条目。Phase 6 写、Phase 3 起就在读。
+
+    过滤 ``acknowledged_at`` 是 P6-3 的另一半：闩锁要「一直返回直到消费者逐条
+    确认」，所以确认过的必须消失在 ``/status.forced_prune_log`` 里，否则
+    ``retention_forced`` 一旦为真就永远为真，等于把这个信号烧掉。
+    条目本身不删（``common/pgdb/retention.py`` 只打标记），事后还能复盘。
+
+    解析不了的原样回出去而**不是**丢掉：它意味着有人手工写坏了闩锁，
+    那正是必须让消费者看见的状态。
+    """
     if not raw:
         return []
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError):
         return [{"raw": raw, "note": "forced_prune_log 不是合法 JSON"}]
-    if isinstance(parsed, list):
-        return parsed
-    return [parsed]
+    items = parsed if isinstance(parsed, list) else [parsed]
+    return [e for e in items
+            if not (isinstance(e, dict) and e.get("acknowledged_at"))]
 
 
 def _record(row) -> Dict[str, Any]:
@@ -613,6 +629,17 @@ async def sync_status():
                 "SELECT seq FROM scraper.scrape_events "
                 "WHERE recorded_at >= now() - interval '1 day' "
                 "ORDER BY recorded_at LIMIT 1")
+            # Phase 6 的保留期观测。**同一个快照里现算**，一个字都不从
+            # sync_meta 读缓存 —— 见 common/pgdb/retention.py 承重约束 6。
+            # 拿不到（老实现 / 别的 Database）就是 None，不影响其余字段。
+            retention = None
+            if hasattr(db, "retention_observe"):
+                try:
+                    retention = await db.retention_observe(conn)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("retention_observe 失败（/status 其余字段照常）: "
+                                   "%s: %s", type(e).__name__, e)
+                    retention = {"error": f"{type(e).__name__}: {e}"}
     except _PoolUnavailable:
         return _err(503, "event_stream_unavailable",
                     "连接池尚未就绪（只剩那条专用写连接，不能借）。")
@@ -671,6 +698,9 @@ async def sync_status():
         "events_per_minute": stats.get("events_per_minute"),
         "oldest_recorded_at": _iso(times["oldest"] if times else None),
         "newest_recorded_at": _iso(times["newest"] if times else None),
+        # 未确认的强制裁剪。**持久闩锁**：一条被记下来之后，`/status` 会一直
+        # 返回它，直到消费者 POST /ack-prune 逐条确认（P6-3）。
+        # 消费者宕机正是触发这件事的前提，所以「响应里一个瞬时布尔」是无效的。
         "retention_forced": bool(forced),
         "forced_prune_log": forced,
         "db_size_bytes": int(db_size) if db_size is not None else None,
@@ -679,6 +709,11 @@ async def sync_status():
         "observed_daily_insert_rate": rate,
         "partitions": stats.get("partitions"),
         "future_partitions": stats.get("future_partitions"),
+        # P6-5：服务端替消费者留出的重叠余量。契约 §7 的 ``OVERLAP`` 必须 ≤ 它，
+        # 否则 ``cursor - OVERLAP`` 会掉到保留窗口下面，每轮一个假 409。
+        # 回出来是为了让消费侧**读这个数**、而不是把 200 硬编码在两个仓库里。
+        "max_safe_overlap": (retention or {}).get("ack_slack_seq"),
+        "retention": retention,
         "server_time_utc": _now_iso(),
     })
 
@@ -815,6 +850,14 @@ async def sync_ack(body: Dict[str, Any] = Body(...)):
       但它是**数据丢失向量**：Phase 6 的保留期下界取 ``min(时间下界, ack_seq)``，
       收下一个我们从没发过的 ack_seq 就等于授权裁掉消费者其实没拿到的数据。
     * 参数形状不对 → 422
+
+    **``ack_seq = 0`` 是收下但不落库的空操作**（200，``advanced: false``）。
+    这不是宽容，是 P6-2 那条不变式的入口守卫：库里存进一个 ``'0'``，
+    保留期的 ``min(时间下界, ack_seq)`` 就恒为 0，从此一行不裁直到磁盘满。
+    而 0 的语义（「持久副本里一条都没有」）与「从未 ack」完全一致 ——
+    计划 §5.4 对后者的规定就是「按纯时间 + 磁盘执行」，所以两者合流不丢信息。
+    库层面还有一条 CHECK（``sync_meta_ack_seq_is_never_zero``）兜底，
+    这里挡在前面只是为了不让一次合法请求撞成 500。
     """
     bad = _unavailable()
     if bad is not None:
@@ -859,21 +902,27 @@ async def sync_ack(body: Dict[str, Any] = Body(...)):
                             sent_ack_seq=raw_seq,
                             min_available_seq=min_available_seq, max_seq=max_seq)
 
-            # 单调：GREATEST 在 SQL 里做，所以并发 ack 也不会互相覆盖。
-            # 正则那一段是防御性的：ack_seq 只由本端点写，理论上一定是数字，
-            # 但一次手工 UPDATE 写进个非数字就会让 ``v::bigint`` 抛，
-            # 而那时**整个 ack 通道**会挂掉，代价远大于这一行的开销。
-            effective = await conn.fetchval(
-                "INSERT INTO scraper.sync_meta (k, v) VALUES ('ack_seq', $1) "
-                "ON CONFLICT (k) DO UPDATE SET v = GREATEST("
-                "  CASE WHEN scraper.sync_meta.v ~ '^[0-9]+$' "
-                "       THEN scraper.sync_meta.v::bigint ELSE 0 END, "
-                "  EXCLUDED.v::bigint)::text "
-                "RETURNING v", str(raw_seq))
-            ack_at = _now_iso()
-            await conn.execute(
-                "INSERT INTO scraper.sync_meta (k, v) VALUES ('ack_at', $1) "
-                "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", ack_at)
+            if raw_seq == 0:
+                # 空操作：不写 ack_seq，也不写 ack_at（写了就是「有人 ack 过」
+                # 的假证据，而 Phase 6 的自愈逻辑正是靠这对键判断幽灵值）。
+                effective = meta.get("ack_seq")
+                ack_at = meta.get("ack_at")
+            else:
+                # 单调：GREATEST 在 SQL 里做，所以并发 ack 也不会互相覆盖。
+                # 正则那一段是防御性的：ack_seq 只由本端点写，理论上一定是数字，
+                # 但一次手工 UPDATE 写进个非数字就会让 ``v::bigint`` 抛，
+                # 而那时**整个 ack 通道**会挂掉，代价远大于这一行的开销。
+                effective = await conn.fetchval(
+                    "INSERT INTO scraper.sync_meta (k, v) VALUES ('ack_seq', $1) "
+                    "ON CONFLICT (k) DO UPDATE SET v = GREATEST("
+                    "  CASE WHEN scraper.sync_meta.v ~ '^[0-9]+$' "
+                    "       THEN scraper.sync_meta.v::bigint ELSE 0 END, "
+                    "  EXCLUDED.v::bigint)::text "
+                    "RETURNING v", str(raw_seq))
+                ack_at = _now_iso()
+                await conn.execute(
+                    "INSERT INTO scraper.sync_meta (k, v) VALUES ('ack_at', $1) "
+                    "ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", ack_at)
     except _PoolUnavailable:
         return _err(503, "event_stream_unavailable",
                     "连接池尚未就绪（只剩那条专用写连接，不能借）。")
@@ -883,17 +932,120 @@ async def sync_ack(body: Dict[str, Any] = Body(...)):
                         f"事件流表还没建好: {type(exc).__name__}")
         raise
 
-    stored = _as_int(effective) or 0
+    # ``stored`` 是生效值；**从未 ack 过是 null，不是 0**（与 /status 同口径）。
+    # 只有这样消费侧才分得清「我 ack 过 0 条」与「服务端根本没收到过 ack」——
+    # 而这两者在保留期眼里虽然等价，在排障时完全不是一回事。
+    stored = _as_int(effective)
     return JSONResponse(content={
         "contract_version": CONTRACT_VERSION,
         "gen": current_gen,
         "instance_id": meta.get("instance_id"),
         "ack_seq": stored,              # 生效值（单调 max 之后的）
         "sent_ack_seq": raw_seq,
-        "advanced": stored == raw_seq and raw_seq != _as_int(meta.get("ack_seq")),
+        "advanced": (stored is not None and stored == raw_seq
+                     and raw_seq != _as_int(meta.get("ack_seq"))),
         "ack_at": ack_at,
         "min_available_seq": min_available_seq,
         "max_seq": max_seq,
-        "lag_records": max_seq - stored,
+        "lag_records": (max_seq - stored) if stored is not None else None,
+        "server_time_utc": _now_iso(),
+    })
+
+
+# ============================================================
+# POST /api/v1/sync/ack-prune
+# ============================================================
+
+@router.post("/ack-prune")
+async def sync_ack_prune(body: Dict[str, Any] = Body(...)):
+    """确认强制裁剪闩锁：``{"gen": "...", "prune_ids": [3, 4]}``（或 ``"all": true``）。
+
+    为什么这是**第五个端点**而不是 ``/ack`` 上的一个可选字段：
+
+    * ``/ack`` 每拉一页就发一次，是拉取循环里最热的调用。把「确认一次数据被
+      强制丢弃」混进去，迟早会有人顺手把 ``prune_ids`` 也自动填上 ——
+      那就等于把闩锁自动清掉，而闩锁存在的唯一目的就是**逼一个人来看一眼**。
+    * 契约 §7 把 ``forced_prune_log`` 列成硬停项。硬停之后的处理动作理应是一次
+      独立的、有意的调用，不是循环体的副作用。
+
+    ``gen`` 必须匹配，理由与 ``/ack`` 相同：闩锁属于某一个实例的流。
+    gen 变过之后消费者本来就该硬停 + 全量对账，这时清掉旧实例的闩锁没有意义。
+
+    确认过的条目**不删除**，只打 ``acknowledged_at``：`/status` 不再返回它，
+    但事后复盘「那次到底裁掉了哪一段」时还查得到。
+    """
+    bad = _unavailable()
+    if bad is not None:
+        return bad
+    if not isinstance(body, dict):
+        return _err(422, "invalid_parameter", "请求体必须是 JSON 对象")
+    gen = body.get("gen")
+    if not isinstance(gen, str) or not gen.strip():
+        return _err(422, "invalid_parameter", "gen 必须是非空字符串", parameter="gen")
+
+    take_all = body.get("all", False)
+    if not isinstance(take_all, bool):
+        return _err(422, "invalid_parameter", "all 必须是布尔", parameter="all")
+    raw_ids = body.get("prune_ids")
+    ids: List[Any] = []
+    if raw_ids is not None:
+        if not isinstance(raw_ids, list):
+            return _err(422, "invalid_parameter",
+                        "prune_ids 必须是数组", parameter="prune_ids")
+        for i in raw_ids:
+            if isinstance(i, bool) or not isinstance(i, (int, str)):
+                return _err(422, "invalid_parameter",
+                            "prune_ids 的元素必须是整数或字符串 id",
+                            parameter="prune_ids")
+            ids.append(i)
+    if not ids and not take_all:
+        return _err(422, "invalid_parameter",
+                    "要么给非空的 prune_ids，要么显式 all=true。"
+                    "一次什么都不确认的调用多半是消费端写错了。",
+                    parameter="prune_ids")
+
+    db = _database()
+    if not hasattr(db, "acknowledge_forced_prunes"):
+        return _err(503, "event_stream_unavailable",
+                    "当前 Database 实现没有保留期闩锁。")
+
+    try:
+        # READ COMMITTED + 可写：闩锁的读改写自己在 retention.py 里用
+        # ``SELECT … FOR UPDATE`` 串行化，不需要快照隔离（也不能用 ——
+        # REPEATABLE READ 下两个并发确认会撞 SerializationError，与 /ack 同因）。
+        async with _snapshot(readonly=False, isolation="read_committed") as conn:
+            meta = await _read_meta(conn)
+            current_gen = meta.get("gen")
+            if current_gen is None:
+                return _err(503, "event_stream_unavailable",
+                            "事件流还没引导（sync_meta 里没有 gen）。")
+            if gen.strip() != current_gen:
+                return _err(409, "gen_mismatch",
+                            f"ack-prune 带的 gen={gen!r} 与当前实例的 gen="
+                            f"{current_gen!r} 不符。按契约 §7：告警 + 全量对账。",
+                            gen=current_gen, sent_gen=gen,
+                            instance_id=meta.get("instance_id"))
+            result = await db.acknowledge_forced_prunes(
+                conn, ids=ids or None, acknowledge_all=take_all)
+    except _PoolUnavailable:
+        return _err(503, "event_stream_unavailable",
+                    "连接池尚未就绪（只剩那条专用写连接，不能借）。")
+    except Exception as exc:  # noqa: BLE001
+        if _schema_missing(exc):
+            return _err(503, "event_stream_unavailable",
+                        f"事件流表还没建好: {type(exc).__name__}")
+        raise
+
+    remaining = result.get("remaining") or []
+    return JSONResponse(content={
+        "contract_version": CONTRACT_VERSION,
+        "gen": current_gen,
+        "instance_id": meta.get("instance_id"),
+        "acknowledged": result.get("acknowledged") or [],
+        # 发来的 id 在闩锁里根本不存在。**不是错误**（重发是允许的），
+        # 但如实回出去，免得消费者以为自己清掉了什么。
+        "unknown_ids": result.get("unknown") or [],
+        "forced_prune_log": remaining,
+        "retention_forced": bool(remaining),
         "server_time_utc": _now_iso(),
     })

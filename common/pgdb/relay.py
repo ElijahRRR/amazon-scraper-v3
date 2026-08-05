@@ -131,6 +131,8 @@ import asyncpg
 from common import config
 from common.pgdb.pool import translate_sql
 from common.pgdb.schema import (
+    EVENT_COMPLETENESS_MAX,
+    EVENT_COMPLETENESS_UNMEASURED,
     EVENT_CONTRACT_VERSION,
     EVENT_DEFAULT_MARKETPLACE,
     EVENT_EXPECTED_COLUMNS,
@@ -138,12 +140,22 @@ from common.pgdb.schema import (
     EVENT_FUTURE_PARTITIONS,
     EVENT_LIST_PARTITIONS_SQL,
     EVENT_MARKETPLACES,
+    EVENT_META_COMPLETENESS,
+    EVENT_META_OUTCOME,
+    EVENT_META_PARSE_ENGINE,
+    EVENT_META_ZIP_OBSERVED,
+    EVENT_META_ZIP_REQUESTED,
+    EVENT_META_ZIP_VERIFY,
     EVENT_OUTCOMES,
     EVENT_OWN_RANGE_CHECK_SQL,
     EVENT_PARENT_INDEX_SQL,
+    EVENT_PARSE_ENGINES,
     EVENT_PARTITION_PREFIX,
     EVENT_PARTITION_SPAN,
     EVENT_STREAM_DDL,
+    EVENT_WORKER_OUTCOMES,
+    EVENT_ZIP_VERIFY_DEFAULT,
+    EVENT_ZIP_VERIFY_VALUES,
     event_create_first_partition_sql,
     event_next_partition_sql,
     event_partition_name,
@@ -212,18 +224,44 @@ _OUTCOME_BY_ERROR_TYPE: Dict[str, str] = {
 }
 _OUTCOME_DEFAULT = "parse_failed"
 
-#: worker 的时区常量。``worker/parser.py:13`` ``_CN_TZ = timezone(timedelta(hours=8))``，
-#: ``:1332`` 用 ``datetime.now(_CN_TZ).strftime('%Y-%m-%d %H:%M:%S')`` 写 crawl_time
-#: —— **不带偏移标记**。所以这里必须显式补 +08:00 再转 UTC。
-#: ⚠ Phase 4 一改 worker 的时区，这一段立刻就错了。改那边时回来改这里。
-_WORKER_TZ = timezone(timedelta(hours=8))
-_CRAWL_TIME_FMT = "%Y-%m-%d %H:%M:%S"
+# --------------------------------------------------------------------------
+# crawl_time：**两种线格式并存**（P4-7 的混合机队窗口）
+# --------------------------------------------------------------------------
+# 旧（Phase 4 之前的 worker）：``datetime.now(UTC+8).strftime('%Y-%m-%d %H:%M:%S')``
+#     -> ``'2026-08-05 10:00:00'``，东八区墙上时间，``%z`` 被**刻意丢掉**。
+# 新（P4-7 之后的 worker）    ：``datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')``
+#     -> ``'2026-08-05T02:00:00Z'``，RFC3339 UTC。
+#
+# **两种必须同时收**，而且这不是防御性编程：worker 与 server 是分开部署的，
+# 一次 worker 灰度发布期间，同一秒钟进 outbox 的两行就可能一新一旧。
+# 只认新格式 ⇒ 老 worker 的每条记录都退化成 fallback（recorded_at）；
+# 只认旧格式 ⇒ 新 worker 的 ``'…T02:00:00Z'`` 用 ``s[:19]`` + 旧 fmt 解析会
+# **抛 ValueError**（'T' 对不上空格）从而也退到 fallback。两个方向都不会静默
+# 错 8 小时——这正是 P4-7 选 ``T``+``Z`` 而不是 ``'+00:00'`` 的原因：
+# ``'2026-08-05 02:00:00+00:00'[:19]`` 会**解析成功**然后被重新贴上 +08:00。
+#
+# 判形规则（``parse_crawl_time``）：
+#   * 带偏移 / 带 Z            -> 照单全收，不做任何假设（tz_aware）
+#   * 裸的、空格分隔           -> 老 worker，补 +08:00（legacy_cst）
+#   * 裸的、``T`` 分隔          -> 新一代形状但丢了标记，按 UTC（naive_utc）
+#   * 其它                     -> 兜底 recorded_at + 计数（unparsable / missing）
+# 三种形态各有计数器，混合机队因此是**可观测**的，而不是靠猜。
+_WORKER_LEGACY_TZ = timezone(timedelta(hours=8))
+_CRAWL_TIME_LEGACY_FMT = "%Y-%m-%d %H:%M:%S"
+_CRAWL_TIME_ISO_FMT = "%Y-%m-%dT%H:%M:%S"
 
-#: Phase 4 之前的固定值（计划 §2.1）。
-#: 特别不要拿 ``data['zip_code']`` 去合成 zip_observed：那是 glow-ingress-line1，
-#: 文档记着近乎无用，一个错的 confirmed 比一个诚实的 unverified 更糟。
-_ZIP_VERIFY_UNVERIFIED = "unverified"
-_COMPLETENESS_UNMEASURED = 0
+#: ``parse_crawl_time`` 的判形结果。
+CRAWL_TIME_TZ_AWARE = "tz_aware"
+CRAWL_TIME_LEGACY_CST = "legacy_cst"
+CRAWL_TIME_NAIVE_UTC = "naive_utc"
+CRAWL_TIME_MISSING = "missing"
+CRAWL_TIME_UNPARSABLE = "unparsable"
+
+#: 判形 -> 计数器名。``tz_aware`` 是常态，不计数（计数器是给异常状况用的）。
+_CRAWL_TIME_COUNTER = {
+    CRAWL_TIME_LEGACY_CST: "collected_at_legacy_cst",
+    CRAWL_TIME_NAIVE_UTC: "collected_at_naive_utc",
+}
 
 #: 严格模式：事件流没引导起来时 _emit_outbox 是抛异常还是记账跳过。
 #: 默认**跳过**——事件流的 bug 不该把 worker 真实采集到的结果一起毁掉；
@@ -243,24 +281,70 @@ def outcome_for_error_type(error_type: Optional[str]) -> str:
 def classify_success_outcome(data: Optional[dict]) -> str:
     """success=True 路径的 outcome（设计规格 §2.4）。
 
-    404 分支（worker/engine.py:1167-1174）用 ``success=True`` 提交
-    ``_default_result`` + ``title='[商品不存在]'``，而且**过不了**
-    ``_is_parse_failure``（它要求 current_price/buybox_price/stock_count/
-    stock_status/brand 全在 _NA_VALUES 里，而 ``_default_result`` 的
-    stock_count 是 ``'0'``，不是成员）。于是 30/40 个字段带着 "N/A" 落库。
-    服务端唯一能看见的信号就是这个哨兵标题。
+    **两个信号，缺一不可**（P4-3 之后）：
+
+    1. ``_outcome``（``worker/engine.py`` 的 ``META_OUTCOME``）。新 worker 的
+       404 提交体里**没有 title**——title 是慢变字段，P4-3 之后 404 分支一个
+       慢变字段都不提交（提交就是覆盖）。于是哨兵标题这条唯一的旧信号消失了，
+       只看标题会把每一个 404 判成 ``ok``，而 ``ok`` 是会算哈希、会被消费侧
+       upsert 进 ``catalog.products`` 的那一档：实测好页 → 404 → 好页
+       = 两次 review_hash 翻转 = 两次误复审，正是契约 §6.5 要防的模式。
+    2. 哨兵标题。**老 worker 照旧只有它**，而且 worker 与 server 分开部署，
+       灰度期两种提交体必然同时在线。掉队的那一半不能静默降级。
+
+    顺序是「先标题、后 ``_outcome``」，因为标题哨兵是页面级证据（那个字符串
+    只可能由 worker 在真的拿到 404/空页时写进去），而 ``_outcome`` 是一个
+    自述字段。两者冲突时以更强的证据为准；``_outcome`` 只在标题不表态时说话。
+    worker 侧的值域是 ``{'ok','not_found'}``（``EVENT_WORKER_OUTCOMES``）——
+    一个 worker 声称自己 ``stale`` 是没有意义的（它不知道自己的租约还在不在），
+    所以集外值一律忽略、回到 ``ok``，再由服务端自己的判定接管。
 
     另外四个哨兵在今天的 worker 里到不了 success 路径（它们各自设置
     last_error_type 然后 continue 重试循环，最终走 success=False 提交），
     这里照样认出来当 parse_failed —— 一次 dict 查找的代价，换将来 worker
     改动时的失败安全。
     """
-    title = (data or {}).get("title")
+    d = data if isinstance(data, dict) else {}
+    title = d.get("title")
     if title == NOT_FOUND_TITLE:
         return "not_found"
     if title in _PARSE_FAIL_TITLES:
         return "parse_failed"
+    declared = d.get(EVENT_META_OUTCOME)
+    if isinstance(declared, str) and declared.strip() in EVENT_WORKER_OUTCOMES:
+        return declared.strip()
     return "ok"
+
+
+def payload_says_not_found(result: Optional[dict]) -> bool:
+    """payload 自身是否声明「商品不存在」。``_build_event_row`` 用它兜底。
+
+    为什么 relay 侧还要再判一次（``_emit_outbox`` 明明已经用
+    ``classify_success_outcome`` 定过 body 的 outcome）：**outbox 行会跨越
+    服务端升级**。它是一张库表，不是内存队列——升级前入队、升级后才被 relay
+    认领的行，带的是**老代码写的 body**（新 worker 的 404 payload 被判成
+    ``'ok'``）。那个窗口的宽度是「重启时 outbox 的深度」，不是零。
+    """
+    d = result if isinstance(result, dict) else {}
+    if d.get("title") == NOT_FOUND_TITLE:
+        return True
+    declared = d.get(EVENT_META_OUTCOME)
+    return isinstance(declared, str) and declared.strip() == "not_found"
+
+
+def reconcile_outcome(outcome: str, result: Optional[dict]) -> Tuple[str, bool]:
+    """(最终 outcome, 是否被 payload 纠正)。**只允许 ok -> not_found 一个方向。**
+
+    单向是刻意的：``blocked`` / ``parse_failed`` / ``stale`` 都是**服务端事实**
+    （封锁判定、``_is_parse_failure``、租约门），payload 无权推翻它们——尤其是
+    ``stale``，它说的是"这次提交到得太晚了"，与页面上有什么毫无关系。
+    而 ``ok -> not_found`` 是**保守**方向：not_found 的记录不算哈希、
+    不进 ``catalog.products``（契约 §6.3），认错了顶多少一次 upsert，
+    漏认则是两次误复审 + 一条被占位符覆盖的目录记录。
+    """
+    if outcome == "ok" and payload_says_not_found(result):
+        return "not_found", True
+    return outcome, False
 
 
 def normalize_outcome(outcome: Optional[str]) -> Tuple[str, bool]:
@@ -303,6 +387,124 @@ def normalize_zip(value: Any) -> Tuple[str, bool]:
     if s.isdigit() and 0 < len(s) < 5:
         return s.zfill(5), True
     return s, False
+
+
+# --------------------------------------------------------------------------
+# Phase 4 的四个采集质量信号（worker payload 的 `_` 键 -> scrape_events 的列）
+# --------------------------------------------------------------------------
+# 共同口径：**归一化，不停摆**。集外值就地纠正 + 计数 + 一条 WARNING，绝不
+# 依赖列上的 CHECK —— 一条脏信号不该让整条事件流回滚（schema.py 的 Phase 4
+# 常量段写了同一条理由）。
+#
+# 第二条共同口径：**只许削弱，不许加强**。这四个字段是消费侧用来决定
+# 「这条记录算不算数」的，服务端把一个说不清的值补成 confirmed / 15 /
+# 'selectolax' 就是在伪造观测。所以拿不准一律落到最弱的那个值
+# （unverified / 0 / NULL），而不是最方便的那个。
+#
+# 由此推出的一条禁令：**绝不拿 ``data['zip_code']`` 去合成 zip_observed。**
+# 那一列是**请求**邮编（P4-1 之后语义已收紧成「恒为请求值」），拿它当观测值
+# 会让 zip_verify 变成一个恒为 confirmed 的常量 —— 一个错的 confirmed 比一个
+# 诚实的 unverified 更糟。观测值只有一个来源：worker 从 glow-ingress-line2
+# 抽出来放进 payload 的 ``_zip_observed``（worker/parser.py 的
+# ``_parse_zip_observed``，它同样拒绝「取不到就回退成请求值」的兜底）。
+
+def normalize_zip_observed(value: Any) -> Tuple[Optional[str], bool]:
+    """(zip_observed 或 None, 是否被改写)。
+
+    ``None`` 是**合法且常见**的：页面没挂 glow 挂件时 worker 如实交 null
+    （worker/parser.py 的 ``_parse_zip_observed`` 明确不做「取不到就回退成请求值」
+    的兜底）。所以「没有观测值」不算改写、不计数。
+
+    补零规则与 ``normalize_zip`` **必须一致**：这两个值会被
+    ``reconcile_zip_verify`` 直接比较，一边补零一边不补，就会凭空造出
+    ``mismatch``（'01001' vs '1001'）。
+    """
+    if value is None:
+        return None, False
+    if isinstance(value, bool) or isinstance(value, (list, dict, tuple, set)):
+        # jsonb 里什么都可能出现；这几种绑到 text 列就是 DataError，
+        # 而 relay 对 DataError 的处置是把整行搬进死信表。
+        return None, True
+    s = str(value).strip()
+    if not s:
+        return None, False
+    if s.isdigit() and 0 < len(s) < 5:
+        return s.zfill(5), True
+    return s, False
+
+
+def normalize_zip_verify(value: Any) -> Tuple[str, bool]:
+    """(封闭集内的 zip_verify, 是否被改写)。集外一律 ``unverified``。
+
+    列是 ``NOT NULL``，所以这里永远要给出一个值。老 worker 的 payload 里根本
+    没有 ``_zip_verify`` 这个键 —— 那不是错误，是「没测过」，正好就是
+    ``unverified`` 的字面含义，因此**不计入** coerced（否则灰度期计数器会被
+    老 worker 刷满，真正的脏值反而看不见）。
+    """
+    if value is None:
+        return EVENT_ZIP_VERIFY_DEFAULT, False
+    v = value.strip() if isinstance(value, str) else ""
+    if v in EVENT_ZIP_VERIFY_VALUES:
+        return v, False
+    return EVENT_ZIP_VERIFY_DEFAULT, True
+
+
+def reconcile_zip_verify(verify: str, zip_requested: Any,
+                         zip_observed: Optional[str]) -> Tuple[str, bool]:
+    """服务端的一致性复核：``confirmed`` 必须真的自洽。返回 (值, 是否被降级)。
+
+    唯一一条规则：``verify == 'confirmed'`` 却带着一个**与请求值不同**的
+    ``zip_observed`` ⇒ 降级成 ``mismatch``。这不是 worker 现在会犯的错
+    （``derive_zip_verify`` 结构上不会这么写），而是「这两列将来任何一处漂了，
+    消费侧不会拿到一条自相矛盾的记录」的守卫 —— 而它守的恰好是本阶段最贵的
+    那个故障：一条声称 zip A、价格其实是 zip B 的记录会把一个商品的价格序列
+    悄悄劈成两组，且从数据上完全看不出异常（契约 §6.1 硬规则）。
+
+    **只降不升**：观测值与请求值相同却写着 ``mismatch`` 的记录原样留着。
+    把它改成 ``confirmed`` 是在替 worker 断言「这一页确实按目标邮编渲染」，
+    而 relay 手上并没有那个证据。
+    """
+    if verify != "confirmed" or not zip_observed:
+        return verify, False
+    req = str(zip_requested or "").strip()
+    if req and zip_observed != req:
+        return "mismatch", True
+    return verify, False
+
+
+def normalize_completeness(value: Any) -> Tuple[int, bool]:
+    """(0..15 的位图, 是否被改写)。拿不准一律 0 = **未测量**（契约 §6.4）。
+
+    ``bool`` 显式拒收：``True`` 是 ``int`` 的子类，直接放行会变成 bit0=1
+    ——「面包屑区块存在」，而那是一句没人测过的断言。
+    ``None``（老 worker 根本没有这个键）不计入 coerced，理由同 zip_verify。
+    """
+    if value is None:
+        return EVENT_COMPLETENESS_UNMEASURED, False
+    if isinstance(value, bool):
+        return EVENT_COMPLETENESS_UNMEASURED, True
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return EVENT_COMPLETENESS_UNMEASURED, True
+    if 0 <= iv <= EVENT_COMPLETENESS_MAX:
+        return iv, False
+    return EVENT_COMPLETENESS_UNMEASURED, True
+
+
+def normalize_parse_engine(value: Any) -> Tuple[Optional[str], bool]:
+    """(``'selectolax'`` / ``'lxml'`` / None, 是否被改写)。
+
+    列可空，而契约 §6.3 已经写明「Phase 4 之前可能为 null」——所以 NULL 是
+    一个消费者已经准备好的合法值，比猜一个引擎名好得多：parse_engine 存在的
+    唯一理由是让「引擎导致的分歧」可归因，一条猜出来的溯源信息比没有更坏。
+    """
+    if value is None:
+        return None, False
+    v = value.strip() if isinstance(value, str) else ""
+    if v in EVENT_PARSE_ENGINES:
+        return v, False
+    return None, True
 
 
 def scrub_nul(obj: Any) -> Tuple[Any, int]:
@@ -353,26 +555,72 @@ def dumps_body(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def parse_crawl_time(crawl_time: Any) -> Tuple[Optional[datetime], str]:
+    """``result.crawl_time`` -> (UTC datetime 或 None, 判形)。见上方 P4-7 注释块。
+
+    判形是**返回值的一部分**而不是内部细节：混合机队期间「这条是老 worker 还是
+    新 worker 发的」是运维要看的数字，调用方据此记计数器。
+
+    ``datetime`` 实例（``save_result()`` 这类进程内直调路径能喂进来）：带 tzinfo
+    的照收；**裸 datetime 沿用旧口径当 +08:00**。那是本函数改动之前的行为，
+    而 JSON 路径根本产生不了 datetime 对象，所以这条分支只影响 Python 直调方
+    ——对它们保持等价比换一个同样是猜的口径更有价值。
+    """
+    if isinstance(crawl_time, datetime):
+        if crawl_time.tzinfo is not None:
+            return crawl_time.astimezone(timezone.utc), CRAWL_TIME_TZ_AWARE
+        return (crawl_time.replace(tzinfo=_WORKER_LEGACY_TZ).astimezone(timezone.utc),
+                CRAWL_TIME_LEGACY_CST)
+
+    s = crawl_time.strip() if isinstance(crawl_time, str) else ""
+    if not s:
+        return None, CRAWL_TIME_MISSING
+
+    # 1) 完整 ISO-8601 / RFC3339。Python 3.11 的 fromisoformat 认 'Z'，
+    #    这里仍然显式换成 '+00:00'，免得哪天跑在更老的解释器上静默退化。
+    iso = s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        dt = None
+    if dt is not None:
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc), CRAWL_TIME_TZ_AWARE
+        # 裸值：靠分隔符判代际。老 worker 是 strftime('%Y-%m-%d %H:%M:%S')，
+        # 空格；'T' 只可能来自 ISO 系的写法，那一代的时钟是 UTC。
+        if "T" in s or "t" in s:
+            return dt.replace(tzinfo=timezone.utc), CRAWL_TIME_NAIVE_UTC
+        return (dt.replace(tzinfo=_WORKER_LEGACY_TZ).astimezone(timezone.utc),
+                CRAWL_TIME_LEGACY_CST)
+
+    # 2) fromisoformat 咬不动的形状（尾巴上挂了别的东西）。旧实现是
+    #    ``strptime(s[:19], fmt)``，那个前缀切法救得回 '2026-08-05 10:00:00.123'
+    #    这类值，照样保留 —— 两种分隔符各试一次。
+    head = s[:19]
+    for fmt, form in ((_CRAWL_TIME_LEGACY_FMT, CRAWL_TIME_LEGACY_CST),
+                      (_CRAWL_TIME_ISO_FMT, CRAWL_TIME_NAIVE_UTC)):
+        try:
+            naive = datetime.strptime(head, fmt)
+        except (ValueError, TypeError):
+            continue
+        tz = _WORKER_LEGACY_TZ if form == CRAWL_TIME_LEGACY_CST else timezone.utc
+        return naive.replace(tzinfo=tz).astimezone(timezone.utc), form
+
+    return None, CRAWL_TIME_UNPARSABLE
+
+
 def parse_collected_at(crawl_time: Any, fallback: datetime) -> Tuple[datetime, bool]:
     """``result.crawl_time`` -> UTC datetime。返回 (值, 是否用了兜底)。
 
-    worker/parser.py:1332 写的是 ``datetime.now(_CN_TZ).strftime('%Y-%m-%d %H:%M:%S')``
-    —— 东八区的墙上时间，**不带偏移标记**。直接当 UTC 解析会让每条记录的
-    collected_at 早 8 小时。
+    ``parse_crawl_time`` 的窄口径包装，保持 Phase 2 起就有的两元组签名。
+    兜底值是 ``recorded_at``（服务端时钟）：它不是采集时刻，但与之相差一次
+    提交的时间；而 collected_at 是 NOT NULL 列，且契约 §6.2 已经把它标成
+    「仅供参考，排序权威是 seq」。
     """
-    if isinstance(crawl_time, datetime):
-        dt = crawl_time
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_WORKER_TZ)
-        return dt.astimezone(timezone.utc), False
-    s = (crawl_time or "").strip() if isinstance(crawl_time, str) else ""
-    if s:
-        try:
-            naive = datetime.strptime(s[:19], _CRAWL_TIME_FMT)
-            return naive.replace(tzinfo=_WORKER_TZ).astimezone(timezone.utc), False
-        except (ValueError, TypeError):
-            pass
-    return fallback, True
+    dt, _form = parse_crawl_time(crawl_time)
+    if dt is None:
+        return fallback, True
+    return dt, False
 
 
 _BOUND_RE = re.compile(r"FOR\s+VALUES\s+FROM\s+\((.+?)\)\s+TO\s+\((.+?)\)",
@@ -694,6 +942,25 @@ class EventStreamMixin:
                     "marketplace_coerced": 0,
                     "zip_padded": 0,
                     "collected_at_fallback": 0,
+                    # ---- Phase 4：采集质量信号 ----
+                    # 各自的归一化次数。这些不是错误计数，是**漂移探针**：
+                    # 常态应当恒为 0，任何一个开始增长都意味着 worker 与
+                    # server 对某个字段的口径已经对不上了。
+                    "zip_verify_coerced": 0,
+                    "zip_verify_downgraded": 0,
+                    "zip_observed_coerced": 0,
+                    "completeness_coerced": 0,
+                    "parse_engine_coerced": 0,
+                    # payload 把一条 body 里写着 'ok' 的记录纠正成 not_found
+                    # 的次数。>0 = outbox 里还压着升级前入队的行（正常，会归零），
+                    # 持续增长 = _emit_outbox 那侧的分类漏了。
+                    "outcome_recovered_not_found": 0,
+                    # 混合机队观测：老 worker（裸 UTC+8）与丢了标记的裸 ISO 各多少条。
+                    "collected_at_legacy_cst": 0,
+                    "collected_at_naive_utc": 0,
+                    # zip_requested 的来源仲裁（见 _emit_outbox）。
+                    "zip_requested_from_payload_meta": 0,
+                    "zip_requested_mismatch": 0,
                     "partitions_created": 0,
                     "range_checks_repaired": 0,
                     "gen_minted": 0,
@@ -952,15 +1219,43 @@ class EventStreamMixin:
             logger.warning("未知 outcome %r -> %s（task_id=%s）",
                            outcome, norm_outcome, task_id)
 
-        if zip_requested is None:
-            # 没有 task 行可读（B1 / save_result 路径）时才退回 payload。
-            # 正常路径必须由调用方传 tasks.zip_code：data['zip_code'] 是
-            # **观测到的**邮编（worker/parser.py:111 / :847 会用页面上
-            # glow-ingress-line1 的值覆盖它），拿它当分组键会把一个商品的
-            # 价格序列悄悄劈成两组。
-            zip_requested = data.get("zip_code")
-            if zip_requested_source is None:
-                zip_requested_source = "payload"
+        # ---------------- zip_requested 的三级仲裁（P4-1）----------------
+        # 1) 调用方传进来的 tasks.zip_code —— 服务端事实，非空时永远赢；
+        # 2) payload 的 `_zip_requested` —— worker **真正**发出请求时用的邮编；
+        # 3) payload 的 zip_code。
+        #
+        # 为什么需要第 2 级：worker 的 target_zip 是
+        # ``(task.zip_code or "").strip() or worker.zip_code``，也就是说
+        # **tasks.zip_code 为空串时，真正请求的是 worker 的默认邮编**，
+        # 而 tasks 行上那个空串既非空（`is not None`）又不是真相。照收它等于
+        # 把整批记录的分组键 (asin, marketplace, zip_requested) 写成 ''，
+        # 消费侧那一组价格序列的邮编从此不可知（契约 §6.1 硬规则）。
+        #
+        # 第 3 级的注释在 P4-1 之前是「data['zip_code'] 是**观测**邮编」——
+        # 那句话现在**过期了**：`_slx_parse_zip_code` / `_parse_zip_code`
+        # （读 glow-ingress-line1 的那两个）已随 P4-1 删除，`zip_code` 的语义
+        # 收紧成「恒为请求邮编」。观测值另有其列（zip_observed）。
+        meta_zip = data.get(EVENT_META_ZIP_REQUESTED)
+        meta_blank = meta_zip is None or not str(meta_zip).strip()
+        if zip_requested is None or not str(zip_requested).strip():
+            if not meta_blank:
+                zip_requested = meta_zip
+                zip_requested_source = "payload_meta"
+                self._bump("zip_requested_from_payload_meta")
+            elif zip_requested is None:
+                zip_requested = data.get("zip_code")
+                if zip_requested_source is None:
+                    zip_requested_source = "payload"
+        elif not meta_blank and (normalize_zip(meta_zip)[0]
+                                 != normalize_zip(zip_requested)[0]):
+            # 服务端事实与 worker 自述不一致：**服务端赢**（消费侧的分组键必须
+            # 与 tasks 行对得上，否则同一个批次的记录会散进两组），但这必须响。
+            # 正常情况下这个计数器恒为 0：worker 的 target_zip 就是从这一行读的。
+            self._bump("zip_requested_mismatch")
+            logger.warning(
+                "zip_requested 不一致：tasks 行=%r，worker 自述=%r（task_id=%s "
+                "asin=%s）。按 tasks 行落库；worker 可能没读到 per-ASIN 邮编。",
+                zip_requested, meta_zip, task_id, asin)
         zip_norm, padded = normalize_zip(zip_requested)
         if padded:
             self._bump("zip_padded")
@@ -1523,10 +1818,49 @@ class EventStreamMixin:
         if padded:
             self._bump("zip_padded")
 
-        collected_at, fell_back = parse_collected_at(result.get("crawl_time"),
-                                                     recorded_at)
-        if fell_back:
+        # ---- outcome：payload 的兜底纠正（升级窗口里入队的老 body）----
+        outcome, recovered = reconcile_outcome(outcome, result)
+        if recovered:
+            self._bump("outcome_recovered_not_found")
+            logger.warning(
+                "body 记的 outcome 是 ok，但 payload 自称 not_found（source_id=%s "
+                "asin=%s）——按 not_found 落库。多半是升级前入队的 outbox 行。",
+                body.get("source_id"), body.get("asin"))
+
+        # ---- Phase 4：四个采集质量信号 ----
+        zip_observed, zo_coerced = normalize_zip_observed(
+            result.get(EVENT_META_ZIP_OBSERVED))
+        if zo_coerced:
+            self._bump("zip_observed_coerced")
+        zip_verify, zv_coerced = normalize_zip_verify(
+            result.get(EVENT_META_ZIP_VERIFY))
+        if zv_coerced:
+            self._bump("zip_verify_coerced")
+        zip_verify, downgraded = reconcile_zip_verify(
+            zip_verify, zip_requested, zip_observed)
+        if downgraded:
+            self._bump("zip_verify_downgraded")
+            logger.warning(
+                "zip_verify=confirmed 但 zip_observed=%r != zip_requested=%r"
+                "（source_id=%s）——降级成 mismatch。一条声称 A 而价格属于 B 的"
+                "记录会把这个商品的价格序列悄悄劈成两组。",
+                zip_observed, zip_requested, body.get("source_id"))
+        completeness, c_coerced = normalize_completeness(
+            result.get(EVENT_META_COMPLETENESS))
+        if c_coerced:
+            self._bump("completeness_coerced")
+        parse_engine, pe_coerced = normalize_parse_engine(
+            result.get(EVENT_META_PARSE_ENGINE))
+        if pe_coerced:
+            self._bump("parse_engine_coerced")
+
+        collected_at, form = parse_crawl_time(result.get("crawl_time"))
+        if collected_at is None:
+            collected_at = recorded_at
             self._bump("collected_at_fallback")
+        counter = _CRAWL_TIME_COUNTER.get(form)
+        if counter:
+            self._bump(counter)
 
         # outcome != 'ok' 时两个哈希都写 NULL —— 这比计划 §2.1（只说了
         # review_hash）更严一点，是有意的：not_found 的 payload 有 30/40 个
@@ -1542,19 +1876,19 @@ class EventStreamMixin:
             "asin": body.get("asin") or "",
             "marketplace": marketplace,
             "zip_requested": zip_requested,
-            "zip_observed": None,                       # Phase 4
-            "zip_verify": _ZIP_VERIFY_UNVERIFIED,       # Phase 4
+            "zip_observed": zip_observed,
+            "zip_verify": zip_verify,
             "collected_at": collected_at.isoformat(),
             "recorded_at": recorded_at.isoformat(),
             "outcome": outcome,
-            "completeness": _COMPLETENESS_UNMEASURED,   # Phase 4，见契约注意事项
+            "completeness": completeness,
             "error_type": body.get("error_type"),
             "error_detail": body.get("error_detail"),
             "batch_id": body.get("batch_id"),
             "task_id": body.get("task_id"),
             "worker_id": body.get("worker_id"),
             "attempt": body.get("attempt") or 0,
-            "parse_engine": None,                       # Phase 4
+            "parse_engine": parse_engine,
             "review_hash": review_hash,
             "slow_hash": slow_hash,
             "hash_ver": st["hash_adapter"].hash_ver,
@@ -1893,9 +2227,17 @@ __all__ = [
     "RELAY_TICK_SECONDS",
     "classify_success_outcome",
     "outcome_for_error_type",
+    "payload_says_not_found",
+    "reconcile_outcome",
     "normalize_outcome",
     "normalize_marketplace",
     "normalize_zip",
+    "normalize_zip_observed",
+    "normalize_zip_verify",
+    "reconcile_zip_verify",
+    "normalize_completeness",
+    "normalize_parse_engine",
+    "parse_crawl_time",
     "parse_collected_at",
     "parse_partition_bound",
     "parse_hash_ver",

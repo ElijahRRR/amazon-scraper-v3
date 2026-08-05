@@ -56,13 +56,27 @@ def _stub_if_missing(name, **attrs):
 _stub_if_missing("aiofiles")
 _stub_if_missing("httpx", AsyncClient=object)
 # worker / common 用真实包（空 __init__）；common.config 只依赖 os，直接用真实的。
-# 这几个是【有意】顶掉的：目的是在不拉起 curl_cffi/selectolax 的前提下
-# 加载真实的 engine.py，所以无条件桩。
-_stub("worker.proxy", get_proxy_manager=lambda: object())
-_stub("worker.session", AmazonSession=object)
-_stub("worker.parser", AmazonParser=object)
-_stub("worker.metrics", MetricsCollector=object)
-_stub("worker.adaptive", AdaptiveController=object, TokenBucket=object)
+#
+# ⚠ 这五行以前是无条件 `_stub(...)`，理由写的是「在不拉起 curl_cffi/selectolax 的
+# 前提下加载真实的 engine.py」。**D-27 之后那个理由不再成立**（selectolax 与
+# dateparser 已经装进 venv，就是为了让解析器测试跑生产路径），而无条件桩有一个
+# 它当初没有的代价：pytest 在**收集期**就 import 全部测试文件，所以这几行会在
+# 任何用例开始跑之前先把 `worker.parser` 换成桩件；`worker/engine.py:325` 的
+# `from worker.parser import AmazonParser` 是**模块级绑定**，一旦绑到 `object`，
+# 本文件的 `tearDownModule` 再怎么还原 sys.modules 也换不回来。
+#
+# 实测（Phase 4 收口，见 D-53）：
+#   pytest tests/test_session_slot.py tests/test_engine_not_found.py  -> 25 failed
+#   pytest tests/test_engine_not_found.py tests/test_session_slot.py  -> 75 passed
+# 默认字母序恰好是安全的那一种，所以六道门全绿、缺陷不可见。
+#
+# 改成 `_stub_if_missing` 之后，桩件回到它的本意——「补上没装的」，而不是
+# 「顶掉装了的」。本环境里只有 worker.session 真的缺依赖（curl_cffi）。
+_stub_if_missing("worker.proxy", get_proxy_manager=lambda: object())
+_stub_if_missing("worker.session", AmazonSession=object)
+_stub_if_missing("worker.parser", AmazonParser=object)
+_stub_if_missing("worker.metrics", MetricsCollector=object)
+_stub_if_missing("worker.adaptive", AdaptiveController=object, TokenBucket=object)
 
 # 屏蔽 basicConfig 噪声
 import logging

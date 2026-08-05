@@ -429,6 +429,60 @@ EVENT_OUTCOMES = ("ok", "not_found", "blocked", "parse_failed", "stale")
 EVENT_MARKETPLACES = ("amazon.com",)
 EVENT_DEFAULT_MARKETPLACE = "amazon.com"
 
+# ==========================================================================
+# Phase 4：采集质量信号的值域
+# ==========================================================================
+# 列本身在 Phase 2 的 DDL 里就已经建好了（zip_observed / zip_verify /
+# completeness / parse_engine，见下方建表语句），Phase 4 补的是**值域**——
+# 在此之前 relay 往这四列写的是固定占位值（relay.py 里四个 `# Phase 4` 注释）。
+#
+# 与 EVENT_OUTCOMES 同一条口径：**一个 CHECK 约束都不加**。
+# 越界值撞上 CHECK 会让 relay 事务永久回滚 ⇒ 整条流停摆，而它本来只是
+# 一条记录的某个信号脏了。归一化全部在 relay 的 Python 里做，并各带一个计数器
+# （`zip_verify_coerced` / `completeness_coerced` / `parse_engine_coerced`），
+# 停摆换成「计数器 + 一条 WARNING」。
+#
+# 还有第二个理由：这四列是 Phase 2 就建出来的，生产库里**已经存在**。
+# `CREATE TABLE IF NOT EXISTS` 对已存在的表是 no-op，所以任何写在 DDL 里的新
+# CHECK 只会出现在**全新库**上 —— 老库与新库的失败面从此不同，那比没有约束更糟。
+
+#: ``zip_verify`` 封闭集（契约 §6.1 / 计划 §2.1）。worker 侧的同一份定义在
+#: worker/parser.py 的 ZIP_VERIFY_* 与 worker/engine.py 的 ZIP_VERIFY_DOMAIN；
+#: 三处不许漂，由 tests/pgdb/test_phase4_fields.py 的跨模块对表用例看守。
+EVENT_ZIP_VERIFY_VALUES = ("confirmed", "assumed", "mismatch", "unverified")
+
+#: 拿不准时写哪个。**永远是最弱的那个**：一个错的 confirmed 比一个诚实的
+#: unverified 更糟（消费侧拿 zip_verify 决定这条价格算不算数）。
+EVENT_ZIP_VERIFY_DEFAULT = "unverified"
+
+#: ``parse_engine`` 值域（P4-9）。集外值一律写 NULL —— 契约 §6.3 已经写明
+#: 「可能为 null」，猜一个引擎名等于伪造溯源信息。
+EVENT_PARSE_ENGINES = ("selectolax", "lxml")
+
+#: ``completeness`` 位图（契约 §6.4，位定义已对外公布，**不许改**）。
+EVENT_COMPLETENESS_BREADCRUMB = 1     # bit0 面包屑区块存在
+EVENT_COMPLETENESS_DETAIL = 2         # bit1 详情表存在
+EVENT_COMPLETENESS_IMAGE = 4          # bit2 主图集存在
+EVENT_COMPLETENESS_MEASURED = 8       # bit3 这次采集真的测量过上面三项
+EVENT_COMPLETENESS_MAX = 15
+#: 0 = **未测量**，不是「三项都缺」。契约 §6.4 用整段写明了这个区别。
+EVENT_COMPLETENESS_UNMEASURED = 0
+
+#: worker 在提交体里放的 `_` 前缀采集元数据键（worker/engine.py 的 META_*）。
+#: `_` 开头的键**永远不会落进 asin_data**（写入侧只遍历 ASIN_DATA_FIELDS），
+#: 它们唯一的去处就是事件流：payload 原样收下，relay 按下面这张表绑到同名列。
+EVENT_META_OUTCOME = "_outcome"
+EVENT_META_ZIP_REQUESTED = "_zip_requested"
+EVENT_META_ZIP_OBSERVED = "_zip_observed"
+EVENT_META_ZIP_VERIFY = "_zip_verify"
+EVENT_META_COMPLETENESS = "_completeness"
+EVENT_META_PARSE_ENGINE = "_parse_engine"
+
+#: worker **只**判定这两个 outcome。blocked / parse_failed / stale 全是服务端的
+#: 判定（租约门 / _is_parse_failure / outcome_for_error_type），一个 worker 声称
+#: 自己 stale 是没有意义的 —— 它不知道自己的租约还在不在。
+EVENT_WORKER_OUTCOMES = ("ok", "not_found")
+
 EVENT_STREAM_DDL: List[str] = [
     "CREATE SCHEMA IF NOT EXISTS scraper",
 
@@ -721,6 +775,16 @@ class SchemaMixin:
         # Database 里（tests/pgdb/test_skeleton.py 就在直接调 init_tables）。
         if hasattr(self, "init_event_stream"):
             await self.init_event_stream()
+
+        # Phase 6：给 sync_meta 装上「ack_seq 永远不是 0」的 CHECK，并顺手自愈
+        # 已经躺在库里的那种幽灵值。必须在事件流建表之后（约束长在 sync_meta 上）。
+        # 装不上不挡启动：Python 侧的 read_ack_floor() 是同一条不变式的第一道防线，
+        # 这一条是给「有人手工 UPDATE」准备的第二道。
+        if hasattr(self, "ensure_retention_schema"):
+            try:
+                await self.ensure_retention_schema(conn)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("保留期防线（sync_meta CHECK）装不上，跳过: %s", e)
 
     async def verify_schema(self, strict: bool = True) -> List[str]:
         """比对实际列序与 EXPECTED_COLUMNS。返回问题列表（空 = 一致）。

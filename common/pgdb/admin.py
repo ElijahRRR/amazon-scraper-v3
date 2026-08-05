@@ -81,14 +81,32 @@ class AdminMixin:
 
         保留协程形状（永不返回、按 checkpoint_interval 心跳），这样
         ``start_maintenance`` / ``close`` 的取消语义与 SQLite 版逐字一致。
+
+        **Phase 6 起这个循环不再是纯空转**：每一跳问一次保留期要不要跑
+        （``maybe_run_retention()`` 自己按 ``SYNC_RETENTION_INTERVAL_S`` 节流，
+        默认 20 分钟一次）。这里是本进程唯一够得着的周期性入口 —— SQLite 版的
+        对应位置也正是审计 §3.6 给保留期指定的挂载点。
+
+        保留期的任何异常都**只记日志**：维护协程一旦因为它退出，
+        ``close()`` 的取消语义、以及将来挂在这里的其它周期任务会一起没了，
+        代价远大于「这一轮没裁成」。
         """
         logger.info(
-            f"🔧 维护协程启动（PG 后端：无 WAL checkpoint 需求，空转 "
-            f"{checkpoint_interval}s/轮）")
+            f"🔧 维护协程启动（PG 后端：无 WAL checkpoint 需求，"
+            f"心跳 {checkpoint_interval}s/轮，兼保留期节拍）")
         while True:
             # SQLite 版在这里做 TRUNCATE checkpoint 并按 busy 标志重试；
             # PG 下没有任何对应动作，只保留心跳节奏与取消点。
             await asyncio.sleep(checkpoint_interval)
+            if not hasattr(self, "maybe_run_retention"):
+                continue
+            try:
+                await self.maybe_run_retention()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.error("保留期本轮异常（维护协程继续）: %s: %s",
+                             type(e).__name__, e)
 
     def start_maintenance(self, checkpoint_interval: int = 120):
         """由 lifespan 调用：拉起后台维护协程（幂等）。

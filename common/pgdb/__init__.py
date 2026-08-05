@@ -24,20 +24,26 @@ from common.pgdb.pool import PoolMixin
 from common.pgdb.relay import EventStreamMixin
 from common.pgdb.results_read import ResultsReadMixin
 from common.pgdb.results_write import ResultsWriteMixin
+from common.pgdb.retention import RetentionMixin
 from common.pgdb.schema import SchemaMixin
 from common.pgdb.tasks import TasksMixin
 
 
 class Database(PoolMixin, SchemaMixin, BatchesMixin, TasksMixin,
                ResultsWriteMixin, ResultsReadMixin, MediaMixin, AdminMixin,
-               EventStreamMixin):
+               EventStreamMixin, RetentionMixin):
     """异步 PostgreSQL 数据库管理器 v3（与 SQLite 版公开面等价）。
 
-    ``EventStreamMixin``（Phase 2 事件流）排在最后，且它的方法**一个都不在
-    PUBLIC_API 里** —— 那个元组是与 SQLite 的对等面契约，事件流是 PG 独有的
-    增量，不该出现在里面。两道导入期自检对此是安全的：``_assert_api_complete``
+    ``EventStreamMixin``（Phase 2 事件流）与 ``RetentionMixin``（Phase 6
+    保留期 + ack 闩锁）排在最后，且它们的方法**一个都不在 PUBLIC_API 里**
+    —— 那个元组是与 SQLite 的对等面契约，事件流与保留期都是 PG 独有的增量，
+    不该出现在里面。两道导入期自检对此是安全的：``_assert_api_complete``
     只查"少了没有"，``_assert_single_owner`` 只遍历已在 PUBLIC_API 里的名字，
     所以新方法能干净地导进来，同时仍然受重复定义检查保护。
+
+    ``RetentionMixin`` 排在 ``EventStreamMixin`` 之后是有意的：它复用后者的
+    ``_seq_high_water()``（判「这个分区还会不会收到新行」的唯一正确判据），
+    自己一个字都不重复实现。
     """
 
 
@@ -79,7 +85,8 @@ PUBLIC_API = (
 )
 
 _MIXINS = (PoolMixin, SchemaMixin, BatchesMixin, TasksMixin, ResultsWriteMixin,
-           ResultsReadMixin, MediaMixin, AdminMixin, EventStreamMixin)
+           ResultsReadMixin, MediaMixin, AdminMixin, EventStreamMixin,
+           RetentionMixin)
 
 
 def _assert_api_complete():

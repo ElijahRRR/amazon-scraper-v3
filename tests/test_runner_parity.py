@@ -13,6 +13,9 @@
 
 看守一：没有任何测试依赖「当前线程事件循环」这个全局槽位。
 看守二：``unittest discover`` 收不到的用例，必须**说出来**，不许无声消失。
+看守三：没有任何测试在模块级**无条件**把一个真的装得上的模块换成桩件（D-53）。
+
+同一个病根的第三次发作：**测试结果不许是收集顺序的函数。**
 """
 from __future__ import annotations
 
@@ -20,6 +23,8 @@ import ast
 import asyncio
 import importlib
 import os
+import subprocess
+import sys
 import unittest
 
 _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +117,84 @@ class EventLoopOwnershipTests(unittest.TestCase):
         finally:
             if previous is not None and not previous.is_closed():
                 asyncio.set_event_loop(previous)
+
+
+class ModuleStubLeakTests(unittest.TestCase):
+    """桩件是用来「补上没装的」，不是「顶掉装了的」（D-53）。
+
+    背景（Phase 4 收口实测）：``tests/test_session_slot.py`` 在模块级无条件
+    ``_stub("worker.parser", AmazonParser=object)``。而 pytest 在**收集期**就
+    import 全部测试文件，``worker/engine.py:325`` 的
+    ``from worker.parser import AmazonParser`` 又是**模块级绑定**——于是先被收集的
+    那个文件说了算，``tearDownModule`` 还原 ``sys.modules`` 也换不回已经绑好的名字::
+
+        pytest tests/test_session_slot.py tests/test_engine_not_found.py  -> 25 failed
+        pytest tests/test_engine_not_found.py tests/test_session_slot.py  -> 75 passed
+
+    默认字母序恰好是安全的那一种，所以六道门全绿、缺陷完全不可见——与 B6
+    （conftest 只有 pytest 读）、D-27（事件循环全局槽位）是同一个病根的第三次发作。
+
+    看守方式是 AST 而不是「跑一遍看红不红」：那样只有在**不利的收集顺序**下才会
+    翻红，等于把看守本身也变成收集顺序的函数。
+    """
+
+    #: 只查这几个包——桩第三方库（httpx / aiofiles / curl_cffi）是正当的，
+    #: 本仓库自己的模块被顶掉才是问题。
+    _OWN_PACKAGES = ("worker.", "common.", "server.")
+
+    @staticmethod
+    def _is_really_importable(modname):
+        """在**干净的子进程**里判断这个模块能不能 import。
+
+        用子进程而不是当场 ``importlib.import_module``：本用例的运行时机不确定，
+        当场 import 会往 ``sys.modules`` 里塞东西，等于用一个顺序依赖去查另一个
+        顺序依赖。``find_spec`` 也不行——``worker/session.py`` 文件在（有 spec），
+        但它模块级 ``from curl_cffi import ...``，本环境装不上，桩它是正当的。
+        """
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import {modname}"],
+            cwd=os.path.dirname(_TESTS_DIR),
+            capture_output=True, timeout=120,
+        )
+        return proc.returncode == 0
+
+    def test_no_test_file_unconditionally_stubs_an_importable_own_module(self):
+        offenders = []
+        for relpath, src in _iter_test_sources():
+            if relpath == os.path.basename(__file__):
+                continue
+            tree = ast.parse(src, filename=relpath)
+            # **只**看模块体的直接子语句。包在 try/except ImportError 里的桩
+            # （tests/test_engine_not_found.py 对 worker.session 就是这么写的）
+            # 是有条件的，正是我们希望的写法，不算违规。
+            for node in tree.body:
+                if not (isinstance(node, ast.Expr)
+                        and isinstance(node.value, ast.Call)):
+                    continue
+                call = node.value
+                fn = call.func
+                name = fn.attr if isinstance(fn, ast.Attribute) else (
+                    fn.id if isinstance(fn, ast.Name) else None)
+                if name != "_stub":          # _stub_if_missing 是对的，放行
+                    continue
+                if not (call.args and isinstance(call.args[0], ast.Constant)
+                        and isinstance(call.args[0].value, str)):
+                    continue
+                target = call.args[0].value
+                if not target.startswith(self._OWN_PACKAGES):
+                    continue
+                if self._is_really_importable(target):
+                    offenders.append(f"{relpath}:{node.lineno} -> {target}")
+
+        self.assertEqual(
+            offenders, [],
+            "这些地方在模块级**无条件**把一个真的装得上的本仓库模块换成了桩件。\n"
+            "pytest 在收集期 import 全部测试文件，被顶掉的模块会被其它文件的模块级 "
+            "`from X import Y` 绑死，`tearDownModule` 还原不回来 —— 于是用例是否通过"
+            "取决于收集顺序（D-53 实测：25 failed vs 75 passed，只差文件顺序）。\n"
+            "改用 `_stub_if_missing(...)`：装了就用真的，没装才补桩。\n"
+            f"违规处：{offenders}",
+        )
 
 
 class PytestOnlySuitesTests(unittest.TestCase):

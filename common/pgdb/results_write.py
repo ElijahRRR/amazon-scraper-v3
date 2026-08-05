@@ -80,6 +80,11 @@ change_type='new' 的 asin_changes；UPDATE 分支做变动检测、且只在 is
 * ``data["content_hash"] / data["title_bullets_hash"]`` 仍然**原地写回入参 dict**
   （database.py:1827-1828）。accept_results_batch 的调用方会看到被改过的 dict，
   这是现状，照抄。
+  **P4-3 的例外**：判定为 not_found 时这两个键**既不算也不写**（连键都不留）。
+  仓库里没有任何调用方在写库之后读它们（全仓 grep：只有 `_shared` 的再导出、
+  pool.py 的一句注释、以及本文件自己），所以「原地写回」这条约定的观察者只剩
+  `_save_result_inner_unlocked` 自己和事件流 payload —— 后者留空正是想要的语义
+  （relay 对 outcome != 'ok' 的两个哈希本来也一律写 NULL）。
 * ``has_baseline = bl_price is not None`` —— 只看 baseline_price 一列。
   baseline_price 为 NULL 时，即使其余五个 baseline 列都有值也**不做**变动检测。
   这是现状，照抄。
@@ -153,10 +158,73 @@ from common.pgdb.outbox import (
     result_context,
     scoped_context,
 )
-from common.pgdb.relay import outcome_for_error_type
+from common.pgdb.relay import outcome_for_error_type, payload_says_not_found
 from common.pgdb.pool import text_affinity  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+# ==========================================================================
+# P4-3：not_found 提交体不许碰目录层（服务端侧的那一半）
+# ==========================================================================
+# worker 侧（worker/engine.py 的 `_build_not_found_result`）已经**不提交**这些
+# 字段了，靠的是写入循环的 `val = data.get(f); if val is not None:` —— 键不在
+# dict 里就不进 SET 子句。那为什么服务端还要再拦一道？三个理由，每一个都实测过：
+#
+#  1. **老 worker 还在线。** worker 与 server 独立部署，灰度期一定存在
+#     「新 server + 老 worker」的窗口，而老 worker 的 404 提交体是
+#     `_default_result()` 全套 30/40 个 "N/A" + `title='[商品不存在]'`。
+#     实测（scratchpad/p43_probe.py 的对照组）：那份 payload 把 title / brand /
+#     category_tree / upc_list / image_urls / manufacturer 全部抹成占位符。
+#     服务端这一道是**唯一**能覆盖那半个机队的防线。
+#
+#  2. **两个哈希是服务端自己算的，worker 拦不住。**
+#     `_save_result_inner_unlocked` 无条件 `data["content_hash"] = ...`，
+#     所以它们永远 `is not None`、永远进 SET 子句。实测（新 worker 的提交体，
+#     目录列全都保住了的那一轮）：
+#         content_hash        f80a6c44227f… -> f71511fd9a5f…
+#         title_bullets_hash  8780e130b238… -> b99834bc19bb…
+#     后者立刻产出一条**假的**变动记录：
+#         title_bullets  title_or_bullets_changed  'title=Anker…' -> 'title='
+#     ——正是契约 §6.5 要防的「占位符进/出触发复审」模式。
+#
+#  3. **is_auto 批次上还会污染 baseline。** 同一次实测：
+#         baseline_price 29.99 -> N/A   baseline_stock_count 12 -> 0
+#         baseline_title_bullets_hash 8780e130… -> b99834bc…（空值的哈希）
+#     baseline 是变动检测的基准，被 404 写坏之后，**下一次成功采集**还会再产出
+#     一条假变动（占位符 -> 真值）。一次 404 = 两次误报。
+#
+# 字段集与 worker 侧同源：`common.slowhash.SLOW_HASH_FIELDS`（慢变/身份层的定义
+# 真源）+ 三个同族目录字段，再加上服务端自己算的两个哈希列。
+# 跨模块一致性由 tests/pgdb/test_phase4_fields.py 的对表用例看守。
+#
+# 快变字段（价格/库存/配送/BSR/评分/卖家）**照旧写占位值**：404 时它们确实不可得，
+# 留着上一次的价格比写 N/A 危险得多。采集参数（crawl_time/zip_code/site/
+# product_url）同理照写——它们描述的是**这一次采集**。
+try:                                        # pragma: no cover - 导入期分支
+    from common.slowhash import SLOW_HASH_FIELDS as _SLOW_FIELDS
+except Exception:                           # noqa: BLE001
+    # 单文件被裁掉时不该让写路径崩掉；退化成显式清单（与 §4.1 的字段集同值）。
+    _SLOW_FIELDS = ()
+    logger.error("common.slowhash 不可导入，P4-3 的目录层保护退化成显式清单")
+
+NOT_FOUND_PRESERVED_FIELDS = frozenset(
+    # image_ids 是 image_urls 归约出来的派生键（slowhash.extract_image_ids），
+    # asin_data 里的列叫 image_urls。
+    (set(_SLOW_FIELDS) - {"image_ids"}) | {
+        "title", "brand", "product_type", "manufacturer", "model_number",
+        "part_number", "country_of_origin", "is_customized", "long_description",
+        "upc_list", "parent_asin", "package_dimensions", "package_weight",
+        "item_dimensions", "item_weight", "first_available_date",
+        "bullet_points", "category_tree", "root_category_id",
+        "variant_attributes",
+        "image_urls",
+        "category_ids",      # 与 category_tree 同源（同一段面包屑的 href 与文本）
+        "ean_list",          # 与 upc_list 同族的 listing 资产
+        "variation_asins",   # 变体家族
+        # 服务端自己算的两个派生列（见上面第 2 条）
+        "content_hash", "title_bullets_hash",
+    })
 
 
 class ResultsWriteMixin:
@@ -462,8 +530,26 @@ class ResultsWriteMixin:
         bid = self.as_int(batch_id)
 
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        data["content_hash"] = _compute_content_hash(data)
-        data["title_bullets_hash"] = _compute_title_bullets_hash(data)
+
+        # P4-3：这一次提交是不是「商品不存在」。判据与事件流**完全同源**
+        # （relay.payload_says_not_found：`_outcome == 'not_found'` 或哨兵标题），
+        # 所以不可能出现「行按 404 处理、事件却标着 ok」这种两侧打架的记录。
+        # 见文件头 NOT_FOUND_PRESERVED_FIELDS 上方的三条实测理由。
+        not_found = payload_says_not_found(data)
+
+        if not_found:
+            # 两个哈希**不算也不写**。它们是慢变字段的派生量，而这次提交里
+            # 一个慢变字段都没有：算出来的是「空记录的哈希」，写进去就等于把
+            # 目录层的指纹抹掉，并在下一次成功采集时产出一条假变动。
+            # 不写 key（而不是写 None）：下面两个循环的判据是 `is not None`，
+            # 缺键与 None 在那里等价；缺键还能让事件流的 payload 如实反映
+            # 「这次没有可哈希的内容」，与 relay 对 outcome != 'ok' 一律写
+            # NULL 哈希的口径一致。
+            data.pop("content_hash", None)
+            data.pop("title_bullets_hash", None)
+        else:
+            data["content_hash"] = _compute_content_hash(data)
+            data["title_bullets_hash"] = _compute_title_bullets_hash(data)
 
         # ================= Phase 2 事件流写钩子（规格 §1.1 的 H3）=================
         # 位置是承重的，三条理由各自独立：
@@ -521,7 +607,14 @@ class ResultsWriteMixin:
             bl_tb_hash = existing_dict.get("baseline_title_bullets_hash")
             has_baseline = bl_price is not None  # baseline 存在才做变动检测
 
-            if has_baseline:
+            # P4-3：404 上**不做**变动检测。一次 404 不是一次「价格/标题变了」的
+            # 观测，是「这一页不存在了」——拿占位符去和 baseline 比，产出的是
+            #     price_stock   stock_qty:down   'price=29.99…' -> 'price=N/A…'
+            #     title_bullets title_or_bullets_changed  'title=Anker…' -> 'title='
+            # 两条假变动（实测，见文件头第 2/3 条）。title_bullets 那条现在已经
+            # 被"不算哈希"消掉了（空 hash 走 `bl_tb_hash and new_tb_hash` 短路），
+            # 价格那条只能在这里拦。
+            if has_baseline and not not_found:
                 # 1. 价格/库存变动（对比 baseline）
                 price_change = _compare_price(bl_price, data.get("current_price"))
                 buybox_change = _compare_price(bl_buybox, data.get("buybox_price"))
@@ -564,6 +657,11 @@ class ResultsWriteMixin:
             for f in ASIN_DATA_FIELDS:
                 if f in ("asin", "screenshot_path"):
                     continue
+                # P4-3：404 一个目录层字段都不许写。新 worker 本来就不提交它们
+                # （缺键 ⇒ 下面 `is not None` 跳过），这一道拦的是**老 worker**
+                # 交上来的 30/40 个 "N/A"——灰度期它们还在线。
+                if not_found and f in NOT_FOUND_PRESERVED_FIELDS:
+                    continue
                 val = data.get(f)
                 if val is not None:
                     update_fields.append(f"{f} = ?")
@@ -576,7 +674,11 @@ class ResultsWriteMixin:
                 update_values.append(text_affinity(resolved_screenshot_path))
 
             # 定时采集：同时更新 baseline
-            if is_auto:
+            # P4-3：404 除外。baseline 是变动检测的**基准**，让一次 404 把它写成
+            # 占位符，等于给下一次成功采集预约一条假变动（占位符 -> 真值）。
+            # 实测：baseline_price 29.99 -> N/A、baseline_title_bullets_hash
+            # 变成空记录的哈希。基准必须来自一次真正看见了商品页的采集。
+            if is_auto and not not_found:
                 update_fields.append("baseline_price = ?")
                 update_values.append(text_affinity(data.get("current_price")))
                 update_fields.append("baseline_buybox_price = ?")
@@ -605,6 +707,11 @@ class ResultsWriteMixin:
             for f in ASIN_DATA_FIELDS:
                 if f in ("asin", "screenshot_path"):
                     continue
+                # P4-3：同 UPDATE 分支。这里没有旧值可保，但结果同样重要——
+                # 目录列留 NULL（"没观测到"）而不是占位符（"观测到了是空"）。
+                # 这两者在导出与哈希里是完全不同的两件事。
+                if not_found and f in NOT_FOUND_PRESERVED_FIELDS:
+                    continue
                 val = data.get(f)
                 if val is not None:
                     insert_fields.append(f)
@@ -615,18 +722,22 @@ class ResultsWriteMixin:
                 insert_values.append(text_affinity(resolved_screenshot_path))
 
             # 首次入库：baseline = 当前值（无论手动还是定时）
-            insert_fields.extend([
-                "baseline_price", "baseline_buybox_price",
-                "baseline_stock_count", "baseline_stock_status",
-                "baseline_title_bullets_hash", "baseline_updated_at",
-            ])
-            insert_values.extend([
-                text_affinity(data.get("current_price")),
-                text_affinity(data.get("buybox_price")),
-                text_affinity(data.get("stock_count")),
-                text_affinity(data.get("stock_status")),
-                text_affinity(data.get("title_bullets_hash")), now,
-            ])
+            # P4-3：除非这一次就是 404。用占位符播种 baseline 会让**第一次成功
+            # 采集**变成一条假变动（'N/A' -> '29.99'）；留 NULL 则 has_baseline
+            # 为假，变动检测安静地等到第一次真正看见商品页的定时采集。
+            if not not_found:
+                insert_fields.extend([
+                    "baseline_price", "baseline_buybox_price",
+                    "baseline_stock_count", "baseline_stock_status",
+                    "baseline_title_bullets_hash", "baseline_updated_at",
+                ])
+                insert_values.extend([
+                    text_affinity(data.get("current_price")),
+                    text_affinity(data.get("buybox_price")),
+                    text_affinity(data.get("stock_count")),
+                    text_affinity(data.get("stock_status")),
+                    text_affinity(data.get("title_bullets_hash")), now,
+                ])
 
             insert_fields.extend(["created_at", "updated_at"])
             insert_values.extend([now, now])

@@ -521,20 +521,47 @@ router = APIRouter(prefix="/api/v1/sync", tags=["sync"],
 
 四个端点见 §5。
 
-### Phase 4 — 数据质量（worker 侧，3-4d）
+### Phase 4 — 数据质量（worker 侧）✅ 已完成
 
-| 项 | 修什么 |
-|---|---|
-| `zip_observed` | 改用 `worker/ziputil.py` 的 `glow-ingress-line2` 抽取，不再用 `line1`（实测几乎恒返回 None） |
-| `zip_verify` | 请求值 vs 观测值的判定结果 |
-| `completeness` 位图 | **按 HTML 区块存在性判定**：面包屑区块 / 详情表 / 主图集 |
-| 404 分支 | 改为 `outcome='not_found'`，**不写占位符覆盖慢变字段** |
-| `manufacturer` 污染 | `_map_detail` 的子串匹配命中 "Manufacturer recommended age"，改精确匹配 |
-| set 顺序不定 | `upc_list` / `variation_asins` 的 `set()+join` 全部改为排序输出 |
-| `parse_engine` | 记录 selectolax / lxml |
-| 四个结转字段 | `rating` / `review_count` / `seller_id` / `seller_name` 补进 `_default_result`，消除 lxml 路径的旧值结转 |
-| 时区 | `crawl_time` 改带时区 UTC |
-| `site` 值域 | 三处不一致（parser 写 `"US"`、列默认 `'amazon.com'`、dataclass 默认 `'amazon.com'`）统一 |
+> ⚠ **本阶段黄金 100% 失明**，三个独立原因：`crawl_time` 及所有时间戳键在
+> `tests/golden/harness.py:34` 的 `_VOLATILE_KEYS` 里被擦成 `<VOLATILE>`；
+> 黄金夹具喂的是**合成** result dict，64 步里从不 import `worker.parser`；
+> bool/int 在差分器的类型检查里豁免。**「golden 仍然 64/64」对本节零信息量。**
+> 决策台账见 `common/pgdb/OWNERSHIP.md` D-39..D-44（服务端）、D-55..D-62（worker 侧）。
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| `zip_observed` / `zip_verify` | ✅ 改读 `glow-ingress-line2`，**import** `ziputil._GLOW_LINE2_RE` 而非复制 | `worker/parser.py`（D-55） |
+| `zip_code` 语义 | ✅ 收紧成「恒为请求邮编」；删掉读 line1 的两个函数 | 同上 |
+| `completeness` 位图 | ✅ 按 **HTML 区块存在性** 判定，第 3 位 = MEASURED | `worker/parser.py`（D-56） |
+| 404 分支 | ✅ `_build_not_found_result`：慢变字段**一个键都不提交** | `worker/engine.py`（D-57） |
+| `manufacturer` 污染 | ✅ 子串 → 归一化键精确匹配 | `worker/parser.py`（D-58） |
+| set 顺序不定 | ✅ 四处 `set()` 全部 `sorted()` | `worker/parser.py`（D-59） |
+| `parse_engine` | ✅ 每个分支第一句赋值 | `worker/parser.py`（D-62） |
+| 四个结转字段 | ✅ 进 `_default_result` + 三个解析函数改成引擎无关 | `worker/parser.py`（D-60） |
+| 时区 | ✅ RFC3339 UTC（`T`+`Z`），relay 双格式并存 | `worker/parser.py`（D-61）/ `relay.py`（D-41） |
+| `site` 值域 | ⛔ **有意不做**，推迟到 Phase 5 | D-44 / 见下 |
+| 四个信号接进事件流 | ✅ 归一化 + 计数器，**零 CHECK** | `common/pgdb/relay.py` / `schema.py`（D-39） |
+| 404 的服务端写入保护 | ✅ 不写目录列 / 不算两个哈希 / 不更新 baseline | `common/pgdb/results_write.py`（D-43） |
+
+**验收（全部实测）**：接缝探针走 **真 HTML → 真 parser → 真 engine
+`_attach_collection_meta` → 真 HTTP → 真 relay → `/api/v1/sync/records` 原始响应**，
+五个信号（`zip_observed` / `zip_verify` / `completeness` / `parse_engine` / `outcome`）
+在三条记录上**逐一相等**；同一条链路上「好页→软降级→好页」
+**只比哈希 = 2 次误复审，契约 §6.5 合取门 = 0 次**。
+
+---
+
+#### 计划错在哪里（实现阶段发现）
+
+| # | 原文 | 实测 | 处置 |
+|---|---|---|---|
+| 1 | 「`site` 值域三处不一致…**统一**」 | 统一的收益为负。`site` 是**导出列**（`EXPORTABLE_FIELDS`，表头「站点」），改值即改已交付给 erpAPI 的数据，而**只有 `crawl_time` 拿到了用户确认**；它承载的信号另有权威来源（事件流 `marketplace`，D-26/§2.3 已钉成封闭集，relay 明文拒绝透传 `site`）；它在 `SLOW_HASH_FIELDS` 之外，改它修不好任何一条误复审；`asin_data` 每 ASIN 一行、无版本，**回填不可逆**。 | **不做**，推迟到 Phase 5 并行验证期——那时新旧两套系统同时在跑，可以对照，回滚成本最低。PG 列默认值也不动：`verify_schema` 不比默认值（改了不会被拦），但那个默认值**从不生效**（parser 每次都写这一列），改动是纯噪声，而与冻结的 `common/database.py:513` 保持逐字一致是有价值的。见 D-44。 |
+| 2 | 隐含假设：`_default_result` 里补上四个结转字段就够了 | 补上之后 **404 分支也会带上它们**（`"N/A"`），而此前那四个键是**缺席**的、被 `if val is not None` 跳过。于是「修好 lxml 结转」这一条会**新增**四列在每次 404 上被刷成 N/A。 | 两条改动**必须同批发布**（D-60 ⟷ D-57）。`_build_not_found_result` 把慢变层整体挡在提交体之外，四个字段作为快变字段照常写占位值——这是正确方向，但它是一处**可见的导出数据变更**，单独回滚任意一半都会退化。 |
+| 3 | 隐含假设：worker 侧「不提交那个键」就保住了目录层 | **三件事 worker 够不着**，全部实测（用**新** worker 的提交体、目录列已保住的那一轮）：(a) `content_hash` / `title_bullets_hash` 是服务端**无条件**算的，永远进 SET；(b) 后者立刻产出一条**假变动** `title=Anker… -> title=`；(c) `is_auto` 批次上四个 `baseline_*` 被写成占位符，于是**下一次成功采集还会再产出一条假变动**。一次 404 = 两次误报。 | 服务端补一道写入保护（D-43），判据与事件流**同源**（`relay.payload_says_not_found`）。**这是一处有意的 PG-only 分叉**：同样的缺陷在 `common/database.py` 里一字不差存在，而那个文件禁止修改。 |
+| 4 | 隐含假设：`crawl_time` 改格式是 worker 单方面的事 | `relay.parse_collected_at` 只 `strptime('%Y-%m-%d %H:%M:%S')`，实测新格式 → 退回 `recorded_at` 并 bump `collected_at_fallback`，**每一条记录**都如此。`relay.py:218` 早就留了一句「⚠ Phase 4 一改 worker 的时区，这一段立刻就错了」。 | relay 改成**双格式并存**（D-41）+ 三种判形各带计数器，灰度进度因此可观测。两种主形态实测落在**同一微秒**。 |
+| 5 | 隐含假设：`title == '[商品不存在]'` 是 404 的信号 | P4-3 把 `title` 从提交体里删掉了（它是慢变字段），于是那个**唯一**的旧信号消失，relay 会把每个 404 判成 `ok` —— 而 `ok` 是会算哈希、会被消费侧 upsert 进 `catalog.products` 的那一档。 | 改成**两个信号**：哨兵标题优先（页面级证据）、其次 payload 的 `_outcome`；`_build_event_row` 再兜一次底，**只允许 `ok → not_found`**。兜底覆盖的是 outbox **跨服务端升级**这个真实窗口（它是库表，不是内存队列）。见 D-40。 |
+| 6 | 未提及 | `parse_product(resp.text, asin, zip_code)` 传的是 task 的**原始** zip，而请求实际用 `target_zip = (zip_code or "").strip() or self.zip_code`。`tasks.zip_code = NULL` 时 payload 里 `zip_code=None` 被 `if val is not None` 跳过 ⇒ `asin_data.zip_code` **保留上一次采集的邮编**。 | 全部改用 `target_zip`（D-55）。连带：`tasks.zip_code = ''` 时那一行既非 NULL 又不是真相，服务端因此需要**三级仲裁**（D-42），且仲裁必须**只有一处**（D-54）。 |
 
 ### Phase 5 — 并行验证 + 切换（3d + 观察）
 
@@ -544,18 +571,37 @@ router = APIRouter(prefix="/api/v1/sync", tags=["sync"],
 4. 切换：停旧、起新、重采几小时把当前语料灌进去。
 5. 观察 48h：relay 滞后、outbox 深度、accept 延迟、磁盘增长速率。
 
-### Phase 6 — 保留期 + ack（2d）
+### Phase 6 — 保留期 + ack ✅ 已完成
 
 ```
-floor = max(磁盘应急下界, min(分区时间下界, ack_seq))
+floor = max(磁盘应急下界, min(分区时间下界, ack_seq - slack))
+                                            ^^^^^^^ 计划漏了这一项，见下
 ```
 
-- **`ack_seq` 初值必须是 NULL 而不是 0**。给 0 的话 `min(时间下界, 0) = 0`，
-  保留期永远匹配不到行——看起来实现了，实际一行不裁，直到磁盘满。
-- 保留期 = `DROP TABLE <分区>`，前提是该分区的 `max(seq) <= floor`。
-- 触发应急裁剪时写持久的 `forced_prune_log`，在 `/status` 上一直返回直到消费者逐条确认。
-  **不能只在响应里放瞬时布尔**——消费者宕机正是触发前提。
-- `min_available_seq` 永远现算，绝不缓存。
+| 项 | 状态 | 落点 |
+|---|---|---|
+| 下界代数 | ✅ `combine_floors()`，硬下界 = 磁盘/分区数/行数 | `common/pgdb/retention.py`（D-45） |
+| 整分区 `DROP` | ✅ **只裁前缀**，绝不 row DELETE，绝不打洞 | 同上（D-47） |
+| `ack_seq` 永不为 0 | ✅ **三层**：唯一读取入口 + 库上 CHECK + 公式断言 | 同上（D-46） |
+| `forced_prune_log` 持久闩锁 | ✅ `sync_meta` 里的 JSON 数组，`FOR UPDATE` 读改写 | 同上（D-49） |
+| 逐条确认 | ✅ **第五个端点** `POST /ack-prune`，不是 `/ack` 的字段 | `server/api/sync.py`（D-50） |
+| `min_available_seq` 现算 | ✅ 做成**每轮体检**（`_assert_no_cached_bounds`），命中就一个分区都不裁 | `retention.py`（D-48） |
+| OVERLAP 余量 | ✅ `max_safe_overlap` 发布给消费侧，硬下限 = 契约的 200 | `sync.py` + 契约 §7（D-47） |
+| `/status` 观测面 | ✅ 六个字段本来就有，新增 `max_safe_overlap` + 现算的 `retention` 块 | `sync.py` |
+| 维护协程接线 | ✅ 每跳一次 `maybe_run_retention()`，自己按 20min 节流；异常只记日志 | `common/pgdb/admin.py` |
+
+---
+
+#### 计划错在哪里（实现阶段发现）
+
+| # | 原文 | 实测 | 处置 |
+|---|---|---|---|
+| 1 | 「保留期 = `DROP TABLE <分区>`，**前提是该分区的 `max(seq) <= floor`**」 | **这条判据不够**。实测（`scratchpad/why409.py`）：`soft_floor=39999050`（已经比 `ack_seq` 低整整 1000）、`p1.max_seq=20000400`（远在下界之下，一行都没多裁），裁完 `min(seq)` 却跳到 **`40000001`**，高出下界 950 —— 一个完全守规矩的消费者当场 `409 cursor_below_retention`。根因：`seq` **允许有空洞**（序列非事务性，分区边界处更是一大段），而 `/records` 的守卫比的是 `min(seq)`，**不是 floor**。 | 增加 `_visible_floor_after()`：**「裁完之后 `min_available_seq` 会变成多少」也必须 ≤ floor**。它严格蕴含计划那条。**余量必须留在守卫看得见的那个量上，否则等于没留。** 配对对照 `test_control_a_floor_that_ignores_the_window_...` 把两道防线都摘掉，同一个消费者立刻拿到 409。见 D-47。 |
+| 2 | 下界公式里没有 `slack` 项 | 契约 §7 要求消费者每轮从 `cursor - OVERLAP` 回拉，而 ack 下界允许裁到 `ack_seq` —— 重叠窗口必然落在保留窗口之外，**每 5 分钟一个假 409**。这正是 Phase 3 verify2 Finding 2 提出的不相容。 | 下界与 `ack_seq` 之间保底留 `SYNC_ACK_SLACK_SEQ`（默认 1000，硬下限 = 契约的 `OVERLAP=200`），并把它作为 `status.max_safe_overlap` **发布**给消费侧。契约 §7 新增「余量由谁留」一节，写明分工：采集侧留余量，消费侧**读那个字段而不是硬编码 200**。 |
+| 3 | 时间下界写作「分区时间下界」 | 直觉写法 `max(seq WHERE recorded_at < horizon)` 对**时钟前跳**毫无抵抗力：一次 NTP 跳变就能让它选中一个远高于预期的 seq。 | 改成 `min(seq WHERE recorded_at >= horizon) - 1`。 |
+| 4 | 未提及锁 | `DROP` 要父表的 `ACCESS EXCLUSIVE`，它会**排在**读者的 `ACCESS SHARE` 后面，而 PG 的锁队列是 FIFO —— 一个排队中的 `ACCESS EXCLUSIVE` 会把它**后面所有新读者**一起堵住。Phase 3 verify2 实测过一次 DROP 在读者后面堵了 >3s。 | 每次 `DROP` 都带 `SET LOCAL lock_timeout`（默认 5s），拿不到就放弃本轮。**宁可晚 20 分钟裁，也不要把整条同步流按分钟级堵死。** 见 D-51。 |
+| 5 | 未提及连接归属 | 借池连接会占用读侧背压面里的一条，而 `db.read()` 在池未就绪时**退回写连接**（`pool.py:940`）—— 在写连接上开 DDL 事务会把某个 `accept_results_batch` 的提交拖进来。 | 保留期跑在**自己的短命连接**上（与 relay 同一豁免），另加库级 `pg_try_advisory_lock`（与 relay 的锁分开）。见 D-52。 |
+| 6 | 「`ack_seq` 初值必须是 NULL 而不是 0」 | 方向对，但**只写对一次是不够的**：这种 no-op **没有症状**（日志正常、看起来实现了），靠代码评审防不住。 | 做成**结构上不可能**：唯一读取入口把「键不存在 / `'0'` / 非数字」统统映射成 `None`；库上一条 CHECK 让 `'0'` **存不进去**（含对已中招库的自愈，实测 `phantom_ack_repaired=1` 后立刻恢复裁剪）；公式里再断言一次。`/ack` 对 `ack_seq: 0` 回 200 空操作，且**不写 `ack_at`**（那会变成「有人 ack 过」的假证据）。见 D-46。 |
 
 ---
 
@@ -766,19 +812,28 @@ while True:
 
 ## 7. 工作量汇总
 
-| 阶段 | 工作量 | 阻塞沃尔玛侧？ |
-|---|---|---|
-| Phase 0 骨架 + 黄金样本 | 1d | — |
-| Phase 1 存储层移植 | 5-8d | 是 |
-| Phase 1.5 移植后简化（可选） | 1-2d | 否 |
-| Phase 2 事件流 + relay | 3-4d | 是 |
-| Phase 3 导出 API | 2-3d | 是 |
-| Phase 4 数据质量（worker 侧） | 3-4d | 部分（决定复审门何时可用） |
-| Phase 5 并行验证 + 切换 | 3d + 观察 | 是 |
-| Phase 6 保留期 + ack | 2d | 否 |
+| 阶段 | 工作量 | 阻塞沃尔玛侧？ | 状态 |
+|---|---|---|---|
+| Phase 0 骨架 + 黄金样本 | 1d | — | ✅ |
+| Phase 1 存储层移植 | 5-8d | 是 | ✅ |
+| Phase 1.5 移植后简化（可选） | 1-2d | 否 | ⛔ 有意推迟 |
+| Phase 2 事件流 + relay | 3-4d | 是 | ✅ |
+| Phase 3 导出 API | 2-3d | 是 | ✅ |
+| Phase 4 数据质量（worker 侧） | 3-4d | 部分（决定复审门何时可用） | ✅ |
+| **Phase 5 并行验证 + 切换** | 3d + 观察 | **是** | ⛔ **未做——唯一挡在生产切换前面的阶段** |
+| Phase 6 保留期 + ack | 2d | 否 | ✅ |
 
 **最快解锁沃尔玛侧**：Phase 0 → 1 → 2 → 3 → 5，约 **3 周**。
 Phase 4 可与试点并行，Phase 6 上线后补。
+
+> **实际交付顺序与此不同**：Phase 6 先于 Phase 5 完成了。这不影响正确性
+> （Phase 6 不阻塞沃尔玛侧），但意味着**保留期在真实负载上还没跑过** ——
+> 切换观察期要盯 `retention.counters.lock_timeouts` 与
+> `effective_floor_seq` 与 `ack_seq` 的距离，见 `.agent/MIGRATION_STATUS.md` §7.2。
+>
+> **Phase 5 是唯一还没有任何证据覆盖的环节。** 黄金证明的是「API 行为逐字节
+> 不变」，**不是**「两套系统采出来的商品数据一样」——后者恰恰是 Phase 5 要测的，
+> 而 Phase 4 刚刚**有意改变了** `worker/parser.py` 的多个导出字段（D-55..D-62）。
 
 ---
 
@@ -787,7 +842,7 @@ Phase 4 可与试点并行，Phase 6 上线后补。
 | # | 事项 | 影响 |
 |---|---|---|
 | 1 | ~~`marketplace` 值域~~ | **已定**：域名形式，`CHECK (marketplace IN ('amazon.com'))`。规则见 §2.3 |
-| 2 | ~~`crawl_time` 改带时区 UTC~~ | **已定**：erpAPI 可接受 |
+| 2 | ~~`crawl_time` 改带时区 UTC~~ | **已定且已落地**（Phase 4 / D-61）：erpAPI 可接受。线格式选 `'%Y-%m-%dT%H:%M:%SZ'` 而不是 `' +00:00'`——后者会让做 `s[:19]` 的陈旧消费者**静默**落后 8 小时，前者抛 `ValueError` 当场响。relay 双格式并存（D-41），灰度进度看 `collected_at_legacy_cst` 计数器 |
 | 3 | ~~PG 部署形态 / 备份策略~~ | **已定**：与 scraper 同机；中心库即持久副本。资源与恢复边界见 §0.1-0.3 |
 | 4 | ~~拉取节奏~~ | **已定**：5 分钟 / 每页 1000 |
 | 5 | **`catalog.products` 的主键：`asin` 还是 `(marketplace, asin)`？（需转给沃尔玛侧）** | ASIN 是按站点分配的，同一 ASIN 字符串在不同站点可以是不同商品。单列主键只在单站点前提下安全。**现在做成复合主键成本是零**（值域只有一个值）；等表里堆了几十万行、挂上审核结论与上架资产之后再改主键会很痛 |

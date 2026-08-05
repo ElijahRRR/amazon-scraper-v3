@@ -1,8 +1,10 @@
 # catalog_sync 拉取契约 v1
 
 > 采集侧（amazon-scraper-v3）→ 沃尔玛侧（catalog_sync）的**唯一**数据出口。
-> 实现：`server/api/sync.py`。规格来源：`.agent/pg_migration_plan.md` §4 / §5。
-> 契约测试：`tests/pgdb/test_sync_api.py`（37 个用例，每个对应本文的一句话）。
+> 实现：`server/api/sync.py` + `common/pgdb/retention.py`。
+> 规格来源：`.agent/pg_migration_plan.md` §4 / §5 / §Phase 6。
+> 契约测试：`tests/pgdb/test_sync_api.py` 与 `tests/pgdb/test_retention.py`
+> （每个用例对应本文的一句话）。
 >
 > **本文中标「硬性规则」的条目，违反即数据错误。** 它们不是建议，也不是
 > 「按需实现」——每一条都对应一种在数据上看不出异常的静默错误。
@@ -19,15 +21,44 @@
 ```
 每 5 分钟：
   GET /api/v1/sync/status          → 检查 gen / max_seq / forced_prune_log
+                                     并确认 OVERLAP <= max_safe_overlap
   GET /api/v1/sync/records?after_seq=<游标-OVERLAP>&limit=1000
       → 200：写 snapshots；outcome=='ok' 且 completeness_ok 才 upsert products
       → 409：告警 + 全量对账 + 停
   POST /api/v1/sync/ack {gen, ack_seq}
-  has_more 为 true 就继续下一页
+  has_more 为 true 就继续下一页（轮内翻页用 next_after_seq，不再减 OVERLAP）
+
+forced_prune_log 非空时（罕见，意味着真的丢了数据）：
+  记下区间 → 人工处理 → POST /api/v1/sync/ack-prune {gen, prune_ids}
 ```
 
 排序权威**只有 `seq`**。分组键**只有 `(asin, marketplace, zip_requested)`。
 「没有新记录」**永远不等于**商品下架。
+
+---
+
+## 0.1 本次发布的变更清单（Phase 4 + Phase 6）
+
+> 一页看完你侧要做什么。每一行都指向本文里写详细的那一节。
+> **`contract_version` 仍然是 1** —— 下面没有一条是不兼容变更：新增字段开始有
+> 真值、旧字段语义不变。唯一需要你**动手**的是第 4 行。
+
+| # | 变了什么 | 你侧要做的事 | 详见 |
+|---|---|---|---|
+| 1 | `zip_observed` / `zip_verify` 从恒定占位值变成**真实判定** | 建议：`zip_verify == 'mismatch'` 的记录不要写进该邮编分组的价格序列 | §6.1 |
+| 2 | `completeness` 开始出现非零值，`completeness_ok` **第一次可能为 `true`** | 无需改动（§6.5 的合取门本来就该这么写） | §6.4 |
+| 3 | `parse_engine` 开始有值（`selectolax` / `lxml`），`null` 仍合法 | 无需改动。可用它观察采集侧的灰度进度 | §6.3 |
+| 4 | **↑ 上面第 2 条的前提**：如果你侧开过「把 `completeness_ok` 视为 `true`」的临时旁路 | **必须撤掉。** 不撤则软降级页重新变成 products 的合法输入，合取门当场失效 | §6.4 |
+| 5 | `not_found` 的 `payload` **不再携带**商品慢变字段（此前是 30/40 个 `"N/A"`） | 无需改动（这类记录本来就不进 products）。但别再读 `payload.title` | §10.4 |
+| 6 | `payload.crawl_time` 的**线格式**改成 RFC3339 UTC；灰度期两种格式并存 | 无需改动。**顶层 `collected_at` 一个字没变**——请一直读它 | §6.2 |
+| 7 | 保留期不再只看天数：改成磁盘/容量/ack 三者取下界，且**整分区 DROP** | 无需改动 | §7「余量由谁留」 |
+| 8 | 新增 `status.max_safe_overlap`；保留期保证下界比 `ack_seq` 低至少这么多 | **读它，别把 `OVERLAP=200` 硬编码。** 断言 `OVERLAP <= max_safe_overlap` | §7 硬性规则 9 |
+| 9 | 新增第五个端点 `POST /api/v1/sync/ack-prune` + `status.forced_prune_log` | 实现「非空 ⇒ 硬停 + 记录区间 + 人工确认」这条支路 | §5.1 |
+| 10 | `ack_seq: 0` 明确定义成合法空操作（采集侧从库层面拒绝存 0） | 无需改动 | §5 |
+
+**没有变的东西**（免得你去找）：`seq` 的语义与排序权威性、`source_id` 的幂等
+锚点形状、分组键、`gen` 的硬停规则、`outcome` 的封闭集、`hash_ver`（仍是 `1`）、
+`review_hash` / `slow_hash` 的字段集与算法。
 
 ---
 
@@ -39,12 +70,13 @@
 | GET | `/api/v1/sync/status` | 每轮开头的健康/一致性检查 |
 | GET | `/api/v1/sync/counts` | 对账（抽样比对无漏采） |
 | POST | `/api/v1/sync/ack` | 确认位点，解锁采集侧的保留期裁剪 |
+| POST | `/api/v1/sync/ack-prune` | 逐条确认「强制裁剪」事件（§5.1）。**非常规调用** |
 
 > **前缀 `/api/v1` 是承重的，不要自己改写路径。**
 > 采集侧存在 `GET /api/results/{asin}` 与 `GET /api/export/{batch_name}` 两条
 > catch-all 路由，它们对不认识的名字回 **404**。把同步端点挂到那两个前缀下
 > （或者请求时写错前缀）会得到一个 404，而 404 很容易被读成「暂无数据」，
-> 于是游标永不推进、同步静默停摆。**本契约的四个端点永不用 404 表达「没有数据」。**
+> 于是游标永不推进、同步静默停摆。**本契约的五个端点永不用 404 表达「没有数据」。**
 
 ---
 
@@ -92,8 +124,8 @@
     "collected_at": "2026-08-04T09:11:02.114000Z",
     "recorded_at":  "2026-08-04T09:11:07.902311Z",
     "outcome": "ok",
-    "completeness": 0,
-    "completeness_ok": false,
+    "completeness": 15,
+    "completeness_ok": true,
     "error_type": null,
     "error_detail": null,
     "batch_id": 8123,
@@ -210,8 +242,13 @@ X = r.next_after_seq
 > ⚠ **`cursor_below_retention` 有一类已知的假阳性，是有意保留的。**
 > `seq` 允许有空洞。如果保留期边界正好落在一段被烧掉的号上，一个其实没掉窗的
 > 游标也会拿到 409。代价是一次多余的全量对账；反方向（放宽判据）的代价是
-> **静默丢数据**。采集侧 Phase 6 会持久记录实际裁掉的 floor，届时假阳性归零。
-> 在那之前：**收到 409 就照章办事，不要试图自己判断它是不是假阳性。**
+> **静默丢数据**。
+> **收到 409 就照章办事，不要试图自己判断它是不是假阳性。**
+>
+> 判据本身**不会**因保留期而放宽（那等于把守卫关掉）。改的是另一头：
+> 保留期在裁之前会先算「裁完之后 `min_available_seq` 会变成多少」，
+> 只有那个值仍然低于安全下界时才动手（§7「余量由谁留」）。
+> 于是常规裁剪**不会**把你的游标推到窗口外，你也就不会因为它拿到 409。
 
 ### 2.7 一致性保证
 
@@ -252,6 +289,34 @@ X = r.next_after_seq
   "observed_daily_insert_rate": 103882,
   "partitions": [{"name": "scrape_events_p1", "lo": 20000000, "hi": 40000000}],
   "future_partitions": 2,
+
+  "max_safe_overlap": 1000,      // ← 你的 OVERLAP 必须 ≤ 它。见 §7
+  "retention": {                 // 保留期的现算观测，排障用
+    "enabled": true,
+    "age_days": 30,
+    "age_horizon_utc": "2026-07-06T09:12:33Z",
+    "age_floor_seq": 39120040,   // 比这更老的行才允许被裁
+    "ack_seq": 41808200,         // 与顶层同源；从未 ack 是 null
+    "ack_slack_seq": 1000,       // = max_safe_overlap
+    "ack_floor_seq": 41807200,   // ack_seq - ack_slack_seq
+    "hard_floor_seq": 0,         // 磁盘/容量应急下界，0 = 没有压力
+    "hard_floor_reasons": [],    // 例 ["disk"] / ["partitions>6"] / ["rows>60000000"]
+    "effective_floor_seq": 39120040,
+    "min_seq": 39120041,
+    "max_seq": 41872330,
+    "next_seq": 41872331,
+    "free_disk_bytes": 41203105792,
+    "disk_floor_bytes": 8589934592,
+    "disk_pressure": false,
+    "max_retained_partitions": 6,
+    "retained_partitions": 3,
+    "max_event_rows": 60000000,
+    "estimated_rows": 41000000,
+    "droppable_now": [],
+    "forced_prune_pending": 0,
+    "partitions": [ /* 每个分区的 lo/hi/min_seq/max_seq/est_rows/size_bytes */ ],
+    "last_pass": { /* 上一轮裁剪的摘要，进程重启后为 null */ }
+  },
   "server_time_utc": "2026-08-04T09:12:33.418922Z"
 }
 ```
@@ -263,9 +328,16 @@ X = r.next_after_seq
   一行的 `seq`），因为 seq 会被回滚烧号。用来看数量级，别拿来对账。
 - `free_disk_bytes` 量的是 `free_disk_path` 那块盘。PG 与采集服务同机部署。
 - `forced_prune_log` 是**持久列表**，不是瞬时布尔。采集侧被迫应急裁剪时往里追加
-  一条，**一直返回**直到你逐条确认。看到非空 = 有数据被强制丢弃，需要人处理。
+  一条，**一直返回**直到你逐条确认（`POST /ack-prune`，§5.1）。
+  它存在采集侧的库里，采集侧进程重启、你侧宕机多久都不会丢 ——
+  **消费者宕机正是触发它的前提**，所以一个只出现在某次响应里的布尔等于没有。
+  看到非空 = 有数据被强制丢弃且**永远拿不回来了**，需要人处理，不是自动重试。
 - `dead_letters > 0` = 有行畸形到进不了事件流，被隔离了。那些行**不会**出现在
   `/records` 里，需要采集侧人工处理。
+- **`max_safe_overlap`：读它，不要把 200 硬编码进你侧。** 见 §7「余量由谁留」。
+- `retention` 整块是**每次调用现算**的观测值，不是缓存。`min_available_seq`
+  同理 —— 采集侧不允许把它写进任何元数据表（缓存值会落后于一次裁剪，
+  于是掉窗的游标拿到 200 而不是 409，两侧都察觉不到）。
 
 `min_available_seq` / `max_seq` 与 `/records` **逐字同源**，不会出现
 「status 说还有、records 回 409」这种状态。
@@ -359,6 +431,69 @@ X = r.next_after_seq
 - `ack_seq > max_seq` → `409 {"error": "ack_ahead_of_stream"}`，**不写任何东西**。
   确认一段本实例从未发出过的 seq，等于授权保留期裁掉你其实没拿到的数据。
 - 形状不对（缺字段 / `ack_seq` 是字符串或布尔 / 负数 / `gen` 空串）→ `422`。
+- **`ack_seq: 0` 是合法的空操作**：返回 200，`advanced: false`，
+  但采集侧**不落库**，`ack_seq` 仍然回 `null`。
+  0 的含义（「持久副本里一条都没有」）与「从未 ack」完全一致，
+  而采集侧的保留期下界是 `min(时间下界, ack_seq)` ——
+  存进一个 0 会让这个式子恒等于 0，保留期从此一行不裁直到磁盘写满。
+  所以采集侧从库层面就拒绝存 0。你**不需要**为此改什么，
+  但要知道：**冷启动时反复 ack 0 不会给你任何保护，也不会造成任何伤害。**
+
+---
+
+## 5.1 `POST /api/v1/sync/ack-prune`
+
+**只在 `/status.forced_prune_log` 非空时才用得上，不要放进拉取循环。**
+
+```jsonc
+// 请求：确认指定的几条
+{"gen": "a3f19c2b7e04", "prune_ids": [7, 8]}
+// 或者：把当前所有未确认的一次清掉（运维手动执行）
+{"gen": "a3f19c2b7e04", "all": true}
+```
+
+```jsonc
+// 200
+{
+  "contract_version": 1,
+  "gen": "a3f19c2b7e04",
+  "instance_id": "prod-hk-1",
+  "acknowledged": [7, 8],       // 本次真正被确认的 id
+  "unknown_ids": [],            // 你发来但闩锁里没有的 id（重发不算错误）
+  "forced_prune_log": [],       // 确认之后**还剩**哪些未确认
+  "retention_forced": false,
+  "server_time_utc": "…"
+}
+```
+
+`forced_prune_log` 的每一条形如：
+
+```jsonc
+{
+  "id": 7,
+  "from_seq": 39120041, "to_seq": 41000000,   // 被销毁的 seq 区间（闭区间）
+  "dropped_through_seq": 41000000,            // = to_seq，兼容字段
+  "ack_seq_at_time": 40000000,                // 事发时你的 ack 位点；从未 ack 是 null
+  "ts": "2026-08-04T09:00:00Z",
+  "partition": "scrape_events_p1",
+  "reason": "disk_floor",                     // disk_floor / disk_target / partition_cap / row_cap
+  "est_rows": 20000000, "size_bytes": 41203105792,
+  "soft_floor_seq": 40000000,                 // 本该停在这里，被应急闸门越过了
+  "free_disk_bytes": 1073741824
+}
+```
+
+规则：
+
+- **这是一条数据丢失通知，不是一次重试信号。**
+  `ack_seq_at_time < to_seq` 意味着 `(ack_seq_at_time, to_seq]` 这一段
+  你**永远拿不到了** —— 采集侧不做本地备份（§8）。确认之前请先把区间记下来。
+- 确认是**逐条**的。确认过的条目不再出现在 `/status.forced_prune_log` 里，
+  但采集侧不会删除它（还留着 `acknowledged_at`，事后可查）。
+- `gen` 不符 → `409 gen_mismatch`。gen 变了你本来就该硬停 + 全量对账，
+  这时清掉旧实例的闩锁没有意义。
+- 既没给非空 `prune_ids`、也没显式 `all: true` → `422`。
+  一次什么都不确认的调用多半是消费端写错了，采集侧不替你猜。
 
 ---
 
@@ -371,8 +506,21 @@ X = r.next_after_seq
 | `asin` | Amazon ASIN |
 | `marketplace` | **封闭集**，当前值域是单元素集 `{"amazon.com"}`。域名形式，由采集侧 CHECK 约束强制。加站点时会提前通知 |
 | `zip_requested` | worker 实际请求的邮编，5 位补零 |
-| `zip_observed` | 从页面抽出的邮编。**Phase 4 之前恒为 `null`** |
-| `zip_verify` | `confirmed` / `assumed` / `mismatch` / `unverified`。**Phase 4 之前恒为 `unverified`** |
+| `zip_observed` | 从页面 glow 配送挂件抽出的邮编（**Phase 4 起有值**）。页面没挂那个挂件时是 `null` —— 这是常态，不是错误 |
+| `zip_verify` | `confirmed` / `assumed` / `mismatch` / `unverified`。**Phase 4 起是真实判定**（此前恒为 `unverified`） |
+
+> **`zip_verify` 的读法**（Phase 4 起）：
+>
+> | 值 | 含义 | 建议处置 |
+> |---|---|---|
+> | `confirmed` | 页面上显示的邮编 == 请求的邮编 | 正常入库 |
+> | `assumed` | 商品页解析成功，但页面没挂 glow 挂件 —— 只能假设切邮编生效了 | 正常入库（这是多数正常记录的取值） |
+> | `mismatch` | 页面显示的是**别的**邮编 ⇒ 这条价格/配送**不属于** `zip_requested` | **不要**写进该分组的价格序列 |
+> | `unverified` | 根本没测（空页 / 拦截 / 404） | 按 `outcome` 处理 |
+>
+> 采集侧保证 `confirmed` 是自洽的：relay 会把「`confirmed` 但
+> `zip_observed != zip_requested`」的记录**降级**成 `mismatch`。
+> 反方向**不会**发生（服务端只削弱、不加强这个判定）。
 
 > **硬性规则：分组键是 `(asin, marketplace, zip_requested)`。**
 > 只按 `asin` 分组会退化成「最近哪个邮编采的」，价格序列会在邮编之间振荡，
@@ -385,6 +533,37 @@ X = r.next_after_seq
 | `collected_at` | **worker 时钟，仅供参考。** 不同 worker 之间可能不同步 |
 | `recorded_at` | 服务端时钟，展示用 |
 | `seq` | **唯一的排序权威** |
+
+> **`collected_at` 一直是、且始终是 RFC3339 UTC（带 `Z`）**，两个字段都由
+> 服务端归一化输出，你侧无需关心 worker 内部用什么格式。
+>
+> 补充说明（只影响读 `payload.crawl_time` 原始值的人）：Phase 4 起 worker 写的
+> `crawl_time` 从裸 `'2026-08-05 10:00:00'`（无标记的 UTC+8）改成
+> `'2026-08-05T02:00:00Z'`（RFC3339 UTC）。**顶层 `collected_at` 的语义与格式
+> 一个字没变**——采集侧的 relay 同时认得两种线格式，并把它们折算到同一个 UTC
+> 时刻（worker 与服务端独立部署，灰度期两种格式必然同时在线）。
+> 如果你侧有代码直接读 `payload.crawl_time`，请改读 `collected_at`。
+>
+> **灰度窗口（这一段是给运维看的，你侧无需动作）**
+>
+> worker 是分批发版的，所以存在一段时间，同一段 `seq` 区间里两种线格式并存：
+>
+> | `payload.crawl_time` 形态 | 来自 | relay 的折算 |
+> |---|---|---|
+> | `'2026-08-05T02:00:00Z'`（带 `Z` 或带偏移） | 新 worker | 照收 |
+> | `'2026-08-05 10:00:00'`（裸 + **空格**分隔） | 老 worker | 当作 UTC+8，减 8 小时 |
+> | `'2026-08-05T10:00:00'`（裸 + `T` 分隔） | 无 | 当作 UTC |
+> | 缺失 / 解析不了 | 异常 | 退回 `recorded_at`，并计数 |
+>
+> 两种主形态实测落在**同一微秒**上，所以 `collected_at` 在整个窗口里都是可比的。
+> 窗口是否结束可以直接观察：`/api/_debug/event-stream` 的计数器
+> `collected_at_legacy_cst` 停止增长 ⇒ 老 worker 已全部下线。
+> `collected_at_fallback` **应当恒为 0**；它一旦增长就说明有 worker 交上来的
+> `crawl_time` 两种格式都不是，那是采集侧的缺陷，不是你侧的。
+>
+> 选 `T`+`Z` 而不是 `' +00:00'` 是刻意的：一个还没改的消费者若对新格式做
+> `s[:19]` 再 `strptime`，`' +00:00'` 会被**静默**解析成一个差 8 小时的时刻，
+> 而 `T`+`Z` 会直接抛 `ValueError`，把它推进自己的兜底分支。**宁可响，不可静默偏移。**
 
 > **硬性规则：「同组最新值」一律按 `seq` 排序，不得用 `recorded_at`，
 > 更不得用 `collected_at`。** NTP 前跳/后跳会让时间戳与 seq 非单调。
@@ -399,7 +578,7 @@ X = r.next_after_seq
 | `completeness_ok` | 服务端算好的合取结果，见 §6.4 |
 | `error_type` / `error_detail` | `outcome != 'ok'` 时的原因 |
 | `batch_id` / `task_id` / `worker_id` / `attempt` | 溯源 |
-| `parse_engine` | `selectolax` / `lxml`。**Phase 4 之前可能为 `null`** |
+| `parse_engine` | `selectolax` / `lxml`。**Phase 4 起有值**；仍可能是 `null`（老 worker、或根本没解析 HTML 的 404 分支），`null` 是合法值 |
 
 > **硬性规则：`outcome != 'ok'` 的记录只入 `snapshots`，
 > 不触发 `products` upsert，其哈希不参与复审判定。**
@@ -428,18 +607,20 @@ completeness_ok  ⟺  (completeness & 8) != 0  AND  (completeness & 7) == 7
 
 服务端已经算好放在 `completeness_ok` 字段里，直接用，不要自己拼。
 
-> ⚠ **采集侧 Phase 4 落地之前，`completeness` 恒为 `0`，
-> 因此 `completeness_ok` 恒为 `false`。**
-> `0` 的含义是「**未测量**」，不是「三项都缺」。
+> ✅ **Phase 4 已落地：`completeness` 开始出现非零值，`completeness_ok` 可以为
+> `true`。** 判据是 **HTML 区块是否存在**（面包屑 / 详情表 / 主图集），不是
+> 「解析出来的值是否非空」—— 二者不等价：「区块在但里面是空的」和「区块被整块
+> 删掉」解析值完全一样，而后者正是软降级页的特征，也正是 §6.5 那道合取门要拦的。
 >
-> 按 §7 的算法字面执行，这意味着 **Phase 4 之前没有任何一行会进
-> `catalog.products`**，`snapshots` 会正常累积。这是**已知且预期**的。
+> ⚠ **`0` 的含义仍然是「未测量」，不是「三项都缺」。** 它出现在：老 worker 的
+> 记录、`not_found`、被拦截/空页的记录。**不要**把「`completeness == 0` 当成
+> ok」写死进代码。
 >
-> 试点期若需要提前打通 products 通路，请与采集侧约定一个**显式的、
-> 有时限的**旁路（例如「Phase 4 前把 `completeness_ok` 视为 true」），
-> 并在采集侧 `/status` 上能看到 `completeness` 开始出现非零值之后立刻撤掉。
-> **不要**把「`completeness == 0` 当成 ok」写死进代码 —— Phase 4 之后
-> `0` 会重新变成真正的「未测量」信号。
+> ⚠ **如果你侧在 Phase 4 之前开了那个「把 `completeness_ok` 视为 true」的
+> 临时旁路，现在必须撤掉。** 不撤的话，软降级页会重新变成 products 的合法输入，
+> §6.5 的合取门当场失效 —— 那道门的两个前提（本条 + 上一条 `completeness_ok`）
+> 正是靠这个字段。撤掉之后 products 的入库量会下降一截，那是**正确的**：
+> 少掉的那部分本来就是没测量过的记录。
 
 ### 6.5 哈希与复审门
 
@@ -528,11 +709,12 @@ if st.gen != stored_gen:
 if st.max_seq < stored_max_seq_ever:
     ALARM("stream rewound"); full_reconcile(); STOP
 if st.forced_prune_log:
-    ALARM(st.forced_prune_log)        # 逐条处理并确认
+    ALARM(st.forced_prune_log)        # 逐条处理，然后 POST /ack-prune（§5.1）
 
+assert OVERLAP <= st.max_safe_overlap # ← 硬性规则 9。不满足就是配置错误，别跑
 stored_max_seq_ever = max(stored_max_seq_ever, st.max_seq)
 
-X = max(0, stored_cursor - OVERLAP)   # 重叠回拉
+X = max(0, stored_cursor - OVERLAP)   # 重叠回拉，**每轮只做一次**
 while True:
     r = GET /api/v1/sync/records?after_seq=X&limit=1000
 
@@ -578,6 +760,7 @@ while True:
 7. **`source_id` 是幂等锚点。** 形如 `{gen}:{uuid}`，在采集侧写入时铸造，
    重放不变。`ON CONFLICT (source_id) DO NOTHING` 是你侧唯一需要的去重。
 8. **`screenshot_path` 不可解引用**（§6.6）。
+9. **`OVERLAP <= status.max_safe_overlap`，且 `limit > OVERLAP`。** 见下一节。
 
 ### 重叠回拉为什么是必须的
 
@@ -587,6 +770,34 @@ while True:
 
 `OVERLAP` 取多少：≥ 一次崩溃可能丢失的最大条数。建议 200，代价可以忽略。
 把 `OVERLAP` 设成 0 等于赌「ack 之后一定写成功了」。
+
+**`limit` 必须严格大于 `OVERLAP`。** 否则每轮开头的 `X = cursor - OVERLAP`
+会把游标退回到不超过一页之前，下一页又只能推进 `limit` 条 —— 游标原地打转，
+同步永远前进不了。`limit=1000` / `OVERLAP=200` 满足这一条。
+另外注意伪码里的位置：**重叠回拉每轮只做一次**，轮内翻页一律用
+`next_after_seq`，不要每页都减一次 `OVERLAP`。
+
+### 余量由谁留（这一条两侧都要看）
+
+重叠回拉与采集侧的保留期天然冲突：你要读 `cursor - OVERLAP`，
+而保留期的下界之一是 `ack_seq`（你自己给的位点）。如果采集侧真的裁到 `ack_seq`，
+那么你**每一轮**的重叠回拉都会落在保留窗口之外，拿到一个
+`409 cursor_below_retention` —— 一次完全守规矩的拉取被判成掉窗，
+然后按 §2.6 触发全量对账。每 5 分钟一次。
+
+分工是这样定的：
+
+| 谁 | 负责什么 |
+|---|---|
+| **采集侧** | 保留期的下界永远比 `ack_seq` 低至少 `max_safe_overlap` 条。**并且**在真正 DROP 之前先算「裁完之后 `min_available_seq` 会变成多少」，只有那个值仍然落在安全下界之内才动手 —— 这一步是必需的，因为 `seq` 有空洞，单看下界不等于单看窗口 |
+| **你侧** | `OVERLAP <= status.max_safe_overlap`。**读那个字段，不要硬编码 200** —— 采集侧调大之后你才能跟着调大 |
+
+当前 `max_safe_overlap` 出厂值是 **1000**（≥ 契约建议的 `OVERLAP=200`）。
+采集侧永远不会把它配置成小于 200。
+
+**唯一的例外是应急裁剪**：磁盘或容量闸门触发时，采集侧会越过 `ack_seq` 强裁，
+这时你**会**拿到一个真的 `409`，并且 `/status.forced_prune_log` 里同时出现一条
+记录（§5.1）。那不是假阳性，是真的丢了数据。
 
 ---
 
@@ -608,9 +819,13 @@ while True:
 | 四个端点全 404 | 路径写错，或者请求打到了别的服务。**不是没有数据** |
 | 503 `event_stream_unavailable` | 采集侧跑在 SQLite 后端，或者还在启动。退避重试 |
 | 409 `cursor_below_retention` | 你落后太多掉出保留窗口了（或者踩到了 §2.6 的已知假阳性）。全量对账 |
+| **每一轮**都 409 `cursor_below_retention`，但游标其实在动 | `OVERLAP > status.max_safe_overlap`（§7 硬性规则 9）。调小 `OVERLAP`，或者让采集侧调大 `SYNC_ACK_SLACK_SEQ` |
+| 409 + `/status.forced_prune_log` 非空 | **不是**假阳性：采集侧磁盘/容量告急，越过你的 ack 强裁了。那段数据永久丢失，按 §5.1 处理 |
+| 游标原地打转，`records` 每轮返回同一批 | `limit <= OVERLAP`（§7 硬性规则 9），或者你在**每一页**都减了一次 `OVERLAP` |
 | 409 `cursor_ahead_of_stream` | 采集侧从备份恢复/回滚了。全量对账 |
 | 200 但 `records` 一直是空的，`max_seq` 不涨 | 看 `/status` 的 `relay_state` 与 `outbox_depth`：`outbox_depth` 单调增长 = relay 停摆，找采集侧 |
-| `products` 一行都没进 | 看 §6.4。Phase 4 之前 `completeness_ok` 恒为 false，这是预期 |
+| `products` 一行都没进 | 看 §6.4。Phase 4 **之前** `completeness_ok` 恒为 false（预期）；Phase 4 之后若仍全 false，看 `/records` 里 `parse_engine` 是不是也全 `null` —— 那说明采集侧还跑着老 worker |
+| Phase 4 之后 `products` 入库量下降 | 多半是没撤掉那个「`completeness_ok` 视为 true」的临时旁路，现在真值生效了。见 §6.4 |
 | `count` 比预期少 | 先看 `/counts` 的 `range_fully_retained`。为 false 说明是被裁剪，不是漏采 |
 | 同一商品价格在两个值之间振荡 | 分组键漏了 `zip_requested`（硬性规则 2） |
 
@@ -622,9 +837,26 @@ while True:
    但连同 meta 一起回滚的整机快照检不出来 —— 这是设计上的边界。
    **你侧的 `st.max_seq < stored_max_seq_ever` 单调性检查是唯一防线**，
    必须实现，且必须是告警而不是静默继续。
-2. `cursor_below_retention` 的假阳性（§2.6），Phase 6 修。
-3. Phase 4 之前：`zip_observed` 恒 `null`、`zip_verify` 恒 `unverified`、
-   `completeness` 恒 `0`、`parse_engine` 可能为 `null`、`crawl_time` 时区待统一。
-4. 采集侧的写路径今天是串行的（单写连接 + 真锁），所以「乱序提交」在今天的 API
+2. `cursor_below_retention` 的假阳性（§2.6）**依然存在**，判据没有放宽 ——
+   放宽它就等于把守卫关掉。Phase 6 改的是另一头：常规裁剪现在会先算
+   「裁完之后 `min_available_seq` 落在哪」，不会把守规矩的消费者推出窗口（§7）。
+   所以你在实践中不该再因为常规裁剪拿到 409；真拿到了，八成是
+   `OVERLAP` 配置超标或者发生了应急裁剪，两者都能在 `/status` 上分辨。
+3. ~~Phase 4 之前：`zip_observed` 恒 `null`、`zip_verify` 恒 `unverified`、
+   `completeness` 恒 `0`、`parse_engine` 可能为 `null`、`crawl_time` 时区待统一。~~
+   **Phase 4 已落地**，四个字段都开始输出真值（见 §6.1 / §6.3 / §6.4）。
+   遗留的诚实边界只剩一条：**worker 是分批发版的**，所以在灰度窗口里，
+   同一段 `seq` 区间内会同时存在
+   「有 `zip_observed` / `completeness != 0` / `parse_engine` 有值」的新记录与
+   「`null` / `0` / `null`」的老记录。二者**不可**按字段有无来判优劣 ——
+   老记录的 `0` 是「未测量」，按 §6.4 照常不进 products，无需你侧特判。
+   灰度进度可以直接观察：`parse_engine` 非 `null` 的记录占比。
+4. **`not_found` 的记录不再携带商品字段。** Phase 4 起，404 的 payload 里
+   **没有** `title` / `brand` / 类目 / UPC / 图片这些慢变字段（此前是 30/40 个
+   `"N/A"` 占位符）—— 它们是「上一次采集到的值仍然有效」，而不是「变成了空」。
+   `outcome != 'ok'` 的记录本来就只入 snapshots（§6.3 硬性规则），所以对你侧
+   零影响；但如果你有代码直接读 `payload.title`，注意它现在可能**不存在**
+   （缺席 ≠ `null` ≠ 空串）。
+5. 采集侧的写路径今天是串行的（单写连接 + 真锁），所以「乱序提交」在今天的 API
    上还不可能发生。事件流的 outbox + 单 relay 是**提前建好的保险**，
    Phase 1.5 放开写并发时它就地生效，届时对你侧零改动。

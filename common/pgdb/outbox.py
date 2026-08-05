@@ -293,6 +293,27 @@ async def task_facts(db, task_id) -> Optional[dict]:
     return dict(row) if row is not None else None
 
 
+def _task_zip_is_authoritative(facts: Optional[dict]) -> bool:
+    """`tasks.zip_code` 这一行能不能当作「请求邮编」的权威来源（D-42 / D-54）。
+
+    **空串不算。** worker 真正请求的是
+    ``target_zip = (task.zip_code or "").strip() or worker.zip_code``——
+    也就是说 `tasks.zip_code = ''` 时，真正发出去的是 worker 的默认邮编，
+    而这一行既非 NULL（`is not None` 为真）又不是真相。照收它就是把消费侧的
+    分组键 ``(asin, marketplace, zip_requested)`` 写成 ``''``，那一组价格序列
+    是哪个邮编采的从此不可知（契约 §6.1 硬规则）。
+
+    `relay._emit_outbox` 的三级仲裁本来就会兜住这一格（它判的是
+    ``not str(zip_requested).strip()``），所以这里改的不是最终落库值，而是
+    **两层的判据一致**：一层靠另一层兜底、两边写法还不一样，是下一个人改错的
+    标准配方。顺带把 `zip_requested_source` 从谎报的 ``'task'`` 修成真实来源。
+    """
+    if facts is None:
+        return False
+    z = facts.get("zip_code")
+    return z is not None and str(z).strip() != ""
+
+
 async def result_context(db, *, task_id=None, worker_id=None, lease_epoch=None,
                          data: Optional[dict] = None,
                          batch_id=None) -> Optional[EventContext]:
@@ -300,15 +321,28 @@ async def result_context(db, *, task_id=None, worker_id=None, lease_epoch=None,
     if not stream_ready(db):
         return None
     facts = await task_facts(db, task_id) if task_id else None
-    if facts is not None and facts.get("zip_code") is not None:
+    if _task_zip_is_authoritative(facts):
         zip_requested, zip_source = facts["zip_code"], "task"
     else:
-        # 无 task_id 的直写路径（B1 / save_result），或 tasks.zip_code 为 NULL。
-        # payload 里的 zip_code 是**观测值**不是请求值（worker/parser.py:111/:847
-        # 会用页面 glow-ingress-line1 抽到的邮编覆盖它），所以必须标出来源，
-        # 否则消费侧的分组键会把同一个商品的价格序列悄悄劈成两组。
-        zip_requested = (data or {}).get("zip_code")
-        zip_source = "payload"
+        # 无 task_id 的直写路径（B1 / save_result），tasks.zip_code 为 NULL，
+        # **或者是空串**（见 `_task_zip_is_authoritative`）。
+        #
+        # 这一格**故意传 None**，把仲裁整个交给 `relay._emit_outbox`——
+        # 它才有完整的三级顺序（tasks 行 > payload `_zip_requested` > payload
+        # `zip_code`）。这里如果自作主张退到 `data['zip_code']`（第 3 级），
+        # 就把第 2 级**跳过去**了：`tasks.zip_code=''` + 老 payload 的
+        # `zip_code` 与 worker 自述的 `_zip_requested` 不一致时，relay 会当成
+        # 「服务端事实 vs worker 自述冲突」保留错的那个，而正确答案在
+        # `_zip_requested` 里。实测：仲裁写两份、还差一级，是 D-54 的成因。
+        #
+        # ⚠ 这里原先还写着「payload 里的 zip_code 是**观测值**不是请求值
+        # （worker/parser.py 会用页面 glow-ingress-line1 抽到的邮编覆盖它）」。
+        # **P4-1 之后那句话是错的**：读 `glow-ingress-line1` 的
+        # `_slx_parse_zip_code` / `_parse_zip_code` 两个函数已经删除，
+        # `zip_code` 的语义收紧成「恒为请求邮编」，观测值另有其列
+        # （`_zip_observed`，页面 line2 抽取）。
+        zip_requested = None
+        zip_source = None
     return EventContext(
         task_id=task_id,
         worker_id=worker_id,
@@ -407,7 +441,8 @@ async def emit_stale_event(db, *, task_id=None, worker_id=None, lease_epoch=None
         asin = (data or {}).get("asin", "")
         if isinstance(asin, str):
             asin = asin.strip()
-    has_task_zip = (facts or {}).get("zip_code") is not None
+    # 空串不算权威（D-54）——与 result_context 用同一个判据，别再写第三份。
+    has_task_zip = _task_zip_is_authoritative(facts)
     return await emit(
         db,
         outcome="stale",
@@ -421,9 +456,9 @@ async def emit_stale_event(db, *, task_id=None, worker_id=None, lease_epoch=None
         lease_epoch=lease_epoch,
         attempt=(facts or {}).get("retry_count") or 0,
         auto_retry_count=(facts or {}).get("auto_retry_count") or 0,
-        zip_requested=(facts["zip_code"] if has_task_zip
-                       else (data or {}).get("zip_code")),
-        zip_requested_source="task" if has_task_zip else "payload",
+        # 同 result_context：非权威就整个交给 relay 的三级仲裁，别在这里抢答。
+        zip_requested=(facts["zip_code"] if has_task_zip else None),
+        zip_requested_source=("task" if has_task_zip else None),
         error_type=error_type,
         error_detail=error_detail,
     )

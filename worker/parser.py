@@ -8,10 +8,115 @@ v3 增强：
 import re
 import json
 import logging
-from datetime import datetime, timezone, timedelta
-
-_CN_TZ = timezone(timedelta(hours=8))
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Tuple
+
+# P4-1：邮编观测值只有**一份**真源 —— worker/ziputil.py 的 glow-ingress-line2 正则。
+# 这里刻意复用它的模块常量而不是抄一份：抄一份就有两个会各自漂移的正则，而
+# 「观测到的邮编」与「邮编是否生效」必须永远看同一个挂件，否则会出现
+# zip_verify=confirmed 但 zip_effective_in_html 判 False 这种自相矛盾的记录。
+from worker.ziputil import _GLOW_LINE2_RE as _GLOW_INGRESS_LINE2_RE
+
+# ==========================================================================
+# P4-7：crawl_time 的线格式
+# ==========================================================================
+# 历史值：``datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')``
+# —— 东八区的墙上时间，且 ``%z`` 被**刻意丢掉**。消费侧拿到的是无标记的 CST，
+# 与它自己的 UTC 混排就是系统性 8 小时错位（审计需求 4）。
+#
+# 现值：RFC3339 的 UTC ``Z`` 形式。用户已确认 erpAPI 可接受（计划 §Phase 4 表）。
+#
+# 为什么是 ``T`` + ``Z`` 而不是 ``2026-08-05 10:00:00+00:00``：
+# 后者会被「按老格式切片再 strptime」的消费者**静默**解析成功
+# （``s[:19]`` 恰好是合法的老格式），然后被重新贴上 +08:00 —— 错 8 小时且无声。
+# 前者的 ``s[:19]`` 是 ``2026-08-05T10:00:00``，``%Y-%m-%d %H:%M:%S`` 必然抛
+# ValueError，消费者走它自己的兜底分支并留下计数。**同样是没改造的消费者，
+# 这个格式让它响，那个格式让它错。** 见下方 P4-7 消费者清单。
+_CRAWL_TIME_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _utc_now_str() -> str:
+    """当前时刻的 RFC3339 UTC 字符串（秒精度）。"""
+    return datetime.now(timezone.utc).strftime(_CRAWL_TIME_FMT)
+
+
+# ==========================================================================
+# P4-2：完整性位图（契约 docs/sync_contract.md §6.4，位定义已对外公布，勿改）
+# ==========================================================================
+# 判据是 **HTML 区块是否存在**，不是解析出来的值是否非空。二者不等价：
+# 「区块在但里面是空的」和「区块被整块删掉」解析值完全一样（都是 ""/"N/A"），
+# 而后者正是软降级页的特征。category 只有面包屑一个数据源，好页→降级页→好页
+# 于是就是两次哈希翻转、两次误复审 —— §6.5 那道合取门要拦的就是这个。
+COMPLETENESS_BREADCRUMB = 1     # bit0 面包屑区块存在
+COMPLETENESS_DETAIL_TABLE = 2   # bit1 详情表存在
+COMPLETENESS_MAIN_IMAGE = 4     # bit2 主图集存在
+COMPLETENESS_MEASURED = 8       # bit3 这次采集**真的测量过**上面三项
+
+#: 面包屑区块。**只认 `_parse_categories` 真正会去读的那一个 id**：位的意义是
+#: 「category 这个信号的唯一数据源在不在」，多认一个别名就会出现「位说在、
+#: 解析器却什么都读不到」的假阳性，比不测更糟。
+_BLOCK_IDS_BREADCRUMB = ("wayfinding-breadcrumbs_feature_div",)
+
+#: 详情表：`_slx_parse_all_details` / `_parse_all_details` 能取到值的所有容器。
+_BLOCK_IDS_DETAIL = (
+    "productDetails_techSpec_section_1",
+    "productDetails_detailBullets_sections1",
+    "productDetails_feature_div",
+    "detailBullets_feature_div",
+    "technicalSpecifications_section_1",
+    "productOverview_feature_div",
+    "prodDetails",
+)
+
+#: 主图集：`_parse_images` 的取值容器 + 图集挂件本身。
+_BLOCK_IDS_IMAGE = (
+    "imgTagWrapperId",
+    "imageBlock_feature_div",
+    "altImages",
+    "landingImage",
+    "main-image-container",
+    "booksImageBlock_feature_div",
+)
+
+# ==========================================================================
+# P4-1：zip_verify 的封闭集（契约 §表 `zip_verify`）
+# ==========================================================================
+ZIP_VERIFY_CONFIRMED = "confirmed"      # 页面 glow-line2 的邮编 == 请求邮编
+ZIP_VERIFY_MISMATCH = "mismatch"        # 页面给了邮编，但**不是**请求的那个
+ZIP_VERIFY_ASSUMED = "assumed"          # 商品页解析成功，但页面没挂 glow-line2
+ZIP_VERIFY_UNVERIFIED = "unverified"    # 根本没测（空页 / 拦截 / 解析失败）
+
+#: 5 位邮编。两侧的零宽断言防止把 ZIP+4 的后 4 位或长数字串的一段当成邮编。
+_ZIP5_RE = re.compile(r"(?<!\d)(\d{5})(?!\d)")
+
+# ==========================================================================
+# P4-9：parse_engine 取值
+# ==========================================================================
+ENGINE_SELECTOLAX = "selectolax"
+ENGINE_LXML = "lxml"
+
+# ==========================================================================
+# P4-8：`site` 的值域 —— **本次有意不动**，理由记在这里
+# ==========================================================================
+# 现状是三处不一致：parser 写 ``"US"``（下方 _default_result）、SQLite 列默认
+# ``'amazon.com'``（common/database.py:513）、PG 列默认 ``'amazon.com'``
+# （common/pgdb/schema.py:155）、dataclass 默认 ``'amazon.com'``
+# （common/models.py:69）。实际每一行都是 ``"US"`` —— 因为 parser 总会写。
+#
+# 不动的理由：
+#   1. `site` 是**导出列**（common/config.py:229 HEADER_MAP "站点"），改值就是改
+#      已交付给 erpAPI 的导出内容。而 crawl_time 的改动有用户明确确认，`site` 没有。
+#   2. 它承载的那个信号已经**另有权威来源**：事件流的 `marketplace` 在 D-26/§2.3
+#      被钉死成封闭集 ``{'amazon.com'}``，并且 relay 明确写着「绝不透传 parser 的
+#      site」（common/pgdb/relay.py:281、schema.py:428）。沃尔玛侧读的是
+#      `marketplace`，不是 `site`。
+#   3. 改它不会修好任何一条误复审：`site` 在 SLOW_HASH_FIELDS 之外
+#      （common/slowhash.py:133 "采集参数，不是商品属性"），值稳定与否与哈希无关。
+#   4. 一次性回填会改写全部历史行，而 `asin_data` 每 ASIN 只有一行、没有版本，
+#      回填之后**无法回滚**到"这行当年记的是什么"。
+# 也就是说：收益 = 消掉一个没有消费者的三处不一致；代价 = 动一列已交付的导出数据
+# 且不可逆。建议留到 Phase 5 并行验证期，与 `asin_data` 的其它列语义收紧一起做，
+# 届时新旧两套系统同时在跑，可以对照。详细论证见交付说明。
 
 # 优先 selectolax，fallback 到 lxml
 _USE_SELECTOLAX = False
@@ -127,6 +232,8 @@ class AmazonParser:
 
     def _parse_with_selectolax(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
         """使用 selectolax 解析"""
+        # P4-9：先记引擎再解析 —— 连「解析器自己炸了」的记录也要能归因到引擎。
+        result["_parse_engine"] = ENGINE_SELECTOLAX
         try:
             tree = SlxParser(html_text)
         except Exception as e:
@@ -139,6 +246,10 @@ class AmazonParser:
         if block_status:
             result["title"] = block_status
             return result
+
+        # P4-1 / P4-2：质量信号。放在拦截判定**之后** —— 验证码页上的
+        # completeness 必须是 0（未测量），而不是「三个区块都缺」。
+        self._apply_quality_signals(result, tree, html_text, zip_code)
 
         # variant 偏移检测：提取页面当前 active ASIN 供上层校验
         # 多属性产品偶发 default variant 偏移，写到 result["_page_asin"]
@@ -153,7 +264,8 @@ class AmazonParser:
 
         # 逐字段提取：多层 fallback
         result["title"] = jsonld.get("title") or self._slx_parse_title(tree)
-        result["zip_code"] = self._slx_parse_zip_code(tree) or zip_code
+        # P4-1：`zip_code` 恒为**请求**邮编（_default_result 已经写好）。
+        # 观测值在 result["_zip_observed"]，判定在 result["_zip_verify"]。
 
         # 商品可售状态检测
         is_unavailable = self._slx_check_unavailable(tree)
@@ -255,12 +367,12 @@ class AmazonParser:
         result["root_category_id"], result["category_ids"], result["category_tree"] = \
             self._slx_parse_categories(tree)
 
-        # 评分 + 评论数（JSON-LD 优先，CSS 兜底）
-        result["rating"] = self._slx_parse_rating(tree, jsonld)
-        result["review_count"] = self._slx_parse_review_count(tree, jsonld)
+        # 评分 + 评论数（JSON-LD 优先，DOM 兜底）
+        result["rating"] = self._parse_rating(tree, jsonld)
+        result["review_count"] = self._parse_review_count(tree, jsonld)
 
         # 卖家店铺 ID + 名（buybox 卖家档案链接）
-        seller_id, seller_name = self._slx_parse_seller(tree, html_text)
+        seller_id, seller_name = self._parse_seller(tree, html_text)
         result["seller_id"] = seller_id
         result["seller_name"] = seller_name
 
@@ -305,17 +417,10 @@ class AmazonParser:
         except Exception:
             return "N/A"
 
-    def _slx_parse_zip_code(self, tree) -> Optional[str]:
-        try:
-            node = tree.css_first('span#glow-ingress-line1')
-            if node:
-                text = node.text(strip=True)
-                match = re.search(r'(\d{5})', text)
-                if match:
-                    return match.group(1)
-        except Exception:
-            pass
-        return None
+    # `_slx_parse_zip_code` 已删除（P4-1）。它读的是 `span#glow-ingress-line1`，
+    # 而邮编在 **line2**（worker/ziputil.py:11-12），所以它近乎恒返回 None；它唯一
+    # 的作用是让 `zip_code` 列在极少数情况下变成观测值、混进请求值里。
+    # 观测邮编现在走 `_parse_zip_observed`（复用 ziputil 的 line2 正则）。
 
     def _slx_parse_brand(self, tree) -> str:
         try:
@@ -801,7 +906,12 @@ class AmazonParser:
             if 'upc' in page_details:
                 upc_set.add(page_details['upc'])
             upc_set.update(re.findall(r'UPC\s*[:#]?\s*(\d{12})', html_text))
-            return ",".join(list(upc_set))
+            # P4-5：`",".join(list(set(...)))` 的顺序由 str 的哈希决定，而 CPython
+            # 的 str 哈希每进程随机加盐（PYTHONHASHSEED）⇒ 同一份 HTML 在不同
+            # worker 进程里得到**不同的字符串**。upc_list 既进哈希（slowhash
+            # _LIST_FIELDS 会排序，但那只救哈希）又是沃尔玛侧直接复用的挂牌资产，
+            # 所以顺序不稳不只是哈希问题。排序 = 消除这个自由度。
+            return ",".join(sorted(upc_set))
         except Exception:
             return ""
 
@@ -883,6 +993,8 @@ class AmazonParser:
 
     def _parse_with_lxml(self, html_text: str, asin: str, zip_code: str, result: Dict, jsonld: Dict) -> Dict:
         """使用 lxml 解析（fallback）"""
+        # P4-9：同 selectolax 路径，先记引擎。
+        result["_parse_engine"] = ENGINE_LXML
         try:
             tree = lxml_html.fromstring(html_text)
         except Exception as e:
@@ -896,6 +1008,9 @@ class AmazonParser:
             result["title"] = block_status
             return result
 
+        # P4-1 / P4-2：与 selectolax 路径同一份逻辑、同一个位置。
+        self._apply_quality_signals(result, tree, html_text, zip_code)
+
         # variant 偏移检测（同 selectolax 路径）：从 HTML 提取页面当前 active ASIN
         result["_page_asin"] = self._extract_page_asin(None, html_text)
 
@@ -904,7 +1019,7 @@ class AmazonParser:
 
         # 逐字段提取（JSON-LD 优先，CSS/XPath 补充）
         result["title"] = jsonld.get("title") or self._parse_title(tree)
-        result["zip_code"] = self._parse_zip_code(tree) or zip_code
+        # P4-1：同 selectolax 路径，`zip_code` 恒为请求邮编。
 
         # 商品可售状态检测
         is_unavailable = self._check_unavailable(tree)
@@ -992,6 +1107,15 @@ class AmazonParser:
         # 类目
         result["root_category_id"], result["category_ids"], result["category_tree"] = \
             self._parse_categories(tree)
+
+        # P4-6：评分 / 评论数 / 卖家 —— 以前这三行**只**存在于 selectolax 路径，
+        # lxml 路径连键都不产出，于是 server 跳过写入、行里留着上一次采集的旧值。
+        # 现在两条路径调用同一组引擎无关的解析器。
+        result["rating"] = self._parse_rating(tree, jsonld)
+        result["review_count"] = self._parse_review_count(tree, jsonld)
+        seller_id, seller_name = self._parse_seller(tree, html_text)
+        result["seller_id"] = seller_id
+        result["seller_name"] = seller_name
 
         return result
 
@@ -1082,8 +1206,14 @@ class AmazonParser:
 
     # ==================== 评分 + 评论数 ====================
 
-    def _slx_parse_rating(self, tree, jsonld: dict) -> str:
-        """评分（如 "4.4"）。JSON-LD aggregateRating.ratingValue 优先；CSS 兜底。"""
+    # ================= P4-6：评分 / 评论数 / 卖家（两条引擎路径共用）=================
+    # 这三个解析器原来叫 `_slx_parse_*` 且只被 selectolax 路径调用，lxml 路径上
+    # 对应的键**根本不存在** ⇒ server 的 `if val is not None` 跳过 ⇒ 行里留着上次
+    # 的旧值配新的 crawl_time（审计 §1.5「四个结转字段」）。改成引擎无关之后，
+    # 两条路径调用的是同一份逻辑，不可能再出现「只有一条路径产出」。
+
+    def _parse_rating(self, tree, jsonld: dict) -> str:
+        """评分（如 "4.4"）。JSON-LD aggregateRating.ratingValue 优先；DOM 兜底。"""
         # 1) JSON-LD（最稳，浏览器/服务端响应一致）
         try:
             jr = jsonld.get("_rating") if jsonld else None
@@ -1096,30 +1226,26 @@ class AmazonParser:
                 return jr
         except Exception:
             pass
-        # 2) CSS：#acrPopover[title="4.4 out of 5 stars"]
-        try:
-            node = tree.css_first('span#acrPopover')
-            if node:
-                title_attr = (node.attributes.get('title') or '').strip()
-                m = re.match(r"^([0-9](?:\.[0-9]+)?)", title_attr)
-                if m:
-                    return m.group(1)
-        except Exception:
-            pass
-        # 3) CSS：#averageCustomerReviews .a-icon-alt
-        try:
-            node = tree.css_first('#averageCustomerReviews .a-icon-alt')
-            if node:
-                txt = node.text(strip=True)
-                m = re.match(r"^([0-9](?:\.[0-9]+)?)", txt)
-                if m:
-                    return m.group(1)
-        except Exception:
-            pass
+        # 2) #acrPopover[title="4.4 out of 5 stars"]
+        title_attr = self._uni_first_attr(
+            tree, 'span#acrPopover', '//span[@id="acrPopover"]/@title', 'title')
+        if title_attr:
+            m = re.match(r"^([0-9](?:\.[0-9]+)?)", title_attr)
+            if m:
+                return m.group(1)
+        # 3) #averageCustomerReviews .a-icon-alt
+        txt = self._uni_first_text(
+            tree, '#averageCustomerReviews .a-icon-alt',
+            '//*[@id="averageCustomerReviews"]//*[contains(concat(" ", normalize-space(@class), " "),'
+            ' " a-icon-alt ")]')
+        if txt:
+            m = re.match(r"^([0-9](?:\.[0-9]+)?)", txt)
+            if m:
+                return m.group(1)
         return "N/A"
 
-    def _slx_parse_review_count(self, tree, jsonld: dict) -> str:
-        """评论数（纯数字字符串，如 "323"）。JSON-LD reviewCount 优先；CSS 兜底。"""
+    def _parse_review_count(self, tree, jsonld: dict) -> str:
+        """评论数（纯数字字符串，如 "323"）。JSON-LD reviewCount 优先；DOM 兜底。"""
         # 1) JSON-LD
         try:
             rc = jsonld.get("_review_count") if jsonld else None
@@ -1129,72 +1255,72 @@ class AmazonParser:
                     return rc_s
         except Exception:
             pass
-        # 2) CSS：#acrCustomerReviewText "1,234 ratings" 或 "(323)"
-        try:
-            node = tree.css_first('#acrCustomerReviewText')
-            if node:
-                txt = node.text(strip=True)
-                m = re.search(r"[\d,]+", txt)
-                if m:
-                    digits = m.group(0).replace(",", "")
-                    if digits.isdigit():
-                        return digits
-        except Exception:
-            pass
+        # 2) #acrCustomerReviewText "1,234 ratings" 或 "(323)"
+        txt = self._uni_first_text(
+            tree, '#acrCustomerReviewText', '//*[@id="acrCustomerReviewText"]')
+        if txt:
+            m = re.search(r"[\d,]+", txt)
+            if m:
+                digits = m.group(0).replace(",", "")
+                if digits.isdigit():
+                    return digits
         return "N/A"
 
     # ==================== 卖家店铺 ID + 名 ====================
 
-    def _slx_parse_seller(self, tree, html_text: str = "") -> Tuple[str, str]:
+    def _parse_seller(self, tree, html_text: str = "") -> Tuple[str, str]:
         """返回 (seller_id, seller_name)。
         - 第三方卖家：从 <a id="sellerProfileTriggerId" href="...seller=XXX">Name</a> 提取
         - Amazon 自营：sellerProfileTriggerId 不存在，但页面有 "Sold by Amazon.com" → 返回 ("AMAZON", "Amazon.com")
         - 其他无法识别：返回 ("N/A", "N/A")
         """
         # 1) 标准路径：buybox 卖家档案链接
-        try:
-            node = tree.css_first('a#sellerProfileTriggerId')
-            if node:
-                name = node.text(strip=True)
-                href = node.attributes.get('href', '') or ''
-                m = re.search(r"seller=([A-Z0-9]+)", href)
-                seller_id = m.group(1) if m else ""
-                if seller_id and name:
-                    return seller_id, name
-                if name:  # 拿到名字但没拿到 ID（极罕见）
-                    return "N/A", name
-        except Exception:
-            pass
+        name = self._uni_first_text(
+            tree, 'a#sellerProfileTriggerId', '//a[@id="sellerProfileTriggerId"]')
+        href = self._uni_first_attr(
+            tree, 'a#sellerProfileTriggerId',
+            '//a[@id="sellerProfileTriggerId"]/@href', 'href')
+        if name or href:
+            m = re.search(r"seller=([A-Z0-9]+)", href or "")
+            seller_id = m.group(1) if m else ""
+            if seller_id and name:
+                return seller_id, name
+            if name:  # 拿到名字但没拿到 ID（极罕见）
+                return "N/A", name
 
         # 2) 备选：任意带 seller= 的链接（href 路径变化时兜底）
-        try:
-            for sel in ['#merchant-info a[href*="seller="]',
-                        '#tabular-buybox a[href*="seller="]',
-                        'a[href*="seller="]']:
-                node = tree.css_first(sel)
-                if not node:
-                    continue
-                href = node.attributes.get('href', '') or ''
-                m = re.search(r"seller=([A-Z0-9]+)", href)
-                if not m:
-                    continue
-                name = node.text(strip=True) or ""
-                if m.group(1):
-                    return m.group(1), (name or "N/A")
-        except Exception:
-            pass
+        for css, xp in (
+            ('#merchant-info a[href*="seller="]',
+             '//*[@id="merchant-info"]//a[contains(@href, "seller=")]'),
+            ('#tabular-buybox a[href*="seller="]',
+             '//*[@id="tabular-buybox"]//a[contains(@href, "seller=")]'),
+            ('a[href*="seller="]', '//a[contains(@href, "seller=")]'),
+        ):
+            href = self._uni_first_attr(tree, css, xp + '/@href', 'href')
+            if not href:
+                continue
+            m = re.search(r"seller=([A-Z0-9]+)", href)
+            if not m:
+                continue
+            name = self._uni_first_text(tree, css, xp) or ""
+            if m.group(1):
+                return m.group(1), (name or "N/A")
 
-        # 3) Amazon 自营：检测 #merchant-info 或 #tabular-buybox 文本
-        try:
-            for sel in ['#merchant-info', '#tabular-buybox', '#offerDisplay_feature_div']:
-                node = tree.css_first(sel)
-                if not node:
-                    continue
-                blob = node.text(strip=True).lower()
-                if "sold by amazon.com" in blob or "ships from amazon.com" in blob:
-                    return "AMAZON", "Amazon.com"
-        except Exception:
-            pass
+        # 3) Amazon 自营：检测 #merchant-info / #tabular-buybox 文本。
+        #    注意 `_uni_first_text` 用的是**带空格分隔**的取文本：老实现用
+        #    selectolax 默认的 `text(strip=True)`（无分隔符拼接），真实页面上的
+        #    `Sold by <a>Amazon.com</a>` 会被拼成 `Sold byAmazon.com`，这个子串
+        #    判断因此**从来没命中过**，自营页恒返回 ("N/A","N/A")。
+        for css, xp in (
+            ('#merchant-info', '//*[@id="merchant-info"]'),
+            ('#tabular-buybox', '//*[@id="tabular-buybox"]'),
+            ('#offerDisplay_feature_div', '//*[@id="offerDisplay_feature_div"]'),
+        ):
+            blob = (self._uni_first_text(tree, css, xp) or "").lower()
+            if not blob:
+                continue
+            if "sold by amazon.com" in blob or "ships from amazon.com" in blob:
+                return "AMAZON", "Amazon.com"
 
         # 4) HTML 文本最后兜底（脚本数据里偶尔有 merchantID）
         try:
@@ -1389,13 +1515,26 @@ class AmazonParser:
         """创建默认结果字典"""
         return {
             "asin": asin,
-            "crawl_time": datetime.now(_CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            # P4-7：RFC3339 UTC。历史上是裸 UTC+8，见模块头 _CRAWL_TIME_FMT 的说明。
+            "crawl_time": _utc_now_str(),
+            # P4-8：**有意保持 "US" 不动**，论证见模块头的 “P4-8” 注释块。
             "site": "US",
+            # P4-1：这一列的语义收紧为「**请求**邮编」，恒等于 task 传进来的值。
+            # 以前是 `_slx_parse_zip_code(tree) or zip_code`，即「能解析出来就用
+            # 页面上的」—— 观测值混进请求值，而消费侧的分组键是
+            # (asin, marketplace, zip_requested)：一条声称 zip A、价格其实是 zip B
+            # 的记录会悄悄把一个商品的价格序列劈成两组。观测值现在单独放在
+            # `_zip_observed`，判定放在 `_zip_verify`。
             "zip_code": zip_code,
             "product_url": f"https://www.amazon.com/dp/{asin}",
             # 内部字段（下划线前缀，server 端 _save_result_inner_unlocked
             # 只写 ASIN_DATA_FIELDS 中的字段，不会落库）
             "_page_asin": None,  # variant 偏移检测用
+            # P4-1 / P4-2 / P4-9：采集质量信号。默认值 = 「没测」，不是「测了是空」。
+            "_zip_observed": None,
+            "_zip_verify": ZIP_VERIFY_UNVERIFIED,
+            "_completeness": 0,          # 0 == 未测量（契约 §6.4）
+            "_parse_engine": None,       # 没有任何引擎跑起来时保持 None
             "title": "N/A",
             "brand": "N/A",
             "product_type": "N/A",
@@ -1430,7 +1569,169 @@ class AmazonParser:
             "package_weight": "N/A",
             "item_dimensions": "N/A",
             "item_weight": "N/A",
+            # P4-6：这四个字段以前**只**在 selectolax 路径上被赋值，lxml 路径上
+            # 整个键都不存在。server 的写库循环是 `val = data.get(f); if val is not
+            # None:`（common/database.py:1906-1912），键不存在 ⇒ 跳过 ⇒ 该行**保留
+            # 上一次采集的值**，却配着一个全新的 crawl_time。也就是说 lxml 路径下
+            # 「4.4 分 / 1234 条评论 / 卖家 X」可能是三周前的，而记录声称是刚采的。
+            # 放进 _default_result 之后，任何路径都必然产出这四个键。
+            "rating": "N/A",
+            "review_count": "N/A",
+            "seller_id": "N/A",
+            "seller_name": "N/A",
         }
+
+    # ============ 引擎无关原语（P4-2 / P4-6 两条路径共用同一份逻辑）============
+
+    @staticmethod
+    def _is_slx(tree) -> bool:
+        """tree 是 selectolax 树还是 lxml 树。
+
+        用**结构探测**而不是模块级 `_USE_SELECTOLAX`：单测必须能在装着
+        selectolax 的进程里直接驱动 lxml 路径（生产上 lxml 分支只在 selectolax
+        缺失时才跑，靠全局开关的话这条路径永远测不到 —— 它正是 P4-6 那四个
+        字段丢失的地方）。
+        """
+        return tree is not None and hasattr(tree, "css_first")
+
+    def _uni_first_text(self, tree, css: str, xpath: str) -> Optional[str]:
+        """两条引擎路径共用的「取第一个匹配节点的文本」。取不到返回 None。
+
+        selectolax 侧显式传 ``separator=" "``：默认的 ``text(strip=True)`` 是
+        **逐文本节点** strip 后**无分隔符**拼接，`Sold by <a>Amazon.com</a>` 会变成
+        `Sold byAmazon.com`，子串判断全部落空（tests/test_long_description.py
+        记的同一个坑，那里的结论也是「以 lxml 语义为准」）。
+        """
+        if tree is None:
+            return None
+        try:
+            if self._is_slx(tree):
+                node = tree.css_first(css)
+                if node is None:
+                    return None
+                return (node.text(separator=" ", strip=True) or "").strip() or None
+            nodes = tree.xpath(xpath)
+            if not nodes:
+                return None
+            first = nodes[0]
+            if isinstance(first, str):
+                return first.strip() or None
+            return " ".join(t.strip() for t in first.itertext() if t.strip()) or None
+        except Exception:
+            return None
+
+    def _uni_first_attr(self, tree, css: str, xpath: str, attr: str) -> Optional[str]:
+        """同上，取属性值。``xpath`` 必须**直接选到属性**（形如 ``...//@href``）。"""
+        if tree is None:
+            return None
+        try:
+            if self._is_slx(tree):
+                node = tree.css_first(css)
+                if node is None:
+                    return None
+                return (node.attributes.get(attr) or "").strip() or None
+            for v in tree.xpath(xpath):
+                s = str(v).strip()
+                if s:
+                    return s
+            return None
+        except Exception:
+            return None
+
+    # ==================== P4-2 完整性位图 ====================
+
+    def _has_any_block(self, tree, ids: Tuple[str, ...]) -> bool:
+        """这些 id 的**区块**在不在。只看存在性，**不看**里面有没有内容。"""
+        if tree is None:
+            return False
+        for block_id in ids:
+            try:
+                if self._is_slx(tree):
+                    if tree.css_first("#" + block_id) is not None:
+                        return True
+                elif bool(tree.xpath('boolean(//*[@id="%s"])' % block_id)):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _measure_completeness(self, tree) -> int:
+        """按 HTML 区块存在性算完整性位图；tree 为空（没测）返回 0。
+
+        契约 §6.4：``0`` 的含义是「未测量」，**不是**「三项都缺」。所以只有真的
+        走到这里、手上有一棵树，才置 MEASURED 位。
+        """
+        if tree is None:
+            return 0
+        bits = COMPLETENESS_MEASURED
+        if self._has_any_block(tree, _BLOCK_IDS_BREADCRUMB):
+            bits |= COMPLETENESS_BREADCRUMB
+        if self._has_any_block(tree, _BLOCK_IDS_DETAIL):
+            bits |= COMPLETENESS_DETAIL_TABLE
+        if self._has_any_block(tree, _BLOCK_IDS_IMAGE):
+            bits |= COMPLETENESS_MAIN_IMAGE
+        return bits
+
+    # ==================== P4-1 邮编观测 / 判定 ====================
+
+    @staticmethod
+    def _parse_zip_observed(html_text: str) -> Optional[str]:
+        """从 glow 配送挂件的**第二行**抽出页面上实际生效的邮编；取不到返回 None。
+
+        `_slx_parse_zip_code` / `_parse_zip_code` 读的是 ``glow-ingress-line1``，
+        而那一行是 "Deliver to" / "Hello, select your address" 这类提示语，几乎不
+        含邮编 —— 本仓自己的 worker/ziputil.py:11-12 写明邮编在 **line2**
+        （"New York 10001" / "Altoona 16602"）。于是那两个函数近乎恒返回 None，
+        `or zip_code` 兜底恒生效，`zip_code` 列 100% 是请求值（审计 §需求3c）。
+
+        这里**不做**「取不到就回退成请求值」的兜底：取不到就是 None。理由与
+        ziputil.py:26-28 完全一致 —— 把请求值伪装成观测值，会让 zip_verify
+        永远是 confirmed，等于把这个信号变成常量。
+        """
+        if not html_text:
+            return None
+        try:
+            m = _GLOW_INGRESS_LINE2_RE.search(html_text)
+            if not m:
+                return None
+            z = _ZIP5_RE.search(m.group(1) or "")
+            return z.group(1) if z else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _norm_zip(z: Any) -> Optional[str]:
+        """邮编归一化到 5 位字符串；无法归一化返回 None。"""
+        s = str(z).strip() if z is not None else ""
+        if not s:
+            return None
+        head = s.split("-")[0].strip()
+        if head.isdigit() and 0 < len(head) <= 5:
+            return head.zfill(5)
+        m = _ZIP5_RE.search(s)
+        return m.group(1) if m else None
+
+    @classmethod
+    def _judge_zip(cls, requested: Any, observed: Any) -> str:
+        """(请求值, 观测值) -> zip_verify 封闭集之一。"""
+        req = cls._norm_zip(requested)
+        obs = cls._norm_zip(observed)
+        if obs is None:
+            # 页面没挂 glow 挂件：只能**假设**切邮编生效了。
+            # 绝不在这里返回 confirmed —— 一个错的 confirmed 比一个诚实的
+            # assumed 更糟（relay.py:222-225 记的是同一条理由）。
+            return ZIP_VERIFY_ASSUMED if req else ZIP_VERIFY_UNVERIFIED
+        if req is None:
+            return ZIP_VERIFY_UNVERIFIED
+        return ZIP_VERIFY_CONFIRMED if obs == req else ZIP_VERIFY_MISMATCH
+
+    def _apply_quality_signals(self, result: Dict, tree, html_text: str,
+                               zip_code: str) -> None:
+        """把 P4-1 / P4-2 的质量信号写进 result（两条引擎路径共用）。"""
+        observed = self._parse_zip_observed(html_text)
+        result["_zip_observed"] = observed
+        result["_zip_verify"] = self._judge_zip(zip_code, observed)
+        result["_completeness"] = self._measure_completeness(tree)
 
     def _check_block(self, html_text: str, tree) -> Optional[str]:
         """检测反爬拦截，返回拦截类型或 None"""
@@ -1609,7 +1910,7 @@ class AmazonParser:
     def _parse_ean(self, html_text: str) -> str:
         try:
             eans = set(re.findall(r'"gtin13":"(\d+)"', html_text))
-            return ",".join(list(eans))
+            return ",".join(sorted(eans))       # P4-5，同 _slx_parse_upc
         except Exception:
             return ""
 
@@ -1624,7 +1925,10 @@ class AmazonParser:
         try:
             all_asins = set(re.findall(r'"asin":"(\w+)"', html_text))
             variations = all_asins - {asin, parent_asin}
-            return ",".join(list(variations))
+            # P4-5：跨进程顺序不定，理由同 _slx_parse_upc。这条兜底路径本身还会
+            # 捞进赞助位 ASIN（slowhash 因此把 variation_asins 整个排除在哈希外），
+            # 但那是另一个问题 —— 顺序不稳是可以现在就消掉的那一半。
+            return ",".join(sorted(variations))
         except Exception:
             return ""
 
@@ -1725,18 +2029,42 @@ class AmazonParser:
         except Exception:
             return "", None
 
+    #: P4-4：`manufacturer` 只认这些**精确**键名（归一化后比较）。
+    #: 原来是子串匹配 `'manufacturer' in k_lower`，它命中的第一个常见键是
+    #: **"Manufacturer recommended age"** —— manufacturer 于是变成 "3 years and up"。
+    #: 由于 `_map_detail` 无条件覆盖、而 `_parse_all_details` 扫的是**全文档**所有
+    #: <tr>（含 "Compare with similar items" 与 A+ 对比表），谁最后写谁赢完全取决于
+    #: 文档顺序：模板/AB 一变就在 "Acme" ↔ "3 years and up" 之间来回翻，每翻一次
+    #: 两次误复审（manufacturer ∈ 慢变字段）。
+    _MANUFACTURER_KEYS = frozenset({
+        "manufacturer",
+        "manufacturer name",
+        "manufactured by",
+    })
+
+    #: 详情表键名归一化时要丢掉的字符。Amazon 的 detailBullets 键长这样：
+    #: ``"Manufacturer ‏ : ‎"`` —— 冒号 + 两个双向控制字符。
+    _KEY_JUNK_RE = re.compile(r"[^a-z0-9&/ ]+")
+
+    @classmethod
+    def _norm_detail_key(cls, k: str) -> str:
+        """详情表键名归一化：小写 → 非 [a-z0-9&/ ] 字符换空格 → 折叠空白。"""
+        return re.sub(r"\s+", " ", cls._KEY_JUNK_RE.sub(" ", (k or "").lower())).strip()
+
     def _map_detail(self, d: Dict, k: str, v: str):
         """字段名映射"""
         k_lower = k.lower()
         if 'model number' in k_lower:
             d['model_number'] = v
         elif 'part number' in k_lower:
+            # 'part number' 排在 'manufacturer' 之前，所以 "Manufacturer Part Number"
+            # 一直落位正确 —— 当年活着的只有年龄段那一条。
             d['part_number'] = v
         elif 'country of origin' in k_lower:
             d['country_of_origin'] = v
         elif 'best sellers rank' in k_lower:
             d['best_sellers_rank'] = v
-        elif 'manufacturer' in k_lower:
+        elif self._norm_detail_key(k) in self._MANUFACTURER_KEYS:
             d['manufacturer'] = v
         elif k_lower.strip() == 'brand':
             d['brand'] = v
@@ -1796,16 +2124,7 @@ class AmazonParser:
         except Exception:
             return "N/A"
 
-    def _parse_zip_code(self, tree) -> Optional[str]:
-        try:
-            line1 = self._get_text(tree, ['//span[@id="glow-ingress-line1"]/text()'])
-            if line1:
-                match = re.search(r'(\d{5})', line1)
-                if match:
-                    return match.group(1)
-        except Exception:
-            pass
-        return None
+    # `_parse_zip_code` 已删除（P4-1），理由同 `_slx_parse_zip_code`。
 
     def _parse_brand(self, tree) -> str:
         try:
@@ -2103,7 +2422,7 @@ class AmazonParser:
             if 'upc' in page_details:
                 upc_set.add(page_details['upc'])
             upc_set.update(re.findall(r'UPC\s*[:#]?\s*(\d{12})', html_text))
-            return ",".join(list(upc_set))
+            return ",".join(sorted(upc_set))    # P4-5，同 _slx_parse_upc
         except Exception:
             return ""
 

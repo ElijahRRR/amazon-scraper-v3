@@ -110,10 +110,35 @@ def test_like_is_rewritten_to_ascii_fold():
     所以统一改写成 ascii_lower。"""
     out = translate_sql("SELECT 1 FROM asin_data d WHERE d.title LIKE ?")
     assert out == ("SELECT 1 FROM asin_data d "
-                   "WHERE ascii_lower(d.title) LIKE ascii_lower($1)")
+                   "WHERE ascii_lower(d.title) LIKE ascii_lower($1) ESCAPE ''")
     # 已经显式写好的形式不会被二次包裹
     src = "SELECT 1 WHERE ascii_lower(d.title) LIKE ascii_lower(?)"
     assert translate_sql(src).count("ascii_lower") == 2
+
+
+def test_like_rewrite_always_disables_the_escape_character():
+    """D-16：SQLite 的 LIKE **没有**转义字符，PG 默认拿反斜杠当转义。
+
+    只改写操作数不管模式，``DELETE /api/results {"search": "back\\\\slash"}``
+    就会静默删错行（两个后端都回 deleted:1）。``ESCAPE ''`` 关掉转义机制 =
+    SQLite 的语义。
+    """
+    # 每一个被改写的 LIKE 都必须带上 ESCAPE ''
+    out = translate_sql(
+        "SELECT 1 WHERE d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?")
+    assert out.count("ESCAPE ''") == 3
+    assert out.count("ascii_lower") == 6
+
+    # 已经自带 ESCAPE 的不会被再加一个（否则是语法错误）
+    assert translate_sql("SELECT 1 WHERE a LIKE ? ESCAPE ''") == \
+        "SELECT 1 WHERE a LIKE $1 ESCAPE ''"
+
+    # 显式谓词（results_read._TERM_OR）与自动改写的产物必须逐字同形，
+    # 否则读路径与删除路径又会不一致。
+    from common.pgdb.results_read import _TERM_OR, _like_pattern
+    assert _TERM_OR.count("ESCAPE ''") == 3
+    # 模式本身**不**再加倍反斜杠——转义已经在 SQL 侧关掉了
+    assert _like_pattern("back\\slash") == "%back\\slash%"
 
 
 def test_mixed_placeholder_styles_rejected():
@@ -140,6 +165,47 @@ def test_text_affinity_matches_sqlite():
     assert text_affinity(10.0) == "10.0"
     assert text_affinity(None) is None
     assert text_affinity("x") == "x"
+
+
+def test_text_affinity_float_edge_cases_match_sqlite():
+    """D-20：``json.loads`` 接受 NaN/Infinity 字面量，``-0.0`` / ``1e400`` 更是
+    普通 JSON 数字——这些值**到得了** text_affinity。
+
+    实测 sqlite3 往 TEXT 列绑（见 tests 里的对照表）：
+        -0.0 -> '0.0'   nan -> NULL   inf -> 'Inf'   -inf -> '-Inf'
+    """
+    import json
+
+    assert text_affinity(-0.0) == "0.0"          # "%.15g" 会给出 '-0'
+    assert text_affinity(0.0) == "0.0"
+    assert text_affinity(float("nan")) is None   # SQLite 存 NULL
+    assert text_affinity(float("inf")) == "Inf"
+    assert text_affinity(float("-inf")) == "-Inf"
+    # 这三个都是 json.loads 直接能解析出来的
+    assert text_affinity(json.loads("NaN")) is None
+    assert text_affinity(json.loads("Infinity")) == "Inf"
+    assert text_affinity(json.loads("1e400")) == "Inf"
+
+
+def test_text_affinity_rejects_what_sqlite_rejects():
+    """D-20：等价性是双向的。
+
+    以前 ``str(v)`` 兜底把"SQLite 500 + 整批回滚"变成"PG 200 + 存下畸形字符串"，
+    ``POST /api/tasks/result/batch`` 一条毒项就能反转批次原子性。
+    """
+    import sqlite3
+
+    # int64 越界：sqlite3 抛 OverflowError
+    assert text_affinity(2 ** 63 - 1) == "9223372036854775807"
+    assert text_affinity(-(2 ** 63)) == "-9223372036854775808"
+    for bad in (2 ** 63, -(2 ** 63) - 1):
+        with pytest.raises(OverflowError):
+            text_affinity(bad)
+
+    # 不支持的类型：sqlite3 抛 ProgrammingError，异常类型也照抄
+    for bad in ([1, 2], {"k": "v"}, (1, 2), {1}, b"ab", object()):
+        with pytest.raises(sqlite3.ProgrammingError):
+            text_affinity(bad)
 
 
 def test_ascii_fold_is_ascii_only():

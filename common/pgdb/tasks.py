@@ -308,25 +308,38 @@ class TasksMixin:
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
-            if dead_worker_ids:
-                cursor = await self._db.execute(
-                    """UPDATE tasks SET status='pending', worker_id=NULL,
-                           lease_epoch=lease_epoch+1, updated_at=?
-                       WHERE status='processing' AND (
-                           worker_id = ANY(?::text[]) OR updated_at < ?
-                       )""",
-                    (now, [self.text_affinity(w) for w in dead_worker_ids], hard_cutoff)
-                )
-            else:
-                # 没有死 Worker，只做硬超时兜底
-                cursor = await self._db.execute(
-                    "UPDATE tasks SET status='pending', worker_id=NULL, "
-                    "lease_epoch=lease_epoch+1, updated_at=? "
-                    "WHERE status='processing' AND updated_at < ?",
-                    (now, hard_cutoff)
-                )
-            reclaimed = cursor.rowcount
-            await self._db.execute("COMMIT")
+            # 原版没有回滚路径（database.py:1258）。SQLite 下一条语句报错只是把连接
+            # 留在事务里；PG 下事务 abort + 写锁随异常释放 + 垫片事务槽不清 =
+            # 之后**每一次** BEGIN 都撞"嵌套 BEGIN"，整条写路径永久焊死。
+            # 捕 BaseException 而不是 Exception：本方法由 _timeout_task_loop 调用，
+            # 停服时会被 cancel，CancelledError 同样必须回滚。
+            # 返回值、异常类型、成功路径都没变。
+            try:
+                if dead_worker_ids:
+                    cursor = await self._db.execute(
+                        """UPDATE tasks SET status='pending', worker_id=NULL,
+                               lease_epoch=lease_epoch+1, updated_at=?
+                           WHERE status='processing' AND (
+                               worker_id = ANY(?::text[]) OR updated_at < ?
+                           )""",
+                        (now, [self.text_affinity(w) for w in dead_worker_ids], hard_cutoff)
+                    )
+                else:
+                    # 没有死 Worker，只做硬超时兜底
+                    cursor = await self._db.execute(
+                        "UPDATE tasks SET status='pending', worker_id=NULL, "
+                        "lease_epoch=lease_epoch+1, updated_at=? "
+                        "WHERE status='processing' AND updated_at < ?",
+                        (now, hard_cutoff)
+                    )
+                reclaimed = cursor.rowcount
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
         if reclaimed > 0:
             logger.info(f"回收 {reclaimed} 个任务 (dead_workers={len(dead_worker_ids)}, hard_cutoff={hard_cutoff})")
         return reclaimed
@@ -459,26 +472,43 @@ class TasksMixin:
         wid = self.text_affinity(worker_id)
         async with self._write_lock:
             await self._db.execute("BEGIN")
-            for epoch, ids in groups.items():
-                cursor = await self._db.execute(
-                    "UPDATE tasks SET status='pending', worker_id=NULL, "
-                    "lease_epoch=lease_epoch+1, updated_at=? "
-                    "WHERE id = ANY(?::bigint[]) AND worker_id=? AND lease_epoch=? "
-                    "AND status='processing'",
-                    (now, ids, wid, epoch)
-                )
-                released += cursor.rowcount
-            await self._db.execute("COMMIT")
+            # 回滚路径同 reclaim_dead_worker_tasks：原版（database.py:1400）没有，
+            # PG 下缺它就是"一个失败请求焊死整条写路径"。只在错误路径上跑。
+            try:
+                for epoch, ids in groups.items():
+                    cursor = await self._db.execute(
+                        "UPDATE tasks SET status='pending', worker_id=NULL, "
+                        "lease_epoch=lease_epoch+1, updated_at=? "
+                        "WHERE id = ANY(?::bigint[]) AND worker_id=? AND lease_epoch=? "
+                        "AND status='processing'",
+                        (now, ids, wid, epoch)
+                    )
+                    released += cursor.rowcount
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
         return released
 
     async def prioritize_batch(self, batch_id: int, priority: int = 10):
         async with self._write_lock:
             await self._db.execute("BEGIN")
-            await self._db.execute(
-                "UPDATE tasks SET priority=? WHERE batch_id=? AND status='pending'",
-                (self.as_int(priority), self.as_int(batch_id))
-            )
-            await self._db.execute("COMMIT")
+            # 回滚路径同 reclaim_dead_worker_tasks（原版 database.py:1415 没有）。
+            try:
+                await self._db.execute(
+                    "UPDATE tasks SET priority=? WHERE batch_id=? AND status='pending'",
+                    (self.as_int(priority), self.as_int(batch_id))
+                )
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
 
     async def get_progress(self, batch_id: int = None) -> Dict:
         """获取任务进度"""

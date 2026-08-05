@@ -22,20 +22,26 @@ OWNS（7 个方法）:
 terms 为空则**完全不加 where 子句**（静默返回全量）——全部保持。
 
 谓词形状：
-    (ascii_lower(d.asin) LIKE ascii_lower(?) OR
-     ascii_lower(d.title) LIKE ascii_lower(?) OR
-     ascii_lower(d.brand) LIKE ascii_lower(?))
+    (ascii_lower(d.asin) LIKE ascii_lower(?) ESCAPE '' OR
+     ascii_lower(d.title) LIKE ascii_lower(?) ESCAPE '' OR
+     ascii_lower(d.brand) LIKE ascii_lower(?) ESCAPE '')
 * 用 ascii_lower 而不是 ILIKE：实测 39 个探针 × 5 种写法，ILIKE 有 9 处与
   SQLite 不一致（根因是非 ASCII：SQLite 只折叠 ASCII，'CAFÉ CREME' 不匹配
   '%café%'），ascii_lower 是 0 处。ILIKE 还依赖 collation。
-* 反斜杠：SQLite 的 LIKE **没有**转义字符，PG 默认是反斜杠。构造模式时把
-  反斜杠加倍：``"%" + t.replace("\\\\", "\\\\\\\\") + "%"``。
-  实测：不处理的话 'back\\slash' 在 PG 下匹配不到，'\\\\' 反而匹配得到。
+* 反斜杠（决策 D-16）：SQLite 的 LIKE **没有**转义字符，PG 默认是反斜杠。
+  统一用 ``ESCAPE ''`` 把 PG 的转义机制整个关掉——这正好就是 SQLite 的语义，
+  模式因此可以**原样**传下去。
+  以前这里靠"在 Python 侧把反斜杠加倍"抵消，但那只覆盖得到本模块自己拼的
+  SQL；server/app.py:2277 的 DELETE 用 f-string 自己拼模式、走
+  pool.translate_sql 的自动改写，加倍不了 —— 于是同一个 ``search`` 在 GET 和
+  DELETE 上命中**不同的行**（GET 对、DELETE 错，而且两边都回 deleted:1）。
+  ``ESCAPE ''`` 加在 SQL 侧，两条路径共用同一份语义，不可能再漂。
 * ``%`` 和 ``_`` **不要**转义：用户输入里的通配符现在就是生效的（'Gol%rand'
   是模糊匹配），两个引擎的元字符一样，这个 bug 免费保留。
 * 也可以直接写 ``d.title LIKE ?`` —— pool.translate_sql 会自动改写成上面的
-  形状。但显式写出来更利于对照表达式 GIN 索引（schema.py 建的就是
-  ``public.ascii_lower(col) public.gin_trgm_ops``，表达式必须逐字一致）。
+  形状（含 ``ESCAPE ''``）。但显式写出来更利于对照表达式 GIN 索引（schema.py
+  建的就是 ``public.ascii_lower(col) public.gin_trgm_ops``，表达式必须逐字
+  一致）。实测 ``ESCAPE ''`` 不影响 GIN 走索引。
 * 查询形状用**扁平 OR**，不要照搬 ``d.id IN (SELECT ... UNION ...)``。
   200k 行实测：非选择性词条上扁平 OR 是 2.2ms，id-IN-UNION 是 536ms
   （HashAggregate 整个 id 集）。
@@ -103,27 +109,32 @@ from common.pgdb._shared import (  # noqa: F401
     _ASIN_DATA_COLUMN_SET,
     _normalize_screenshot_path,
 )
-from common.pgdb.pool import as_int, text_affinity
+from common.pgdb.pool import LIKE_NO_ESCAPE, as_int, text_affinity
 
 
 # 一个 term 的三列 OR 谓词。写成 ascii_lower(...) LIKE ascii_lower(?) 而不是
 # ILIKE：见模块头注释与 OWNERSHIP.md D-5。表达式必须与 schema.py 建的
 # 表达式 GIN 索引（public.ascii_lower(col) public.gin_trgm_ops）对得上。
-_TERM_OR = ("(ascii_lower(d.asin) LIKE ascii_lower(?)"
-            " OR ascii_lower(d.title) LIKE ascii_lower(?)"
-            " OR ascii_lower(d.brand) LIKE ascii_lower(?))")
+_TERM_OR = ("(ascii_lower(d.asin) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE +
+            " OR ascii_lower(d.title) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE +
+            " OR ascii_lower(d.brand) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE + ")")
 
 
 def _like_pattern(t: str) -> str:
-    """``%term%``，并把反斜杠加倍。
+    """``%term%``，原样，不做任何转义处理。
 
-    SQLite 的 LIKE **没有**转义字符，PG 的 LIKE 默认用反斜杠转义。不加倍的话
-    ``'back\\slash'`` 在 PG 下匹配不到（``\\s`` 被吃成字面量 ``s``），而
-    ``'\\\\'`` 反而能匹配到——两个方向都错。
+    SQLite 的 LIKE **没有**转义字符。这里以前靠"把反斜杠加倍"去抵消 PG 的默认
+    转义，结果读路径（这里，加倍了）和删除路径（server/app.py:2277 的 f-string，
+    没加倍）语义不一致：同一个 ``search=back\\slash``，GET 命中 ``back\\slash``
+    那行，DELETE 却删掉 ``backslash`` 那行。
+
+    现在两条路径统一由 SQL 侧的 ``ESCAPE ''`` 关掉转义机制（pool.LIKE_NO_ESCAPE
+    / pool._LIKE_QMARK_RE，决策 D-16），所以模式本身必须**原样**传下去——再加倍
+    就等于把用户输入里的反斜杠变成两个。
     ``%`` 和 ``_`` 故意**不**转义：用户输入里的通配符今天就是生效的
     （``Gol%rand`` 是模糊匹配），两个引擎的元字符一样，这个行为免费保留。
     """
-    return "%" + str(t).replace("\\", "\\\\") + "%"
+    return "%" + str(t) + "%"
 
 
 class ResultsReadMixin:

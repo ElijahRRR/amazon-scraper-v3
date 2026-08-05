@@ -17,8 +17,11 @@ OWNS（8 个方法，对应 common/database.py 的同名实现）:
 --------------------------------------------------------------------------
 * create_batch 必须保持"INSERT OR IGNORE → 然后单独 SELECT id"两条语句的形状。
   → ``INSERT INTO batches(...) VALUES(...) ON CONFLICT DO NOTHING``
-    （裸 DO NOTHING，不写冲突目标，对齐 SQLite 的"吞掉一切约束冲突"）
-    然后 ``SELECT id FROM batches WHERE name = ?``。
+    （裸 DO NOTHING，不写冲突目标）然后 ``SELECT id FROM batches WHERE name = ?``。
+    注意 ``DO NOTHING`` 只吞**唯一/排他**冲突，而 SQLite 的 ``INSERT OR IGNORE``
+    吞的是**所有**约束冲突。差额（NOT NULL / CHECK / FK）由方法体里那个
+    ``except IntegrityConstraintViolationError: pass`` 补齐 —— 不补的话
+    ``create_batch(None)`` 会从 SQLite 的返回 0 变成 PG 抛 NotNullViolationError。
   **不要**改写成 ``ON CONFLICT DO NOTHING RETURNING id``：冲突时它不返回行，
   create_batch 就会从"返回已存在的 id"变成返回 0，基线 step
   ``upload_batch_a_duplicate``（inserted=0 且复用原 batch）直接炸。
@@ -88,6 +91,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+# 只借异常类型，不建连接（硬规矩 3 禁的是自己建连接）。
+from asyncpg.exceptions import IntegrityConstraintViolationError
+
 from common.pgdb._shared import LOCK_STATS, TimedLock, record_stage  # noqa: F401
 from common.pgdb.pool import as_int, text_affinity
 
@@ -113,21 +119,32 @@ class BatchesMixin:
         callback_status = "pending" if callback_url else None
         name_p = text_affinity(name)
         async with self._write_lock:
-            async with self._tx():
-                # INSERT OR IGNORE → ON CONFLICT DO NOTHING（裸的、不写冲突目标）。
-                # 冲突时**不返回行**，所以 id 必须由下面那条独立 SELECT 取回 ——
-                # 这正是"同名重传返回已有 id"的来源，基线钉死了它。
-                await self._db.execute(
-                    "INSERT INTO batches "
-                    "(name, needs_screenshot, is_auto, status, external_id, "
-                    " callback_url, callback_status, expand_variants) "
-                    "VALUES (?, ?, ?, 'running', ?, ?, ?, ?) "
-                    "ON CONFLICT DO NOTHING",
-                    (name_p, 1 if needs_screenshot else 0, 1 if is_auto else 0,
-                     text_affinity(external_id), text_affinity(callback_url),
-                     callback_status,
-                     1 if expand_variants else 0)
-                )
+            # ON CONFLICT DO NOTHING 只吞**唯一/排他**冲突，而 SQLite 的
+            # INSERT OR IGNORE 吞的是**所有**约束冲突——NOT NULL / CHECK / FK 也算。
+            # 于是 create_batch(None) 在 SQLite 下是"插不进去，然后 SELECT 查不到，
+            # 返回 0"，在 PG 下却抛 NotNullViolationError。这里把差额补上：
+            # 把完整性约束错误当成"这一行没插进去"，交给下面那条 SELECT 决定返回值。
+            # 注意异常必须逃出 self._tx() 之后才吞——PG 的事务一旦 abort，同一个
+            # 事务里再发语句就是 25P02，必须先让 _tx() 回滚干净。
+            # identity 烧号不受影响（序列是非事务的，实测两个后端都烧掉 1 号）。
+            try:
+                async with self._tx():
+                    # INSERT OR IGNORE → ON CONFLICT DO NOTHING（裸的、不写冲突目标）。
+                    # 冲突时**不返回行**，所以 id 必须由下面那条独立 SELECT 取回 ——
+                    # 这正是"同名重传返回已有 id"的来源，基线钉死了它。
+                    await self._db.execute(
+                        "INSERT INTO batches "
+                        "(name, needs_screenshot, is_auto, status, external_id, "
+                        " callback_url, callback_status, expand_variants) "
+                        "VALUES (?, ?, ?, 'running', ?, ?, ?, ?) "
+                        "ON CONFLICT DO NOTHING",
+                        (name_p, 1 if needs_screenshot else 0, 1 if is_auto else 0,
+                         text_affinity(external_id), text_affinity(callback_url),
+                         callback_status,
+                         1 if expand_variants else 0)
+                    )
+            except IntegrityConstraintViolationError:
+                pass
             # 提交之后再读（SQLite 版就是 COMMIT 后的自动提交读），仍在写锁内
             async with self._db.execute(
                     "SELECT id FROM batches WHERE name = ?", (name_p,)) as c:

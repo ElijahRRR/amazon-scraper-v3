@@ -129,6 +129,29 @@ def _remove_screenshot_files(file_paths: list):
             pass
 
 
+async def _rollback_quietly(conn):
+    """裸 ``BEGIN`` 块失败后回滚，两个后端共用（不按后端分叉，见 OWNERSHIP.md D-4）。
+
+    本文件里有 7 个 ``async with db._write_lock: BEGIN ... COMMIT`` 块。原来其中 6 个
+    没有回滚路径——SQLite 下这些语句基本不会失败，失败了也只是把那一条连接留在事务里。
+    PostgreSQL 下 ``db._db`` 同样是**一条**专用写连接，但事务是粘在连接上的状态：
+    任何一条语句报错，事务立刻 abort，写锁随异常释放，而垫片的事务槽还是满的，
+    于是**之后每一次 BEGIN** 都撞上"嵌套 BEGIN"守卫——一个失败请求把整条写路径
+    永久焊死（读仍然 200，健康检查看不出来）。加回滚把它降级成"一个请求 500"。
+
+    - 只在**错误路径**上跑：成功路径一条语句都没多，两个后端的返回值/异常类型不变。
+    - 回滚本身的异常一律吞掉（SQLite 在没有活动事务时 ROLLBACK 会报错），
+      永远不能盖掉真正的原因，最后一定 ``raise`` 原异常。
+    - 捕获 ``BaseException`` 而不是 ``Exception``：这些块全都在 HTTP handler 里，
+      客户端断开会让 Starlette 取消请求协程，``CancelledError`` 同样必须回滚，
+      否则连接照样带着事务泄漏出去（common/pgdb/batches.py 的 ``_tx()`` 已经是这个口径）。
+    """
+    try:
+        await conn.execute("ROLLBACK")
+    except BaseException:
+        pass
+
+
 def _register_worker(worker_id: str, enable_screenshot: bool = None, ip: str = None):
     if not _WORKER_ID_RE.match(worker_id):
         return
@@ -337,10 +360,16 @@ async def _timeout_task_loop():
             # 兜底完成检测：扫描长期 running 的批次（防止入队事件丢失）
             # 只扫最近活动的 batches，避免全表查询
             try:
+                # ORDER BY updated_at 单独一列不是全序：updated_at 是秒级精度，
+                # 一次提交里的多个批次会拿到同一个时间戳，LIMIT 30 于是返回的是
+                # **不确定的 30 行**（不只是顺序不定，是行集合不定）——SQLite 走
+                # rowid、PG 走堆序，UPDATE 之后堆序还会漂。补 id DESC 把它变成全序。
+                # NULLS LAST 是 SQLite DESC 的默认行为（实测），显式写出来只是为了
+                # 让 PG 对齐（PG 的 DESC 默认 NULLS FIRST），SQLite 侧是 no-op。
                 async with db.read() as rc, rc.execute(
                     """SELECT id FROM batches
                        WHERE status='running'
-                       ORDER BY updated_at DESC
+                       ORDER BY updated_at DESC NULLS LAST, id DESC
                        LIMIT 30"""
                 ) as c:
                     rows = await c.fetchall()
@@ -1250,33 +1279,37 @@ async def api_retry_batch(batch_name: str, force: bool = False):
 
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
-        skipped = 0
-        if no_retry_list:
-            async with db._db.execute(
-                f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
-                f"AND COALESCE(error_type, '') IN ({no_retry_placeholders})",
-                [batch_id] + no_retry_list
-            ) as c:
-                row = await c.fetchone()
-                skipped = row[0] if row else 0
+        try:
+            # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
+            skipped = 0
+            if no_retry_list:
+                async with db._db.execute(
+                    f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
+                    f"AND COALESCE(error_type, '') IN ({no_retry_placeholders})",
+                    [batch_id] + no_retry_list
+                ) as c:
+                    row = await c.fetchone()
+                    skipped = row[0] if row else 0
 
-        # 实际重试 SQL：始终排除 NO_RETRY；force 参数保留兼容旧调用，但不覆盖 variant_offset。
-        if not no_retry_list:
-            cursor = await db._db.execute(
-                "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
-                "WHERE batch_id=? AND status='failed'",
-                (batch_id,)
-            )
-        else:
-            cursor = await db._db.execute(
-                f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
-                f"WHERE batch_id=? AND status='failed' "
-                f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders})",
-                [batch_id] + no_retry_list
-            )
-        retried = cursor.rowcount
-        await db._db.execute("COMMIT")
+            # 实际重试 SQL：始终排除 NO_RETRY；force 参数保留兼容旧调用，但不覆盖 variant_offset。
+            if not no_retry_list:
+                cursor = await db._db.execute(
+                    "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                    "WHERE batch_id=? AND status='failed'",
+                    (batch_id,)
+                )
+            else:
+                cursor = await db._db.execute(
+                    f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                    f"WHERE batch_id=? AND status='failed' "
+                    f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders})",
+                    [batch_id] + no_retry_list
+                )
+            retried = cursor.rowcount
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
     return {
         "ok": True,
         "retried": retried,
@@ -1302,12 +1335,16 @@ async def api_delete_batch(batch_name: str):
 
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        await db._db.execute("DELETE FROM tasks WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM batch_asins WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM screenshots WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM asin_changes WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
-        await db._db.execute("COMMIT")
+        try:
+            await db._db.execute("DELETE FROM tasks WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM batch_asins WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM screenshots WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM asin_changes WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     # 删除物理截图文件
     _remove_screenshot_files(screenshot_files)
@@ -1352,11 +1389,8 @@ async def api_delete_batches_bulk(request: Request):
                 await db._db.execute(f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", batch_ids)
             await db._db.execute(f"DELETE FROM batches WHERE id IN ({ph})", batch_ids)
             await db._db.execute("COMMIT")
-        except Exception:
-            try:
-                await db._db.execute("ROLLBACK")
-            except Exception:
-                pass
+        except BaseException:
+            await _rollback_quietly(db._db)
             raise
 
     _remove_screenshot_files(screenshot_files)
@@ -1372,17 +1406,25 @@ async def api_batch_errors(batch_name: str):
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
     async with db.read() as rc:
+        # cnt 并列时顺序原本不定 → 用 error_type 兜底成全序。
+        # NULLS FIRST 是 SQLite ASC 的默认行为（实测），PG 的 ASC 默认 NULLS LAST，
+        # 所以必须显式写；error_type 在两边都是二进制序（PG 侧 COLLATE "C"）。
         async with rc.execute(
             "SELECT error_type, COUNT(*) as cnt FROM tasks "
             "WHERE batch_id=? AND status='failed' "
-            "GROUP BY error_type ORDER BY cnt DESC",
+            "GROUP BY error_type ORDER BY cnt DESC, error_type NULLS FIRST",
             (batch_id,)
         ) as c:
             error_summary = [dict(r) for r in await c.fetchall()]
+        # 这一条原来是 ORDER BY updated_at DESC LIMIT 200，没有 tiebreaker。
+        # updated_at 是秒级精度，而 accept_results_batch 会把**整次提交**盖上同一个
+        # 时间戳：一批 260 个任务一起失败时，200 行的**行集合**在两个后端不一样
+        # （实测 60 行不同），同一个后端换一次表重组也可能变。补 id DESC 后与
+        # /api/batches/{id}/failures（get_batch_failures，本来就是这个写法）一致。
         async with rc.execute(
             "SELECT asin, error_type, error_detail, retry_count, worker_id, updated_at "
             "FROM tasks WHERE batch_id=? AND status='failed' "
-            "ORDER BY updated_at DESC LIMIT 200",
+            "ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200",
             (batch_id,)
         ) as c:
             failed_tasks = [dict(r) for r in await c.fetchall()]
@@ -1503,13 +1545,17 @@ async def api_release_tasks(request: Request):
             placeholders = ",".join("?" * len(task_ids))
             async with db._write_lock:
                 await db._db.execute("BEGIN")
-                cursor = await db._db.execute(
-                    f"UPDATE tasks SET status='pending', worker_id=NULL, "
-                    f"lease_epoch=lease_epoch+1, updated_at=? "
-                    f"WHERE id IN ({placeholders}) AND status='processing'",
-                    [now] + task_ids
-                )
-                await db._db.execute("COMMIT")
+                try:
+                    cursor = await db._db.execute(
+                        f"UPDATE tasks SET status='pending', worker_id=NULL, "
+                        f"lease_epoch=lease_epoch+1, updated_at=? "
+                        f"WHERE id IN ({placeholders}) AND status='processing'",
+                        [now] + task_ids
+                    )
+                    await db._db.execute("COMMIT")
+                except BaseException:
+                    await _rollback_quietly(db._db)
+                    raise
             return {"ok": True, "released": cursor.rowcount}
         return {"ok": True, "released": 0}
     released = await db.release_tasks(worker_id, tasks)
@@ -2235,14 +2281,18 @@ async def api_delete_by_file(file: UploadFile = File(...)):
     # 分批删除
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        for i in range(0, len(asin_list), CHUNK):
-            chunk = asin_list[i:i+CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-        await db._db.execute("COMMIT")
+        try:
+            for i in range(0, len(asin_list), CHUNK):
+                chunk = asin_list[i:i+CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     _remove_screenshot_files(screenshot_files)
     return {"ok": True, "deleted": len(asin_list), "asin_count": len(asin_list)}
@@ -2314,14 +2364,18 @@ async def api_delete_results(request: Request):
     # 分批删除
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        for i in range(0, len(asin_list), CHUNK):
-            chunk = asin_list[i:i+CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-        await db._db.execute("COMMIT")
+        try:
+            for i in range(0, len(asin_list), CHUNK):
+                chunk = asin_list[i:i+CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     # 删除物理截图文件
     _remove_screenshot_files(screenshot_files)
@@ -2652,10 +2706,14 @@ async def api_clear_database():
     import shutil
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        for table in ["asin_changes", "asin_data", "batch_asins", "tasks", "screenshots", "batches"]:
-            await db._db.execute(f"DELETE FROM {table}")
-        await db._db.execute("DELETE FROM sqlite_sequence")
-        await db._db.execute("COMMIT")
+        try:
+            for table in ["asin_changes", "asin_data", "batch_asins", "tasks", "screenshots", "batches"]:
+                await db._db.execute(f"DELETE FROM {table}")
+            await db._db.execute("DELETE FROM sqlite_sequence")
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     # 清理截图文件
     ss_dir = config.SCREENSHOT_DIR

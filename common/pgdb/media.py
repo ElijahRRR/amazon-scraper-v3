@@ -487,8 +487,15 @@ class MediaMixin:
 
     async def get_pending_screenshots(self, batch_id: int,
                                       limit: int = 50) -> List[Dict]:
+        # 原版（database.py:2292）是 LIMIT 没有 ORDER BY —— 不是全序，取哪 5 行
+        # 由存储层决定。SQLite 全表扫按 rowid 走，而 screenshots.id 就是 rowid，
+        # 所以它实际产出的一直是 id 升序；PG 按堆序，一旦有行被 UPDATE 过（截图
+        # done→pending 的重试就会）新版本挪到堆尾，取到的就是另一批行。实测
+        # 20 行里 churn 掉 8 行、limit=5：sqlite [S001..S005] / pg [S009..S013]。
+        # 补 ORDER BY id 把 PG 钉到 SQLite 今天的产出上，SQLite 侧不经过这里。
         async with self.read() as rc, rc.execute(
-            "SELECT * FROM screenshots WHERE batch_id = ? AND status = 'pending' LIMIT ?",
+            "SELECT * FROM screenshots WHERE batch_id = ? AND status = 'pending' "
+            "ORDER BY id LIMIT ?",
             (self.as_int(batch_id), self.as_int(limit))
         ) as c:
             return [dict(r) for r in await c.fetchall()]

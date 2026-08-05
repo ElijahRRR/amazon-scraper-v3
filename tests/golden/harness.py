@@ -380,9 +380,24 @@ def diff_steps(golden: List[Dict], actual: List[Dict], limit: int = 40) -> List[
     return out
 
 
+def _numeric_but_not_bool(v: Any) -> bool:
+    """int/float 之间的宽容**不能**把 bool 也捎带进来。
+
+    bool 是 int 的子类，所以原来的 ``isinstance(g, (int, float))`` 对 True/False
+    同样成立；再加上叶子比较用的是 ``g != a``（``1 == True``），基线里 146 个取值
+    为 0/1 的 int 叶子和 97 个真 bool 叶子全都可以静默互换。也就是说
+    "INTEGER 0/1 变成 BOOLEAN true/false" 这一整类类型漂移（D-1 契约的核心风险，
+    asyncpg 会把 BOOLEAN 列直接给成 Python bool）黄金样本一步都拦不住。
+
+    int↔float 的宽容保留：本场景里 ``success_rate`` / ``completion_rate`` 这类
+    字段确实会随数据在 int 与 float 之间摆动。
+    """
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def _diff_body(name: str, g: Any, a: Any, path: str = "") -> List[str]:
     where = f"[{name}]{path}"
-    if type(g) is not type(a) and not (isinstance(g, (int, float)) and isinstance(a, (int, float))):
+    if type(g) is not type(a) and not (_numeric_but_not_bool(g) and _numeric_but_not_bool(a)):
         return [f"{where} 类型: {type(g).__name__} -> {type(a).__name__}"]
 
     if isinstance(g, dict):

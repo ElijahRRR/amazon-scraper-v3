@@ -256,8 +256,22 @@ templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
 # * import 方向是单向的：sync.py **不在模块级** import server.app
 #   （那是循环导入，启动即崩、整个 erpAPI 下线），它在每个 handler 里惰性取 db。
 from server.api import sync as _sync_api  # noqa: E402
+from server.api import export_incremental as _export_incr_api  # noqa: E402
 
 app.include_router(_sync_api.router)
+
+# ⚠ 这一行的**位置**是承重的，不是风格。
+#
+# /api/export/incremental 落在本文件下方 `@app.get("/api/export/{batch_name}")`
+# 那条 catch-all 的前缀里，而 Starlette 按**注册顺序**匹配。挪到那条之后，
+# 本端点会静默退化成 404 `{"detail":"批次不存在: incremental"}` ——
+# 而 404 正是 catalog_sync 最容易读成「暂无数据」的码：游标永不推进，
+# 同步静默停摆，两侧都不报错。实测过，未挂载时就是这个响应。
+#
+# /api/export/fields 与 /api/export/all 是同前缀下静态路径的现成先例，
+# 它们靠的是「定义在 catch-all 之前」这同一条规则。
+# tests/test_incremental_export.py::test_route_order_is_load_bearing 钉死它。
+app.include_router(_export_incr_api.router)
 
 
 def _cst_filter(value):

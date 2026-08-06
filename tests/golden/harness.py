@@ -162,6 +162,23 @@ _PATCHED_LOOPS = (
 )
 
 
+# `_default_settings()` 的取值大多是 config.py 里的字面量常量，但有两项读环境变量
+# （经 `.env` 或 shell）。它们会原样出现在 `/api/settings`、`/api/worker/sync`、
+# `/api/settings/reset` 的响应里，于是**基线跟着跑测试的机器变**：开发机 `.env` 里配了
+# 代理，同一份录制就报 4 处差异；CI 里没配，就绿。这不是移植 bug，是夹具漏了一处隔离。
+#
+# 值取 config.py 声明的默认值（环境变量不存在时的取值），所以钉住之后重放出来的
+# 就是基线录制时的形态。**不是 scrub**——scrub 会连带屏蔽字段本身的变化，钉住则
+# 保留逐值比较，只是把机器差异消掉。
+#
+# 新增环境变量驱动的设置项时这里要同步加：`tests/test_golden_env_isolation.py`
+# 会 AST 扫描 config.py 与 `_default_settings()`，漏了直接失败。
+_ENV_DERIVED_SETTINGS = {
+    "PROXY_URL": "",
+    "DEFAULT_ZIP_CODE": "10001",
+}
+
+
 def _pg_scratch_db():
     """DB_BACKEND=postgres 时：建一个本次运行专用的库，返回 (dsn, drop_fn)。
 
@@ -242,6 +259,11 @@ def isolated_server():
             ("EXPORT_DIR", os.path.join(tmp_root, "data", "exports")),
             ("SCREENSHOT_DIR", os.path.join(tmp_root, "screenshots")),
         ):
+            saved[f"config.{name}"] = getattr(config, name)
+            setattr(config, name, value)
+
+        # 必须在 TestClient 进入 lifespan（其中调用 _load_settings）之前钉住
+        for name, value in _ENV_DERIVED_SETTINGS.items():
             saved[f"config.{name}"] = getattr(config, name)
             setattr(config, name, value)
 

@@ -7,6 +7,23 @@
 
 ---
 
+## 0. 先切到有这些改动的分支（**跳过这步后面每一条命令都会 file not found**）
+
+本次迁移的**全部产物**只在 `claude/walmart-api-db-refactor-7oergd` 上，
+`main` 上没有 `requirements-dev.txt`、没有 `tools/`、没有 `docs/`、
+没有 `common/pgdb/`、没有 `tests/golden/`。
+
+```bash
+cd ~/你的路径/amazon-scraper-v3
+git fetch origin
+git checkout claude/walmart-api-db-refactor-7oergd
+
+# 确认（三个都要在）
+ls requirements-dev.txt tools/phase5_preflight.py docs/local_macos_setup.md
+```
+
+---
+
 ## 1. PostgreSQL
 
 ```bash
@@ -43,13 +60,21 @@ export PG_DSN="postgresql://scraper@127.0.0.1:5432/scraper"
 
 ## 2. Python 依赖
 
-macOS 自带的 Python 可能是 3.9，本项目要 **≥ 3.10**：
+**用 3.12，别用 3.13/3.14。** 代码本身要 ≥ 3.10，但这次迁移的所有验证
+（golden 64 步、pytest 682 条）都是在 **3.11** 上跑的；而依赖里有四个是要编 C 扩展的
+——`curl_cffi`、`lxml`、`selectolax`、`asyncpg`——太新的解释器往往还没有预编译 wheel，
+pip 会掉进源码编译，缺 `libxml2` / Rust 工具链就直接失败。3.12 是离验证环境最近
+又肯定有 wheel 的版本。
+
+`python3` 指向哪个版本取决于 PATH，所以下面**显式写全路径**建 venv：
 
 ```bash
-brew install python@3.12      # 已经有 3.10+ 就跳过
+brew install python@3.12
 
 cd ~/你的路径/amazon-scraper-v3
-python3 -m venv .venv
+rm -rf .venv                  # 如果之前用别的版本建过，先删掉
+/opt/homebrew/opt/python@3.12/bin/python3.12 -m venv .venv
+.venv/bin/python -V           # 应显示 3.12.x
 .venv/bin/pip install -U pip
 .venv/bin/pip install -r requirements-dev.txt   # 含 server + worker + 测试
 .venv/bin/pip install asyncpg
@@ -177,6 +202,9 @@ worker 跑起来后回到第 6 步，这次 `parse_engine` 应该是 `selectolax
 
 | 症状 | 原因 |
 |---|---|
+| `Could not open requirements file: 'requirements-dev.txt'` | 还在 `main` 上。回到第 0 步切分支 |
+| `can't open file '.../tools/phase5_preflight.py'` | 同上 |
+| `pip install` 卡在编译 `lxml`/`curl_cffi` 然后报错 | venv 的 Python 太新（3.13/3.14）没有 wheel。按第 2 步用 3.12 重建 |
 | `ConnectionRefusedError: 5432` | PG 没起。`brew services start postgresql@16` |
 | `role "scraper" does not exist` | 第 1 步的 `createuser` 没跑 |
 | `/api/export/incremental` 返回 404「批次不存在」 | 路由顺序坏了。跑 preflight 会直接指出来 |

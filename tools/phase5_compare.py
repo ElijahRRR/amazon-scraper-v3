@@ -151,6 +151,31 @@ SLOW_CRITICAL = {
 
 # ---------------------------------------------------------------- 取数
 
+
+def resolve_batch(base: str, spec: Optional[str], timeout: int = 60) -> Optional[int]:
+    """把 ``--old-batch/--new-batch`` 的取值解析成 batch_id。
+
+    接受两种写法：纯数字就是 id；否则当**批次名**，去 ``/api/batches`` 查。
+    真机上第一次给的就是名字（``batch_20260806_145034``）—— 界面上看得见的
+    是名字，不是 id，所以只认 id 是把内部标识泄漏给使用者。
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if spec.isdigit():
+        return int(spec)
+    url = f"{base.rstrip('/')}/api/batches"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        batches = (json.loads(r.read()) or {}).get("batches") or []
+    for b in batches:
+        if str(b.get("batch_name")) == spec:
+            bid = b.get("id")
+            print(f"  批次 {spec!r} -> id {bid}", file=sys.stderr, flush=True)
+            return int(bid)
+    names = [str(b.get("batch_name")) for b in batches[:8]]
+    raise SystemExit(f"❌ {base} 上找不到批次 {spec!r}。最近几个：{names}")
+
+
 def fetch_results(base: str, limit: int, timeout: int = 60,
                   wanted: Optional[set] = None, max_scan: int = 200000,
                   batch_id: Optional[int] = None) -> Dict[str, dict]:
@@ -366,11 +391,11 @@ def main() -> int:
     ap.add_argument("--asins", metavar="FILE",
                     help="只比对这个文件里的 ASIN（每行一个）。**强烈建议给**，"
                          "理由见 fetch_results 的 docstring")
-    ap.add_argument("--old-batch", type=int, metavar="ID",
-                    help="只看旧系统这一个批次（/api/results?batch_id=）。"
-                         "生产库上强烈建议给 —— 否则要翻遍全表去找那几十个 ASIN")
-    ap.add_argument("--new-batch", type=int, metavar="ID",
-                    help="同上，新系统侧")
+    ap.add_argument("--old-batch", metavar="ID_或_名字",
+                    help="只看旧系统这一个批次。可以给数字 id，也可以直接给批次名"
+                         "（工具去 /api/batches 查）。生产库上强烈建议给 —— "
+                         "否则要翻遍全表去找那几十个 ASIN")
+    ap.add_argument("--new-batch", metavar="ID_或_名字", help="同上，新系统侧")
     ap.add_argument("--timeout", type=int, default=60,
                     help="单次 HTTP 超时秒数")
     ap.add_argument("--max-scan", type=int, default=200000,
@@ -391,13 +416,16 @@ def main() -> int:
               "「最近首次收录的 N 个 ASIN」，不是「最近采集的」。"
               "生产库上这样几乎必然交集为空 —— 强烈建议用 --asins。", file=sys.stderr)
 
+    old_bid = resolve_batch(a.old, a.old_batch, a.timeout)
+    new_bid = resolve_batch(a.new, a.new_batch, a.timeout)
+
     print(f"拉取旧系统 {a.old} …", file=sys.stderr, flush=True)
     old = fetch_results(a.old, a.limit, wanted=wanted, max_scan=a.max_scan,
-                        timeout=a.timeout, batch_id=a.old_batch)
+                        timeout=a.timeout, batch_id=old_bid)
     print(f"  {len(old)} 行", file=sys.stderr)
     print(f"拉取新系统 {a.new} …", file=sys.stderr)
     new = fetch_results(a.new, a.limit, wanted=wanted, max_scan=a.max_scan,
-                        timeout=a.timeout, batch_id=a.new_batch)
+                        timeout=a.timeout, batch_id=new_bid)
     print(f"  {len(new)} 行", file=sys.stderr)
 
     if not old or not new:

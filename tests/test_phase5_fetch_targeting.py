@@ -24,7 +24,8 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools.phase5_compare import fetch_results, read_asin_file  # noqa: E402
+from tools.phase5_compare import (  # noqa: E402
+    fetch_results, read_asin_file, resolve_batch)
 
 # 5 页 × 200 行。前 4 页是「最近首次收录」的噪声，目标在最后一页。
 TOTAL_PAGES = 5
@@ -49,6 +50,22 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps({"items": items,
                            "has_more": page < TOTAL_PAGES - 1,
                            "next_cursor": page + 1}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _BatchHandler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = json.dumps({"batches": [
+            {"id": 7, "batch_name": "batch_20260806_145034"},
+            {"id": 8, "batch_name": "batch_20260806_145100"},
+        ]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -119,3 +136,38 @@ class AsinFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveBatchTests(unittest.TestCase):
+    """`--old-batch/--new-batch` 既认 id 也认批次名。
+
+    真机上第一次给的就是名字（`batch_20260806_145034`）—— 界面上看得见的是名字，
+    只认 id 等于把内部标识泄漏给使用者。而且找不到时必须**报错并列出候选**，
+    静默按「不过滤」跑下去会退化成翻遍全表，正是它要避免的那件事。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), _BatchHandler)
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_none_stays_none(self):
+        self.assertIsNone(resolve_batch(self.base, None))
+
+    def test_digits_pass_through_without_a_lookup(self):
+        self.assertEqual(resolve_batch(self.base, "42"), 42)
+
+    def test_a_name_is_looked_up(self):
+        self.assertEqual(resolve_batch(self.base, "batch_20260806_145034"), 7)
+
+    def test_unknown_name_fails_loudly_with_candidates(self):
+        with self.assertRaises(SystemExit) as cm:
+            resolve_batch(self.base, "batch_does_not_exist")
+        self.assertIn("batch_20260806_145034", str(cm.exception))

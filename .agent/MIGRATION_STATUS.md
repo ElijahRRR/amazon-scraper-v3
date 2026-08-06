@@ -7,7 +7,7 @@
 > `docs/sync_contract.md` = 交付沃尔玛侧的契约；
 > `.agent/phase{1,2,3}/` = 各阶段验证报告（都带 file:line 与实测输出）。
 >
-> 最后更新：Phase 4 + Phase 6 收口。分支 `claude/walmart-api-db-refactor-7oergd`。
+> 最后更新：**真机验证第一轮**（macOS 本机，PG 17.9）。分支 `claude/walmart-api-db-refactor-7oergd`。
 
 ---
 
@@ -21,7 +21,8 @@
 | Phase 3 同步 API `/api/v1/sync/*` + 契约 | ✅ |
 | Phase 4 采集质量（worker + 服务端接线） | ✅ |
 | Phase 6 保留期 + ack | ✅ |
-| **Phase 5 并行验证 + 切换** | ⛔ **未做。这是唯一挡在生产切换前面的阶段。** |
+| **Phase 5 S1-S3 真机跑起来** | ✅ 本机 PG 17.9 已验（见 §5.5） |
+| **Phase 5 S4 新旧内容比对** | ⛔ **未做。这是唯一挡在生产切换前面的一步。** |
 | Phase 1.5 写并发放开 | ⛔ 有意推迟（见 §3） |
 
 **当前门（六道，全绿）**——命令与实测输出见 §6。
@@ -194,6 +195,66 @@
 
 ---
 
+## 5.5 真机验证第一轮（macOS 本机，PG 17.9）
+
+沙箱里的一切都是 Linux + PG 16 + Python 3.11。本轮换成 **macOS + PG 17.9 +
+Python 3.12**，跑真代理、真 Amazon、真商品页。**四个缺陷是这一轮才现形的**，
+每一个都有「为什么既有用例看不见」的解释——那比修复本身更值得记。
+
+### 验过的
+
+| 项 | 结果 |
+|---|---|
+| PG 17.9 建 schema/表/索引/分区、relay 常驻 | ✅ 无 DDL 报错 |
+| 两个后端 golden | ✅ 各 64/64 |
+| 两个后端 pytest | ✅ sqlite 684 passed、postgres 705 passed |
+| 完整采集链路 + 契约不变量（`tools/smoke_local.py`） | ✅ 25 项全过 |
+| 真实采集 50+ 个 ASIN | ✅ `parse_engine=selectolax`、`zip_verify=confirmed` |
+| 后台「清空数据」在 PG 上的行为 | ✅ 与旧系统一致（`DELETE FROM sqlite_sequence` 被翻成五条 `RESTART WITH 1`） |
+
+### 查出并修掉的
+
+| # | 缺陷 | 为什么既有用例看不见 |
+|---|---|---|
+| V1 | **黄金基线是「跑测试那台机器」的函数**：开发机 `.env` 配了 `PROXY_URL`，同一份 64 步录制在两个后端上都报 4 处 `settings.proxy_url` 差异 | 夹具隔离了 settings **文件**，没隔离**环境变量喂进来的默认值**（`_default_settings()` 直接读 `config.PROXY_URL`）。沙箱没配代理所以永远绿 |
+| V2 | **`slow.images` / `slow.bullet_points` 整块塞进单个元素**：6 条图片 URL 成了一个数组元素 | 分隔符有两份且已分叉。parser 四条路径全是 `"\n".join(...)`，slowhash 记的是对的（所以 `slow_hash` 一直对），只有导出适配器自带一份错的（images 按 `,`、bullets 按 `\|`）。夹具**只喂了一条** image URL，单元素下任何分隔符都"对" |
+| V3 | **`<br>` 不产生分隔符**，A+ 描述里的词被粘住（`corrosion.The` / `alloythat` / `pushand` / `PullDrawer`） | 两个引擎取叶子文本都是「把子树文本首尾相接」，而 `<br>` 自身不含文本。既有用例的 HTML 里没有 `<br>` |
+| V4 | **被裁空的事件流永远发不出 409**，落后的消费者会永远等下去 | 导出端点调 `_window()` 前把两个下界压成一个数（`max(... or 0, ... or 0)`），空表的 `None` 被压成 `0`，而 `_window` 判空靠的正是 `min_seq is None`。`test_incremental_export.py` 里**一条 409 用例都没有** |
+
+四条的变异验证都做了（把修复改回去，对应用例当场红）。V1/V4 各自新增了守卫文件
+（`tests/test_golden_env_isolation.py` 用 AST 扫描 config 与 `_default_settings()`
+求交集；`tests/pgdb/test_export_retention_window.py` 四条覆盖被裁空/全新空库/
+底部被裁/已追平消费者）。
+
+### 一条共同的教训
+
+V2 和 V4 是同一种错法：**抄了一份该共用的东西，然后两份各自演化**。
+V2 抄的是分隔符表，V4 抄的是窗口计算。两处的"正确版本"都一直在
+（`common/slowhash.py` 的 `_SPLIT_PATTERNS`、`sync.py:512` 的两次 `_window`），
+只是没被复用。现在 V2 已经收敛成单一事实源（`split_multivalue()`），
+V4 与 `sync.py` 对齐。
+
+### 顺带记下的环境事实
+
+* 目标机器要装 **PG 16**，但本机实际连的是先前就存在的 **PG 17.9**——
+  `brew services start postgresql@16` 报的 `Bootstrap failed: 5` 就是端口冲突。
+  17 满足全部要求（分区 + `SKIP LOCKED`），但**别去"修好"那个 16 的服务**：
+  真启起来是另一个空集群。
+* venv 用 **Python 3.12**。3.13/3.14 下 `curl_cffi`/`lxml`/`selectolax`/`asyncpg`
+  常常还没有 wheel，pip 会掉进源码编译。
+* `common/config.py:50` 的 `SERVER_HOST` 是**写死的 `0.0.0.0`**，不读环境变量。
+  `.env` 里的 `SERVER_HOST=127.0.0.1` 不生效。
+* `SERVER_PUBLIC_BASE` / `SERVER_FORWARDED_PREFIX` 在本仓库里**没有任何代码读**。
+
+### 还没验的（Phase 5 S4）
+
+`<br>` 修复只在构造的 HTML 上验过，**没在真实 Amazon 页面上做前后对比**。
+工具已就绪：`tools/desc_glue_check.py --compare`，判据是精确的（修复只在 `<br>`
+处插入换行，所以同一 ASIN 前后两轮「去掉换行后必须逐字节相等」，换行数之差就是
+修好的处数）。重采一轮即可补上。
+
+---
+
 ## 6. 门（实测输出，见 §9 复现命令）
 
 ```
@@ -202,9 +263,9 @@
 ### GATE 2) golden postgres
 ✅ 64 步与基线完全一致
 ### GATE 3) pytest sqlite
-635 passed, 14 skipped, 1 warning in 180.78s (0:03:00)
+684 passed, 22 skipped, 1 warning in 188.73s (0:03:08)
 ### GATE 4) pytest postgres
-637 passed, 12 skipped, 1 warning in 193.13s (0:03:13)
+705 passed, 1 skipped, 1 warning in 239.74s (0:03:59)
 ### GATE 5) unittest sqlite
 Ran 157 tests in 1.720s
 
@@ -223,6 +284,12 @@ OK (skipped=12)
 > Phase 4 交付期一度存在的那条 `xfailed`（relay 接线哨兵）**已经消失** ——
 > 接线做完之后它按设计换岗成了两条正向回归断言，见
 > `tests/test_engine_not_found.py::RelayContractSentinelTests`。
+>
+> 相对上一版（635/637）的增量来自真机验证第一轮（§5.5）新增的守卫：
+> `test_golden_env_isolation.py`(4) + `test_export_multivalue_split.py`(10) +
+> `test_export_retention_window.py`(4) + `test_long_description.py` 的
+> `BrSeparatorParity`(5)。两列 skip 数差得多是因为**跑这一版的机器装齐了
+> `selectolax`/`lxml`**，PG 那列几乎不再 skip。
 
 > **门的覆盖面，说清楚**：`unittest discover` 的加载器只认 `TestCase` 子类，
 > 所以 `tests/pgdb/`、`tests/golden/`、`tests/test_slowhash.py` 下的函数式用例

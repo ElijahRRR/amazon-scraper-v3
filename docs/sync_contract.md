@@ -215,10 +215,14 @@ X = r.next_after_seq
 | **409** | `cursor_ahead_of_stream` | `after_seq > max_seq` | **告警 + 全量对账 + 停**。采集侧疑似从备份恢复/回滚 |
 | 422 | `invalid_parameter` / `range_too_wide` | 参数不合法 | 修请求，不要重试 |
 | 503 | `event_stream_unavailable` | 采集侧跑在 SQLite 后端 / 库未就绪 / 事件流表未建 | 退避重试并告警 |
-| 5xx | — | 服务端故障 | 退避重试并告警 |
+| 5xx | `internal_error` | 服务端故障（未捕获异常） | 退避重试并告警 |
 
 > `429` 在计划里为背压预留，**当前不会发出**。你侧仍然应该实现它
 > （收到就按 `Retry-After` 退避），这样将来加上时不需要改消费端。
+
+5xx 的响应体与契约层错误同形状：`{"error": "internal_error", "detail": "服务器内部错误",
+"request_id": "…"}`。`detail` 是固定文案、**不含任何异常细节**；`request_id` 是这一次请求的
+关联键，服务端日志里有同一个值，报障时带上它。
 
 422 有两种响应体：契约层面的错误带 `{"error": ..., "detail": "…"}`；
 框架层面的类型错误（例如 `after_seq=abc`）只带 FastAPI 标准的

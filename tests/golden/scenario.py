@@ -294,3 +294,61 @@ def run(rec: Recorder) -> None:
     rec.call("delete_batch_b", "DELETE", f"/api/batches/{BATCH_B}", expect=200)
     rec.call("batches_after_delete", "GET", "/api/batches", expect=200)
     rec.call("results_final", "GET", "/api/results", expect=200)
+
+    # ---------------- 错误路径（Phase 2.4 追加） ----------------
+    # **必须留在文件末尾、`results_final` 之后。** 批次/任务的自增 id
+    # （batch id 3、task id 1/3/7/8）被前面的步骤逐值钉死，插在中间会让后面
+    # 每一步全漂，diff 从「纯追加」变成几百处差异。
+    #
+    # 选步的硬筛：新增步骤在两个后端必须逐字节相同。下面每一步都是
+    # `HTTPException` 的 `{"detail": "..."}`，由 app.py 在碰任何存储之前 raise
+    # （或者打的本来就是不存在的对象），与后端无关。
+    # 同样的理由让它们**没有副作用**：不建批次、不落盘、不改 runtime_settings，
+    # 所以放在最后也不会回头污染前 64 步。
+
+    # 上传：文件里一个有效 ASIN 都没有 / callback_url 非法（都在 create_batch 之前）
+    rec.call("upload_no_valid_asin", "POST", "/api/upload", expect=400,
+             files={"file": ("golden_bad.txt", b"not-an-asin\nzzz\n", "text/plain")},
+             data={"batch_name": "golden_batch_bad", "needs_screenshot": "false"})
+    rec.call("upload_bad_callback_url", "POST", "/api/upload", expect=400,
+             files={"file": ("golden_cb.txt", "\n".join(ASINS_A).encode(), "text/plain")},
+             data={"batch_name": "golden_batch_cb", "needs_screenshot": "false",
+                   "callback_url": "ftp://example.com/hook"})
+
+    # 批次不存在：四个端点各写各的 raise，所以要各录一步
+    rec.call("screenshots_progress_missing_batch", "GET",
+             "/api/batches/no_such_batch/screenshots/progress", expect=404)
+    rec.call("status_missing_batch", "GET",
+             "/api/batches/no_such_batch/status", expect=404)
+    rec.call("retry_missing_batch", "POST",
+             "/api/batches/no_such_batch/retry", expect=404)
+    rec.call("delete_missing_batch", "DELETE",
+             "/api/batches/no_such_batch", expect=404)
+
+    # callback 重发：404（批次不存在）与 400（批次在、但没配 callback_url）
+    rec.call("callback_retry_missing_batch", "POST",
+             "/api/batches/no_such_batch/callback/retry", expect=404)
+    rec.call("callback_retry_without_callback_url", "POST",
+             f"/api/batches/{BATCH_A}/callback/retry", expect=400)
+
+    # 批量删除的两条入参 400
+    rec.call("delete_bulk_not_a_list", "POST", "/api/batches/delete-bulk",
+             expect=400, json={"batch_ids": "1,2,3"})
+    rec.call("delete_bulk_empty", "POST", "/api/batches/delete-bulk",
+             expect=400, json={"batch_ids": ["abc", None]})
+
+    # 定时任务：创建时的两条 400。两条都在 os.makedirs/写文件之前 raise，无落盘副作用
+    rec.call("schedule_bad_time_format", "POST", "/api/schedules", expect=400,
+             files={"file": ("golden_sched.txt", "\n".join(ASINS_A).encode(),
+                             "text/plain")},
+             data={"name": "golden-sched", "time": "25:61", "interval_days": "1"})
+    rec.call("schedule_interval_too_small", "POST", "/api/schedules", expect=400,
+             files={"file": ("golden_sched.txt", "\n".join(ASINS_A).encode(),
+                             "text/plain")},
+             data={"name": "golden-sched", "time": "03:30", "interval_days": "0"})
+
+    # 定时任务：改/删不存在的 id
+    rec.call("schedule_update_missing", "PUT", "/api/schedules/no_such_schedule",
+             expect=404, json={"enabled": False})
+    rec.call("schedule_delete_missing", "DELETE",
+             "/api/schedules/no_such_schedule", expect=404)

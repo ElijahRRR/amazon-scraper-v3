@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import socket
 import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -246,6 +247,74 @@ app = FastAPI(title="Amazon Scraper v3", version="3.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
 
+
+# ==================== 全局 500：结构化 JSON + 可关联的 request_id ====================
+#
+# 未捕获异常今天由 Starlette 的 ServerErrorMiddleware 兜底，返回
+# `text/plain` 的 "Internal Server Error"，调用方拿不到任何可机读的东西、
+# 也没有能和服务端日志对上的标识。这里换成与 `server/api/sync.py:_err`
+# 同形状的结构化 JSON。
+#
+# 两个实施陷阱（对抗验证实测给出，别按"更顺手"的写法改回去）：
+#
+# 1. `request_id` **不能**用 `BaseHTTPMiddleware` + contextvar 生成。
+#    Starlette 的中间件栈是
+#    `[ServerErrorMiddleware] + user_middleware + [ExceptionMiddleware]`，
+#    ServerErrorMiddleware 在**最外层**：contextvar 在下游的赋值上游看不见，
+#    结果恰恰是在 500 的那一次 `request_id` 永远是 None。
+#    所以这里用**纯 ASGI 中间件**把 id 写进 `scope["state"]`——scope 是同一个
+#    dict 对象、按引用共享，外层的 `Request(scope).state` 一定读得到。
+#
+# 2. body 里**不放** `server_time_utc` 这类逐次不同的字段：任何逐次不同的字段
+#    进了黄金基线就录不出来（`_err` 里那个字段之所以能留，是因为 sync 端点
+#    不在黄金里）。`request_id` 可以放，因为**黄金场景里没有任何一步返回
+#    500**，这条响应永远不会进基线（2.4 追加的 14 步错误路径也全是 4xx）。
+#
+# body 不泄漏任何异常细节：异常全文只进日志，用同一个 `request_id` 关联。
+
+
+class _RequestIDMiddleware:
+    """纯 ASGI 中间件：给每个 HTTP 请求生成 `request_id` 并写进 scope。
+
+    刻意**不是** `BaseHTTPMiddleware` 子类，理由见上方第 1 条。
+    只写 scope，不碰 receive/send，因此不改任何一条正常响应的字节。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            # setdefault：uvicorn/TestClient 已经放了每请求一份的 state dict，
+            # 这里只往里加一个键，不覆盖。
+            scope.setdefault("state", {})["request_id"] = uuid.uuid4().hex
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_RequestIDMiddleware)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """全局 500。返回结构化 JSON，异常细节只进日志。
+
+    注意 `ServerErrorMiddleware` 调完本 handler **仍会 re-raise**，
+    所以 `TestClient(raise_server_exceptions=True)`（黄金夹具的默认值）
+    下的测试期行为不变。
+    """
+    request_id = getattr(request.state, "request_id", None)
+    logger.exception(
+        f"未处理异常 request_id={request_id} {request.method} {request.url.path}"
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_error",
+            "detail": "服务器内部错误",
+            "request_id": request_id,
+        },
+    )
+
 # Phase 3 —— catalog_sync 拉取契约（GET/POST /api/v1/sync/*）。
 #
 # * **无条件挂载，两个后端都挂**。SQLite 上四个端点如实回 503 而不是消失：
@@ -349,7 +418,7 @@ async def _timeout_task_loop():
                             if now - os.path.getmtime(fpath) > 3600:
                                 os.remove(fpath)
             except Exception:
-                pass
+                logger.warning("清理导出临时文件失败（忽略，下轮重试）", exc_info=True)
 
             # 兜底清理 openpyxl 泄漏的 /tmp 临时目录（超过 30 分钟未动）
             # 正常 wb.close() 会清掉；异常路径可能漏清，累积会吃满磁盘
@@ -369,9 +438,9 @@ async def _timeout_task_loop():
                                     os.remove(fpath)
                                 logger.info(f"清理 openpyxl 泄漏目录: {fname}")
                         except Exception:
-                            pass
+                            logger.warning(f"清理 openpyxl 泄漏目录失败（忽略）: {fname}", exc_info=True)
             except Exception:
-                pass
+                logger.warning("扫描 /tmp openpyxl 泄漏目录失败（忽略，下轮重试）", exc_info=True)
 
             # 每 10 次循环（约 5 分钟）做一次 WAL checkpoint —— 按需 TRUNCATE 策略
             # 经 30k recon 实测：固定 TRUNCATE 会触发 ~200-400ms 的 commit 阻塞抖动，
@@ -389,7 +458,7 @@ async def _timeout_task_loop():
                     if os.path.exists(wal_path):
                         wal_size = os.path.getsize(wal_path)
                 except Exception:
-                    pass
+                    logger.warning("读取 WAL 文件大小失败（按 0 处理，走 PASSIVE）", exc_info=True)
                 wal_mb = wal_size / 1024 / 1024
                 # 阈值：WAL > 128MB 才主动 TRUNCATE；否则 PASSIVE 不阻塞 writer
                 mode = "TRUNCATE" if wal_size > 128 * 1024 * 1024 else "PASSIVE"
@@ -586,7 +655,7 @@ async def _send_one_callback(client: httpx.AsyncClient, batch_id: int):
             stop = datetime.strptime(batch["completed_at"][:19], '%Y-%m-%d %H:%M:%S')
             duration = int((stop - start).total_seconds())
     except Exception:
-        pass
+        logger.debug("计算批次耗时失败（duration 置空）", exc_info=True)
 
     server_base = (_runtime_settings.get("server_public_base") or "").rstrip("/")
     if not server_base:
@@ -1266,7 +1335,7 @@ async def api_batch_status(batch_name: str):
             stop = datetime.strptime(end_at[:19], '%Y-%m-%d %H:%M:%S')
             duration = int((stop - start).total_seconds())
     except Exception:
-        pass
+        logger.debug("计算批次耗时失败（duration 置空）", exc_info=True)
 
     return {
         "batch_name": batch_name,
@@ -1315,7 +1384,7 @@ async def api_batch_callback_retry(batch_name: str):
         try:
             _callback_send_queue.put_nowait(batch["id"])
         except Exception:
-            pass
+            logger.warning(f"callback 重发入队失败（忽略）: batch_id={batch['id']}", exc_info=True)
     return {"ok": changed, "batch_id": batch["id"]}
 
 
@@ -2114,7 +2183,7 @@ async def _export_xlsx_streaming(filename: str, batch_id: int = None,
         try:
             st["wb"].close()
         except Exception:
-            pass
+            logger.debug("openpyxl workbook close 失败（忽略）", exc_info=True)
 
     tmp_path = None
     try:

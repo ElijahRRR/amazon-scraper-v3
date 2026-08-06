@@ -109,6 +109,36 @@ MAX_BIGINT = 2 ** 63 - 1
 #: ``test_valid_outcomes_matches_the_schema`` 看守（那是测试期，随便 import）。
 VALID_OUTCOMES = ("ok", "not_found", "blocked", "parse_failed", "stale")
 
+#: 错误码封闭集。`_err` 的**第二个位置实参**只能取自这里。
+#:
+#: 为什么落在这个文件、而不是新建 `server/api/errors.py`：上面几行的
+#: `VALID_OUTCOMES` 就是「封闭集 + 静态守卫用例」这个模式的原产地，
+#: 而 `export_incremental.py` 本来就 `from server.api import sync as _sync`。
+#: 多一个模块只多一条 import 边，不多一分保障。
+#:
+#: 前 9 个是今天 46 处 `_err` 调用点实际在用的码（AST 扫 `server/` 全树去重；
+#: `server/api/sync.py` 40 处 + `export_incremental.py` 6 处）。
+#: `internal_error` 是全局 500 处理器（`server/app.py` 的
+#: `_unhandled_exception_handler`）用的，**不经过 `_err`**，最容易被漏掉。
+#:
+#: 漂移由 `tests/test_error_codes.py` 看守：调用点 ⊆ 本集合、
+#: 文档里出现的码 ⊆ 本集合（**单向**，理由见该文件头）。
+ERROR_CODES = frozenset({
+    "ack_ahead_of_stream",
+    "cursor_ahead_of_stream",
+    "cursor_below_retention",
+    "event_stream_unavailable",
+    "export_token_not_configured",
+    "gen_mismatch",
+    "internal_error",
+    "invalid_export_token",
+    "invalid_parameter",
+    "range_too_wide",
+})
+
+#: `_err` 自己组装的键。`extra` 里的同名键会被**丢掉**，不是覆盖。
+_ERR_RESERVED_KEYS = frozenset({"error", "detail", "server_time_utc"})
+
 #: ``completeness`` 位图。计划 Phase 2 收口时留给 Phase 3 的必答题：
 #: Phase 2 观测不到 HTML 区块存在性，所有行都是 ``0`` = **未测量**。
 #: 位 0/1/2 = 面包屑 / 详情表 / 主图集；位 3（值 8）= MEASURED。
@@ -181,7 +211,14 @@ def _err(status: int, code: str, detail: str, **extra: Any) -> JSONResponse:
     """
     body: Dict[str, Any] = {"error": code, "detail": detail,
                             "server_time_utc": _now_iso()}
-    body.update(extra)
+    # 曾经是裸的 `body.update(extra)`：`_err(503, "x", "y", error="oops")` 会把
+    # 机器读的 `error` 静默改掉。这里**先剔除保留键**。
+    #
+    # 刻意**不**改成「命中保留键就 raise」：那会把一个本该回 409
+    # `cursor_below_retention` 的请求变成 500 —— 用一个错误处理的 bug
+    # 换掉一次本来正确的错误处理。剔除 + `tests/test_error_codes.py` 的
+    # 守卫用例就够了。
+    body.update({k: v for k, v in extra.items() if k not in _ERR_RESERVED_KEYS})
     return JSONResponse(status_code=status, content=body)
 
 

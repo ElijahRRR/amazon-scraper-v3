@@ -5755,6 +5755,290 @@
         "content_type": "application/json",
         "status": 200
       }
+    },
+    {
+      "name": "upload_no_valid_asin",
+      "request": {
+        "data": {
+          "batch_name": "golden_batch_bad",
+          "needs_screenshot": "false"
+        },
+        "files": [
+          "file"
+        ],
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/upload"
+      },
+      "response": {
+        "body": {
+          "detail": "未找到有效 ASIN"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "upload_bad_callback_url",
+      "request": {
+        "data": {
+          "batch_name": "golden_batch_cb",
+          "callback_url": "ftp://example.com/hook",
+          "needs_screenshot": "false"
+        },
+        "files": [
+          "file"
+        ],
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/upload"
+      },
+      "response": {
+        "body": {
+          "detail": "非法 callback_url（bad_scheme:ftp）。仅接受 http(s)://公网域名/IP"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "screenshots_progress_missing_batch",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": null,
+        "path": "/api/batches/no_such_batch/screenshots/progress"
+      },
+      "response": {
+        "body": {
+          "detail": "批次不存在: no_such_batch"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
+    },
+    {
+      "name": "status_missing_batch",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "GET",
+        "params": null,
+        "path": "/api/batches/no_such_batch/status"
+      },
+      "response": {
+        "body": {
+          "detail": "批次不存在: no_such_batch"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
+    },
+    {
+      "name": "retry_missing_batch",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches/no_such_batch/retry"
+      },
+      "response": {
+        "body": {
+          "detail": "批次不存在: no_such_batch"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
+    },
+    {
+      "name": "delete_missing_batch",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "DELETE",
+        "params": null,
+        "path": "/api/batches/no_such_batch"
+      },
+      "response": {
+        "body": {
+          "detail": "批次不存在: no_such_batch"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
+    },
+    {
+      "name": "callback_retry_missing_batch",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches/no_such_batch/callback/retry"
+      },
+      "response": {
+        "body": {
+          "detail": "批次不存在: no_such_batch"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
+    },
+    {
+      "name": "callback_retry_without_callback_url",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches/golden_batch_a/callback/retry"
+      },
+      "response": {
+        "body": {
+          "detail": "该批次没有配置 callback_url"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "delete_bulk_not_a_list",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": {
+          "batch_ids": "1,2,3"
+        },
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches/delete-bulk"
+      },
+      "response": {
+        "body": {
+          "detail": "batch_ids 必须是数组"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "delete_bulk_empty",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": {
+          "batch_ids": [
+            "abc",
+            null
+          ]
+        },
+        "method": "POST",
+        "params": null,
+        "path": "/api/batches/delete-bulk"
+      },
+      "response": {
+        "body": {
+          "detail": "batch_ids 为空或无效"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "schedule_bad_time_format",
+      "request": {
+        "data": {
+          "interval_days": "1",
+          "name": "golden-sched",
+          "time": "25:61"
+        },
+        "files": [
+          "file"
+        ],
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/schedules"
+      },
+      "response": {
+        "body": {
+          "detail": "时间格式错误，应为 HH:MM"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "schedule_interval_too_small",
+      "request": {
+        "data": {
+          "interval_days": "0",
+          "name": "golden-sched",
+          "time": "03:30"
+        },
+        "files": [
+          "file"
+        ],
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/schedules"
+      },
+      "response": {
+        "body": {
+          "detail": "间隔天数至少为 1"
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "name": "schedule_update_missing",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": {
+          "enabled": false
+        },
+        "method": "PUT",
+        "params": null,
+        "path": "/api/schedules/no_such_schedule"
+      },
+      "response": {
+        "body": {
+          "detail": "定时任务不存在"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
+    },
+    {
+      "name": "schedule_delete_missing",
+      "request": {
+        "data": null,
+        "files": null,
+        "json": null,
+        "method": "DELETE",
+        "params": null,
+        "path": "/api/schedules/no_such_schedule"
+      },
+      "response": {
+        "body": {
+          "detail": "定时任务不存在"
+        },
+        "content_type": "application/json",
+        "status": 404
+      }
     }
   ],
   "version": 1

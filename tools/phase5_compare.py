@@ -152,8 +152,8 @@ SLOW_CRITICAL = {
 # ---------------------------------------------------------------- 取数
 
 def fetch_results(base: str, limit: int, timeout: int = 60,
-                  wanted: Optional[set] = None, max_scan: int = 200000
-                  ) -> Dict[str, dict]:
+                  wanted: Optional[set] = None, max_scan: int = 200000,
+                  batch_id: Optional[int] = None) -> Dict[str, dict]:
     """翻页拉 /api/results，返回 {asin: row}。两套系统的响应形状由黄金基线钉死。
 
     ``wanted`` 给定时**只收这些 ASIN**，并一直翻到全部找齐或翻完为止 ——
@@ -168,9 +168,11 @@ def fetch_results(base: str, limit: int, timeout: int = 60,
     """
     out: Dict[str, dict] = {}
     cursor: Optional[int] = None
-    scanned = 0
+    scanned = pages = 0
     while True:
         q = {"limit": 200}
+        if batch_id is not None:
+            q["batch_id"] = batch_id       # 直接锁定一个批次，页数从几十降到个位数
         if cursor is not None:
             q["cursor"] = cursor
         url = f"{base.rstrip('/')}/api/results?" + urllib.parse.urlencode(q)
@@ -178,12 +180,19 @@ def fetch_results(base: str, limit: int, timeout: int = 60,
             body = json.loads(r.read())
         items = body.get("items") or []
         scanned += len(items)
+        pages += 1
         for it in items:
             asin = it.get("asin")
             if not asin:
                 continue
             if wanted is None or asin in wanted:
                 out[asin] = it
+        # 跨公网翻 60+ 页、每页服务端还要算一次带 join 的 COUNT —— 没有进度输出的话
+        # 分不清「在动」和「卡死」。真机上就是这么卡了一次。
+        if pages % 5 == 0 or (wanted and len(out) >= len(wanted)):
+            found = f"{len(out)}/{len(wanted)}" if wanted else str(len(out))
+            print(f"  … 第 {pages} 页，已扫 {scanned} 行，命中 {found}",
+                  file=sys.stderr, flush=True)
         if not items or not body.get("has_more"):
             break
         if wanted is None:
@@ -357,6 +366,13 @@ def main() -> int:
     ap.add_argument("--asins", metavar="FILE",
                     help="只比对这个文件里的 ASIN（每行一个）。**强烈建议给**，"
                          "理由见 fetch_results 的 docstring")
+    ap.add_argument("--old-batch", type=int, metavar="ID",
+                    help="只看旧系统这一个批次（/api/results?batch_id=）。"
+                         "生产库上强烈建议给 —— 否则要翻遍全表去找那几十个 ASIN")
+    ap.add_argument("--new-batch", type=int, metavar="ID",
+                    help="同上，新系统侧")
+    ap.add_argument("--timeout", type=int, default=60,
+                    help="单次 HTTP 超时秒数")
     ap.add_argument("--max-scan", type=int, default=200000,
                     help="配合 --asins：每侧最多翻多少行去找（默认 20 万）")
     ap.add_argument("--dump-from", choices=("old", "new", "both"), default="old",
@@ -375,11 +391,13 @@ def main() -> int:
               "「最近首次收录的 N 个 ASIN」，不是「最近采集的」。"
               "生产库上这样几乎必然交集为空 —— 强烈建议用 --asins。", file=sys.stderr)
 
-    print(f"拉取旧系统 {a.old} …", file=sys.stderr)
-    old = fetch_results(a.old, a.limit, wanted=wanted, max_scan=a.max_scan)
+    print(f"拉取旧系统 {a.old} …", file=sys.stderr, flush=True)
+    old = fetch_results(a.old, a.limit, wanted=wanted, max_scan=a.max_scan,
+                        timeout=a.timeout, batch_id=a.old_batch)
     print(f"  {len(old)} 行", file=sys.stderr)
     print(f"拉取新系统 {a.new} …", file=sys.stderr)
-    new = fetch_results(a.new, a.limit, wanted=wanted, max_scan=a.max_scan)
+    new = fetch_results(a.new, a.limit, wanted=wanted, max_scan=a.max_scan,
+                        timeout=a.timeout, batch_id=a.new_batch)
     print(f"  {len(new)} 行", file=sys.stderr)
 
     if not old or not new:

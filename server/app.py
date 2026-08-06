@@ -27,6 +27,7 @@ import openpyxl
 
 from common import config
 from common.database import Database
+from common.dbfactory import create_database
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,6 +129,29 @@ def _remove_screenshot_files(file_paths: list):
             pass
 
 
+async def _rollback_quietly(conn):
+    """裸 ``BEGIN`` 块失败后回滚，两个后端共用（不按后端分叉，见 OWNERSHIP.md D-4）。
+
+    本文件里有 7 个 ``async with db._write_lock: BEGIN ... COMMIT`` 块。原来其中 6 个
+    没有回滚路径——SQLite 下这些语句基本不会失败，失败了也只是把那一条连接留在事务里。
+    PostgreSQL 下 ``db._db`` 同样是**一条**专用写连接，但事务是粘在连接上的状态：
+    任何一条语句报错，事务立刻 abort，写锁随异常释放，而垫片的事务槽还是满的，
+    于是**之后每一次 BEGIN** 都撞上"嵌套 BEGIN"守卫——一个失败请求把整条写路径
+    永久焊死（读仍然 200，健康检查看不出来）。加回滚把它降级成"一个请求 500"。
+
+    - 只在**错误路径**上跑：成功路径一条语句都没多，两个后端的返回值/异常类型不变。
+    - 回滚本身的异常一律吞掉（SQLite 在没有活动事务时 ROLLBACK 会报错），
+      永远不能盖掉真正的原因，最后一定 ``raise`` 原异常。
+    - 捕获 ``BaseException`` 而不是 ``Exception``：这些块全都在 HTTP handler 里，
+      客户端断开会让 Starlette 取消请求协程，``CancelledError`` 同样必须回滚，
+      否则连接照样带着事务泄漏出去（common/pgdb/batches.py 的 ``_tx()`` 已经是这个口径）。
+    """
+    try:
+        await conn.execute("ROLLBACK")
+    except BaseException:
+        pass
+
+
 def _register_worker(worker_id: str, enable_screenshot: bool = None, ip: str = None):
     if not _WORKER_ID_RE.match(worker_id):
         return
@@ -151,10 +175,48 @@ def _register_worker(worker_id: str, enable_screenshot: bool = None, ip: str = N
 
 # ==================== 生命周期 ====================
 
+async def _scrape_event_relay():
+    """Phase 2 事件流 relay 的进程入口（**PostgreSQL 专属**）。
+
+    SQLite 后端下整个事件流一个字节的代码都不跑：``common.database.Database``
+    压根没有这些方法，这里直接返回。这比运行期 ``if is_postgres()`` 守卫更强
+    —— SQLite 路径上不存在可以走错的分支。
+
+    单例由 ``pg_try_advisory_lock`` 保证：滚动部署时第二个进程拿不到锁，
+    ``start_event_relay()`` 返回 False 并安静退出（见 common/pgdb/relay.py）。
+
+    ⚠ 异常必须在这里落日志。本协程是 ``asyncio.create_task`` 起来的，没人
+    ``await`` 它的结果：不接的话，relay 起不来这件事只会以一句 GC 期的
+    "Task exception was never retrieved" 出现（甚至完全不出现），而现象是
+    HTTP 全部正常、outbox 无声无息地涨到撑爆磁盘。事件流停摆必须是**响的**。
+    """
+    from common.dbfactory import is_postgres
+    if not is_postgres() or db is None or not hasattr(db, "run_event_relay"):
+        return
+    try:
+        await db.run_event_relay()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "事件流 relay 异常退出——采集与 HTTP 不受影响，但 scrape_outbox "
+            "会持续堆积且没有新事件产生。请检查 /api/_debug/event-stream。")
+
+
+async def _stop_scrape_event_relay():
+    if db is not None and hasattr(db, "stop_event_relay"):
+        try:
+            await db.stop_event_relay()
+        except Exception:
+            logger.exception("停止事件流 relay 失败（继续关闭数据库）")
+
+
 @asynccontextmanager
 async def lifespan(app):
     global db, _callback_send_queue
-    db = Database()
+    # 存储后端由 DB_BACKEND 决定（默认 sqlite，此时与移植前完全相同：
+    # 同一个 common.database.Database 类、同一个无参构造）。见 common/dbfactory.py
+    db = create_database()
     await db.connect()
     _load_settings()
     os.makedirs(config.EXPORT_DIR, exist_ok=True)
@@ -172,7 +234,9 @@ async def lifespan(app):
     # 启动期 optimize 改为异步：服务先就绪、worker 先能拉任务，ANALYZE 后台慢慢做
     # （此前同步执行在 2.4GB 库上会阻塞启动 2~3 分钟）
     asyncio.create_task(db.run_startup_optimize())
+    asyncio.create_task(_scrape_event_relay())
     yield
+    await _stop_scrape_event_relay()
     if db:
         await db.close()
     logger.info("服务器关闭")
@@ -181,6 +245,33 @@ async def lifespan(app):
 app = FastAPI(title="Amazon Scraper v3", version="3.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
+
+# Phase 3 —— catalog_sync 拉取契约（GET/POST /api/v1/sync/*）。
+#
+# * **无条件挂载，两个后端都挂**。SQLite 上四个端点如实回 503 而不是消失：
+#   不挂 = 404，而消费者会把 404 读成"暂无数据"并静默停摆（计划 §Phase 3）。
+#   路由表在 import 时定型、DB_BACKEND 是运行期变量，条件挂载必然骗人。
+# * ``include_in_schema=False`` 在 router 上，所以 ``/openapi.json``（黄金基线
+#   step 5，逐字节钉死）不变 —— 有用例钉住这一条。
+# * import 方向是单向的：sync.py **不在模块级** import server.app
+#   （那是循环导入，启动即崩、整个 erpAPI 下线），它在每个 handler 里惰性取 db。
+from server.api import sync as _sync_api  # noqa: E402
+from server.api import export_incremental as _export_incr_api  # noqa: E402
+
+app.include_router(_sync_api.router)
+
+# ⚠ 这一行的**位置**是承重的，不是风格。
+#
+# /api/export/incremental 落在本文件下方 `@app.get("/api/export/{batch_name}")`
+# 那条 catch-all 的前缀里，而 Starlette 按**注册顺序**匹配。挪到那条之后，
+# 本端点会静默退化成 404 `{"detail":"批次不存在: incremental"}` ——
+# 而 404 正是 catalog_sync 最容易读成「暂无数据」的码：游标永不推进，
+# 同步静默停摆，两侧都不报错。实测过，未挂载时就是这个响应。
+#
+# /api/export/fields 与 /api/export/all 是同前缀下静态路径的现成先例，
+# 它们靠的是「定义在 catch-all 之前」这同一条规则。
+# tests/test_incremental_export.py::test_route_order_is_load_bearing 钉死它。
+app.include_router(_export_incr_api.router)
 
 
 def _cst_filter(value):
@@ -334,10 +425,16 @@ async def _timeout_task_loop():
             # 兜底完成检测：扫描长期 running 的批次（防止入队事件丢失）
             # 只扫最近活动的 batches，避免全表查询
             try:
+                # ORDER BY updated_at 单独一列不是全序：updated_at 是秒级精度，
+                # 一次提交里的多个批次会拿到同一个时间戳，LIMIT 30 于是返回的是
+                # **不确定的 30 行**（不只是顺序不定，是行集合不定）——SQLite 走
+                # rowid、PG 走堆序，UPDATE 之后堆序还会漂。补 id DESC 把它变成全序。
+                # NULLS LAST 是 SQLite DESC 的默认行为（实测），显式写出来只是为了
+                # 让 PG 对齐（PG 的 DESC 默认 NULLS FIRST），SQLite 侧是 no-op。
                 async with db.read() as rc, rc.execute(
                     """SELECT id FROM batches
                        WHERE status='running'
-                       ORDER BY updated_at DESC
+                       ORDER BY updated_at DESC NULLS LAST, id DESC
                        LIMIT 30"""
                 ) as c:
                     rows = await c.fetchall()
@@ -1247,33 +1344,37 @@ async def api_retry_batch(batch_name: str, force: bool = False):
 
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
-        skipped = 0
-        if no_retry_list:
-            async with db._db.execute(
-                f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
-                f"AND COALESCE(error_type, '') IN ({no_retry_placeholders})",
-                [batch_id] + no_retry_list
-            ) as c:
-                row = await c.fetchone()
-                skipped = row[0] if row else 0
+        try:
+            # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
+            skipped = 0
+            if no_retry_list:
+                async with db._db.execute(
+                    f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
+                    f"AND COALESCE(error_type, '') IN ({no_retry_placeholders})",
+                    [batch_id] + no_retry_list
+                ) as c:
+                    row = await c.fetchone()
+                    skipped = row[0] if row else 0
 
-        # 实际重试 SQL：始终排除 NO_RETRY；force 参数保留兼容旧调用，但不覆盖 variant_offset。
-        if not no_retry_list:
-            cursor = await db._db.execute(
-                "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
-                "WHERE batch_id=? AND status='failed'",
-                (batch_id,)
-            )
-        else:
-            cursor = await db._db.execute(
-                f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
-                f"WHERE batch_id=? AND status='failed' "
-                f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders})",
-                [batch_id] + no_retry_list
-            )
-        retried = cursor.rowcount
-        await db._db.execute("COMMIT")
+            # 实际重试 SQL：始终排除 NO_RETRY；force 参数保留兼容旧调用，但不覆盖 variant_offset。
+            if not no_retry_list:
+                cursor = await db._db.execute(
+                    "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                    "WHERE batch_id=? AND status='failed'",
+                    (batch_id,)
+                )
+            else:
+                cursor = await db._db.execute(
+                    f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                    f"WHERE batch_id=? AND status='failed' "
+                    f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders})",
+                    [batch_id] + no_retry_list
+                )
+            retried = cursor.rowcount
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
     return {
         "ok": True,
         "retried": retried,
@@ -1299,12 +1400,16 @@ async def api_delete_batch(batch_name: str):
 
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        await db._db.execute("DELETE FROM tasks WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM batch_asins WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM screenshots WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM asin_changes WHERE batch_id=?", (batch_id,))
-        await db._db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
-        await db._db.execute("COMMIT")
+        try:
+            await db._db.execute("DELETE FROM tasks WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM batch_asins WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM screenshots WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM asin_changes WHERE batch_id=?", (batch_id,))
+            await db._db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     # 删除物理截图文件
     _remove_screenshot_files(screenshot_files)
@@ -1349,11 +1454,8 @@ async def api_delete_batches_bulk(request: Request):
                 await db._db.execute(f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", batch_ids)
             await db._db.execute(f"DELETE FROM batches WHERE id IN ({ph})", batch_ids)
             await db._db.execute("COMMIT")
-        except Exception:
-            try:
-                await db._db.execute("ROLLBACK")
-            except Exception:
-                pass
+        except BaseException:
+            await _rollback_quietly(db._db)
             raise
 
     _remove_screenshot_files(screenshot_files)
@@ -1369,17 +1471,25 @@ async def api_batch_errors(batch_name: str):
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
     async with db.read() as rc:
+        # cnt 并列时顺序原本不定 → 用 error_type 兜底成全序。
+        # NULLS FIRST 是 SQLite ASC 的默认行为（实测），PG 的 ASC 默认 NULLS LAST，
+        # 所以必须显式写；error_type 在两边都是二进制序（PG 侧 COLLATE "C"）。
         async with rc.execute(
             "SELECT error_type, COUNT(*) as cnt FROM tasks "
             "WHERE batch_id=? AND status='failed' "
-            "GROUP BY error_type ORDER BY cnt DESC",
+            "GROUP BY error_type ORDER BY cnt DESC, error_type NULLS FIRST",
             (batch_id,)
         ) as c:
             error_summary = [dict(r) for r in await c.fetchall()]
+        # 这一条原来是 ORDER BY updated_at DESC LIMIT 200，没有 tiebreaker。
+        # updated_at 是秒级精度，而 accept_results_batch 会把**整次提交**盖上同一个
+        # 时间戳：一批 260 个任务一起失败时，200 行的**行集合**在两个后端不一样
+        # （实测 60 行不同），同一个后端换一次表重组也可能变。补 id DESC 后与
+        # /api/batches/{id}/failures（get_batch_failures，本来就是这个写法）一致。
         async with rc.execute(
             "SELECT asin, error_type, error_detail, retry_count, worker_id, updated_at "
             "FROM tasks WHERE batch_id=? AND status='failed' "
-            "ORDER BY updated_at DESC LIMIT 200",
+            "ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 200",
             (batch_id,)
         ) as c:
             failed_tasks = [dict(r) for r in await c.fetchall()]
@@ -1500,13 +1610,17 @@ async def api_release_tasks(request: Request):
             placeholders = ",".join("?" * len(task_ids))
             async with db._write_lock:
                 await db._db.execute("BEGIN")
-                cursor = await db._db.execute(
-                    f"UPDATE tasks SET status='pending', worker_id=NULL, "
-                    f"lease_epoch=lease_epoch+1, updated_at=? "
-                    f"WHERE id IN ({placeholders}) AND status='processing'",
-                    [now] + task_ids
-                )
-                await db._db.execute("COMMIT")
+                try:
+                    cursor = await db._db.execute(
+                        f"UPDATE tasks SET status='pending', worker_id=NULL, "
+                        f"lease_epoch=lease_epoch+1, updated_at=? "
+                        f"WHERE id IN ({placeholders}) AND status='processing'",
+                        [now] + task_ids
+                    )
+                    await db._db.execute("COMMIT")
+                except BaseException:
+                    await _rollback_quietly(db._db)
+                    raise
             return {"ok": True, "released": cursor.rowcount}
         return {"ok": True, "released": 0}
     released = await db.release_tasks(worker_id, tasks)
@@ -2232,14 +2346,18 @@ async def api_delete_by_file(file: UploadFile = File(...)):
     # 分批删除
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        for i in range(0, len(asin_list), CHUNK):
-            chunk = asin_list[i:i+CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-        await db._db.execute("COMMIT")
+        try:
+            for i in range(0, len(asin_list), CHUNK):
+                chunk = asin_list[i:i+CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     _remove_screenshot_files(screenshot_files)
     return {"ok": True, "deleted": len(asin_list), "asin_count": len(asin_list)}
@@ -2311,14 +2429,18 @@ async def api_delete_results(request: Request):
     # 分批删除
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        for i in range(0, len(asin_list), CHUNK):
-            chunk = asin_list[i:i+CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-        await db._db.execute("COMMIT")
+        try:
+            for i in range(0, len(asin_list), CHUNK):
+                chunk = asin_list[i:i+CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
+                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     # 删除物理截图文件
     _remove_screenshot_files(screenshot_files)
@@ -2632,6 +2754,39 @@ async def api_debug_lock_stats():
     }
 
 
+@app.get("/api/_debug/event-stream", include_in_schema=False)
+async def api_debug_event_stream():
+    """Phase 2 事件流的可观测面：outbox 深度、relay 滞后、每分钟事件数、
+    seq 窗口、分区、死信、计数器。
+
+    三条约束决定了它长这样：
+
+    * **``include_in_schema=False``**。``/openapi.json`` 是黄金基线的第 5 步，
+      逐字节钉死；新端点只要进了 schema，64 步当场挂。同一个理由写在计划
+      §Phase 3 里（sync router 也是这么挂的）。
+    * **不动任何既有响应**。指标本来最自然的去处是 ``/api/diagnostic``，
+      但那个端点是基线 step 55，多一个 key 就是"字段出现"差异。所以另开一个
+      端点，而不是往老的里塞。
+    * **两个后端都必须能回**。SQLite 上事件流在结构上就不存在，这里如实回
+      ``enabled: false`` 而不是 404 或 500 —— 运维拿同一个 URL 探两种部署。
+    """
+    from common.dbfactory import get_backend, is_postgres
+
+    out = {"backend": get_backend(), "enabled": False}
+    if not is_postgres() or db is None or not hasattr(db, "event_stream_stats"):
+        # SQLite：事件流是 PG 专属，这不是错误状态。
+        out["reason"] = "event stream is postgres-only"
+        return out
+    out["enabled"] = True
+    try:
+        out.update(await db.event_stream_stats())
+    except Exception as e:  # noqa: BLE001
+        # 观测端点自己不许把服务搞挂：库还没引导好 / 表还没建时如实报错。
+        out["error"] = f"{type(e).__name__}: {e}"
+        out.update(db.event_relay_metrics())
+    return out
+
+
 @app.post("/api/_debug/lock-stats/reset")
 async def api_debug_lock_stats_reset():
     """清空所有计时统计（开始新一轮观察前调用）。"""
@@ -2649,10 +2804,14 @@ async def api_clear_database():
     import shutil
     async with db._write_lock:
         await db._db.execute("BEGIN")
-        for table in ["asin_changes", "asin_data", "batch_asins", "tasks", "screenshots", "batches"]:
-            await db._db.execute(f"DELETE FROM {table}")
-        await db._db.execute("DELETE FROM sqlite_sequence")
-        await db._db.execute("COMMIT")
+        try:
+            for table in ["asin_changes", "asin_data", "batch_asins", "tasks", "screenshots", "batches"]:
+                await db._db.execute(f"DELETE FROM {table}")
+            await db._db.execute("DELETE FROM sqlite_sequence")
+            await db._db.execute("COMMIT")
+        except BaseException:
+            await _rollback_quietly(db._db)
+            raise
 
     # 清理截图文件
     ss_dir = config.SCREENSHOT_DIR

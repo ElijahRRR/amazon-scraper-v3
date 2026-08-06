@@ -28,25 +28,70 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 # ── 只桩掉 engine 模块级需要、但本环境未装的重依赖子模块 ────────────────────
+# 记录被我们改动过的 sys.modules 条目，模块结束时原样还原。
+# 不还原会让整个测试进程被污染：本文件的桩件对后续用例仍然生效，
+# 谁先被 import 谁说了算，测试结果变成收集顺序的函数。
+# （test_delivery_parse.py 里那段 `sys.modules.pop("worker.parser")` 就是被这个
+#  坑过一次之后的手工绕行；桩件泄漏还会让黄金样本夹具拿到假的 httpx。）
+_SAVED_MODULES = {}
+
+
 def _stub(name, **attrs):
+    _SAVED_MODULES.setdefault(name, sys.modules.get(name))
     m = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(m, k, v)
     sys.modules[name] = m
     return m
 
-_stub("aiofiles")
-_stub("httpx", AsyncClient=object)
+
+def _stub_if_missing(name, **attrs):
+    """真依赖装了就用真的——桩件的用意是「补上没装的」，不是「顶掉装了的」。"""
+    try:
+        __import__(name)
+    except ImportError:
+        _stub(name, **attrs)
+
+
+_stub_if_missing("aiofiles")
+_stub_if_missing("httpx", AsyncClient=object)
 # worker / common 用真实包（空 __init__）；common.config 只依赖 os，直接用真实的。
-_stub("worker.proxy", get_proxy_manager=lambda: object())
-_stub("worker.session", AmazonSession=object)
-_stub("worker.parser", AmazonParser=object)
-_stub("worker.metrics", MetricsCollector=object)
-_stub("worker.adaptive", AdaptiveController=object, TokenBucket=object)
+#
+# ⚠ 这五行以前是无条件 `_stub(...)`，理由写的是「在不拉起 curl_cffi/selectolax 的
+# 前提下加载真实的 engine.py」。**D-27 之后那个理由不再成立**（selectolax 与
+# dateparser 已经装进 venv，就是为了让解析器测试跑生产路径），而无条件桩有一个
+# 它当初没有的代价：pytest 在**收集期**就 import 全部测试文件，所以这几行会在
+# 任何用例开始跑之前先把 `worker.parser` 换成桩件；`worker/engine.py:325` 的
+# `from worker.parser import AmazonParser` 是**模块级绑定**，一旦绑到 `object`，
+# 本文件的 `tearDownModule` 再怎么还原 sys.modules 也换不回来。
+#
+# 实测（Phase 4 收口，见 D-53）：
+#   pytest tests/test_session_slot.py tests/test_engine_not_found.py  -> 25 failed
+#   pytest tests/test_engine_not_found.py tests/test_session_slot.py  -> 75 passed
+# 默认字母序恰好是安全的那一种，所以六道门全绿、缺陷不可见。
+#
+# 改成 `_stub_if_missing` 之后，桩件回到它的本意——「补上没装的」，而不是
+# 「顶掉装了的」。本环境里只有 worker.session 真的缺依赖（curl_cffi）。
+_stub_if_missing("worker.proxy", get_proxy_manager=lambda: object())
+_stub_if_missing("worker.session", AmazonSession=object)
+_stub_if_missing("worker.parser", AmazonParser=object)
+_stub_if_missing("worker.metrics", MetricsCollector=object)
+_stub_if_missing("worker.adaptive", AdaptiveController=object, TokenBucket=object)
 
 # 屏蔽 basicConfig 噪声
 import logging
+_SAVED_LOG_LEVEL = logging.root.manager.disable
 logging.disable(logging.CRITICAL)
+
+
+def tearDownModule():
+    """还原 sys.modules 与 logging，避免污染同进程内的其他测试。"""
+    for name, original in _SAVED_MODULES.items():
+        if original is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = original
+    logging.disable(_SAVED_LOG_LEVEL)
 
 from worker.engine import SessionSlot, Worker  # noqa: E402
 
@@ -112,8 +157,40 @@ class FakeWorker:
         return s
 
 
+# 本模块自持的事件循环。**不要**改回 asyncio.get_event_loop()。
+#
+# 原来这里是 `asyncio.get_event_loop().run_until_complete(coro)`，依赖的是
+# 「当前线程的事件循环」这个**进程级全局槽位**。任何一句 asyncio.run(...) 结束时
+# 都会关闭自己的循环并把该槽位置空，而本仓库里有好几处正当的 asyncio.run：
+#   * tests/golden/harness.py:206-207   _pg_scratch_db 建库/删库
+#   * tests/test_golden_with_relay.py:86 抽干事件流
+#   * pytest-asyncio 每个 async 用例（跑完关闭并置空）
+# 这些文件按字母序排在 tests/test_session_slot.py **之前**，于是本模块 31 个用例
+# 是否通过，变成了「收集顺序 × 后端 × runner」的函数。实测（HEAD fea7395）：
+#
+#   DB_BACKEND=postgres python -m unittest discover -s tests
+#     -> Ran 51 tests ... FAILED (errors=26, skipped=4)
+#        26 × RuntimeError: There is no current event loop in thread 'MainThread'
+#
+# SQLite 下那两个文件走 skipTest、不跑 asyncio.run，所以只有 Postgres 侧翻红。
+# pytest 侧看不见，是因为 tests/conftest.py 有一个 autouse 夹具把槽位补回来——
+# 而 **unittest 根本不读 conftest.py**，同一份代码两个 runner 两种结果（B6）。
+#
+# 修法是拿掉这个依赖本身，而不是继续在别处打补丁：本模块自己持有一个循环，
+# 谁把全局槽位置空都伤不到它。仍然调用 set_event_loop()，一是保持与原来完全一致的
+# 语义（被测代码里若有 get_event_loop() 仍拿到同一个循环），二是顺手把槽位补上。
+# 复用同一个循环（而不是每次 asyncio.run）也是刻意的：31 个用例共享一个循环是
+# 原有行为，跨循环复用 asyncio 同步原语在 3.10+ 会抛 "bound to a different
+# event loop"，换成 per-call asyncio.run 等于自找一类新故障。
+_LOOP = None
+
+
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    global _LOOP
+    if _LOOP is None or _LOOP.is_closed():
+        _LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(_LOOP)
+    return _LOOP.run_until_complete(coro)
 
 
 class SessionSlotTests(unittest.TestCase):

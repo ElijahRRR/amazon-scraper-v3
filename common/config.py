@@ -23,6 +23,22 @@ except ImportError:
 # ============================================================
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(PROJECT_DIR, "data", "scraper.db")
+
+# ============================================================
+# 存储后端（PG 迁移 Phase 1）
+# ============================================================
+# "sqlite"（默认，未设置时也是它）-> common.database.Database
+# "postgres"                      -> common.pgdb.Database
+# 选择逻辑在 common/dbfactory.py。未设置时 SQLite 路径逐字节不变。
+DB_BACKEND = os.environ.get("DB_BACKEND", "sqlite").strip().lower()
+
+# PostgreSQL 连接串。仅在 DB_BACKEND=postgres 时使用。
+PG_DSN = os.environ.get("PG_DSN", "postgresql://scraper:scraper@127.0.0.1/scraper_dev")
+# 读侧连接池大小（写侧是**一条专用连接**，见 common/pgdb/pool.py 的决策 D-2）。
+PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "2"))
+PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "10"))
+# 单条语句超时（秒）。导出会长时间占用连接，别设得太小。
+PG_COMMAND_TIMEOUT = float(os.environ.get("PG_COMMAND_TIMEOUT", "60"))
 EXPORT_DIR = os.path.join(PROJECT_DIR, "data", "exports")
 SCREENSHOT_DIR = os.path.join(PROJECT_DIR, "server", "static", "screenshots")
 TEMPLATE_DIR = os.path.join(PROJECT_DIR, "server", "templates")

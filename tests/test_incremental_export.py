@@ -255,6 +255,42 @@ class ContractTests(unittest.TestCase):
             self.assertRegex(rec["scraped_at"],
                              r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+    def test_stock_state_is_a_closed_three_value_set(self):
+        """已确认（2026-08-06）：值域就是这三个，不许再冒出第四个值。"""
+        import server.api.export_incremental as m
+        allowed = {"in_stock", "out_of_stock", "unknown"}
+        samples = [
+            {"stock_status": "In Stock"}, {"stock_status": "Currently unavailable"},
+            {"stock_status": "Out of Stock"}, {"stock_status": "N/A"},
+            {"stock_status": ""}, {}, {"stock_status": "Only 3 left"},
+            {"stock_status": "有货"}, {"stock_status": "缺货"},
+        ]
+        got = {m._stock_state(x) for x in samples}
+        self.assertTrue(got <= allowed, f"冒出了值域外的取值: {got - allowed}")
+
+    def test_slow_hash_is_not_recomputable_from_the_slow_object(self):
+        """已确认：slow_hash 是**不透明值**。
+
+        这个用例把「不可重算」钉成事实：拿消费侧唯一能拿到的东西（`slow` 对象）
+        按契约文字描述的朴素算法（字段排序后 sha256 前 16 位）重算一遍，
+        必须**对不上**。对上了反而说明有人把采集侧的算法悄悄换成了朴素版——
+        那会丢掉归一化（NFKC / 空白折叠 / 哨兵值 / 图片 URL 归约），
+        慢变哈希会重新变成噪声。
+        """
+        import hashlib
+        import json as _json
+        with _server_with_relay() as (c, _):
+            _seed(c, n=1)
+            rec = c.get("/api/export/incremental",
+                        params={"cursor": 0}, headers=self._hdr()
+                        ).json()["records"][0]
+            naive = hashlib.sha256(
+                _json.dumps(rec["slow"], sort_keys=True,
+                            ensure_ascii=False).encode()).hexdigest()[:16]
+            self.assertNotEqual(
+                rec["slow_hash"], naive,
+                "消费侧按 slow 对象重算竟然对上了——采集侧的归一化算法可能被换掉了")
+
     def test_default_limit_is_500(self):
         with _server_with_relay() as (c, _):
             import server.api.export_incremental as m

@@ -640,6 +640,22 @@ async def _holders_are(conn, n: int) -> bool:
     return await _advisory_lock_holders(conn) == n
 
 
+async def _relay_backend_pid(conn):
+    """从**另一条**连接查出 relay 那条会话的后端 pid，查不到返回 None。
+
+    别改成 ``pgdb._ev()["relay_conn"].fetchval("SELECT pg_backend_pid()")``：
+    那条连接归 relay 循环所有，而用例把 tick 压到 20ms，asyncpg 又不允许一条连接
+    上有两个操作在飞——在快机器上会稳定撞出
+    ``InterfaceError: cannot perform operation: another operation is in progress``，
+    而且是**测试** flake，产品一点问题没有。单例 advisory 锁本来就唯一标识 relay
+    那条会话，从旁路查是等价的，还顺带验证了「锁确实被持有」。
+    """
+    return await conn.fetchval(
+        "SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a USING (pid) "
+        "WHERE l.locktype = 'advisory' AND a.datname = current_database() "
+        "LIMIT 1")
+
+
 async def _drained(conn) -> bool:
     return await conn.fetchval("SELECT count(*) FROM scraper.scrape_outbox") == 0
 
@@ -788,7 +804,8 @@ async def test_relay_reconnects_after_its_own_backend_is_terminated(
         await _emit_direct(pgconn, f"{gen}:pre", gen, "B0PRE")
         assert await _wait_for(lambda: _drained(pgconn))
 
-        pid = await pgdb._ev()["relay_conn"].fetchval("SELECT pg_backend_pid()")
+        pid = await _relay_backend_pid(pgconn)
+        assert pid is not None, "relay 没持有单例锁，杀谁都没意义"
         assert await pgconn.fetchval("SELECT pg_terminate_backend($1)", pid) is True
         # 杀完之后单例锁确实没人持有了 —— 这就是"另一个实例可以接管"的窗口
         assert await _wait_for(lambda: _holders_are(pgconn, 0))
@@ -1196,17 +1213,37 @@ async def test_relay_restart_churn_with_a_persisted_consumer_cursor(
 
     stop = asyncio.Event()
     seen, seqs, skips, dupes, restarts = {}, [], [], [], [0]
+    emitted = [0]
+
+    # 重启的触发点按**写入进度**定，不按墙钟。原先混沌猴是固定 sleep(0.25)，
+    # 而 writer 的总时长随机器快慢浮动：慢机器上跑 2 秒能重启 7 次，快机器上
+    # 0.5 秒跑完只来得及重启 1 次，于是用例自带的空转自检 restarts>=2 直接失败。
+    # 按进度定就跟机器速度无关了，而且三次重启保证都落在写入流中途。
+    milestones = [total // 4, total // 2, (3 * total) // 4]
+
+    async def _hold_for_restart():
+        """写到里程碑就停在这儿，等混沌猴真的把这一次重启做完再继续。
+
+        不 hold 的话快机器上 writer 可能整段跑完混沌猴才轮询到，三次重启会挤在
+        写入结束**之后**发生 —— restarts 计数好看，但用例想验的「relay 在批次
+        中途被打断」根本没发生，是另一种形式的真空。
+        """
+        for i, m in enumerate(milestones):
+            if emitted[0] >= m and restarts[0] < i + 1:
+                await _wait_for(lambda: restarts[0] >= i + 1, timeout=30.0)  # noqa: B023
 
     async def writer(w: int):
         conn = await asyncpg.connect(pgdb.dsn)
         rng = random.Random(900 + w)
         try:
             for n in range(per_writer):
+                await _hold_for_restart()
                 tx = conn.transaction()
                 await tx.start()
                 await _emit_direct(conn, f"{gen}:w{w}-{n}", gen, f"B0W{w}{n:03d}")
                 await asyncio.sleep(rng.uniform(0.0, 0.02))     # 提交顺序被打乱
                 await tx.commit()
+                emitted[0] += 1
                 await asyncio.sleep(rng.uniform(0.0, 0.005))
         finally:
             await conn.close()
@@ -1238,14 +1275,18 @@ async def test_relay_restart_churn_with_a_persisted_consumer_cursor(
             await conn.close()
 
     async def chaos():
-        while not stop.is_set():
-            await asyncio.sleep(0.25)
+        for m in milestones:
+            if not await _wait_for(lambda: emitted[0] >= m or stop.is_set(),  # noqa: B023
+                                   timeout=60.0, step=0.005):
+                return
             if stop.is_set():
-                break
+                return
             await pgdb.stop_event_relay()          # 在批次中途取消
-            restarts[0] += 1
             await asyncio.sleep(0.02)
             await pgdb.start_event_relay()
+            # 计数放在重启**完成之后**：_hold_for_restart 等的是"这一次做完了"，
+            # 提前自增会让 writer 在 relay 还没起来时就放行。
+            restarts[0] += 1
 
     assert await pgdb.start_event_relay() is True
     cons = asyncio.create_task(consumer())
@@ -1264,7 +1305,10 @@ async def test_relay_restart_churn_with_a_persisted_consumer_cursor(
             except Exception:  # noqa: BLE001, PERF203
                 pass
 
-    assert restarts[0] >= 2, f"混沌猴只重启了 {restarts[0]} 次，这个用例是真空的"
+    # 里程碑驱动之后重启次数是确定的，所以这里可以要求相等而不是 >=2：
+    # 少一次说明混沌猴提前退出了（用例真空），多一次说明触发条件被改坏了。
+    assert restarts[0] == len(milestones), \
+        f"混沌猴重启了 {restarts[0]} 次，预期 {len(milestones)} 次 —— 用例可能是真空的"
     assert await pgconn.fetchval("SELECT count(*) FROM scraper.scrape_outbox") == 0
     assert await pgconn.fetchval("SELECT count(*) FROM scraper.scrape_outbox_dead") == 0
     assert await pgconn.fetchval(

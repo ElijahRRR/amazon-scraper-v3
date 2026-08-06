@@ -62,9 +62,13 @@ class _BatchHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        # 真实形状：/api/batches 用的键是 ``name``（common/database.py:831）。
+        # 第三个用 batch_name，钉住「两个键都要认」—— 写死一个就会像真机那样
+        # 查出来全是 None。
         body = json.dumps({"batches": [
-            {"id": 7, "batch_name": "batch_20260806_145034"},
-            {"id": 8, "batch_name": "batch_20260806_145100"},
+            {"id": 7, "name": "batch_20260806_145034"},
+            {"id": 8, "name": "batch_20260806_145100"},
+            {"id": 9, "batch_name": "batch_alt_key"},
         ]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -166,6 +170,13 @@ class ResolveBatchTests(unittest.TestCase):
 
     def test_a_name_is_looked_up(self):
         self.assertEqual(resolve_batch(self.base, "batch_20260806_145034"), 7)
+
+    def test_the_batch_name_key_is_name_not_batch_name(self):
+        """真机就栽在这儿：写死 batch_name，候选列表打出来全是 ['None','None']。"""
+        self.assertEqual(resolve_batch(self.base, "batch_20260806_145100"), 8)
+
+    def test_the_other_key_spelling_is_accepted_too(self):
+        self.assertEqual(resolve_batch(self.base, "batch_alt_key"), 9)
 
     def test_unknown_name_fails_loudly_with_candidates(self):
         with self.assertRaises(SystemExit) as cm:

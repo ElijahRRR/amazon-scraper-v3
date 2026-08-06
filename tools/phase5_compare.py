@@ -167,13 +167,21 @@ def resolve_batch(base: str, spec: Optional[str], timeout: int = 60) -> Optional
     url = f"{base.rstrip('/')}/api/batches"
     with urllib.request.urlopen(url, timeout=timeout) as r:
         batches = (json.loads(r.read()) or {}).get("batches") or []
+    # ⚠ 键名是 ``name``（common/database.py:831 的 `SELECT b.id, b.name, ...`），
+    # **不是** ``batch_name``。后者只出现在 /api/upload 与 /api/batches/{name}/status
+    # 的响应里。两个都收：真机上写死 batch_name 的版本查出来全是 None。
+    def _name_of(b):
+        return b.get("name") or b.get("batch_name")
+
     for b in batches:
-        if str(b.get("batch_name")) == spec:
+        if _name_of(b) is not None and str(_name_of(b)) == spec:
             bid = b.get("id")
             print(f"  批次 {spec!r} -> id {bid}", file=sys.stderr, flush=True)
             return int(bid)
-    names = [str(b.get("batch_name")) for b in batches[:8]]
-    raise SystemExit(f"❌ {base} 上找不到批次 {spec!r}。最近几个：{names}")
+    names = [str(_name_of(b)) for b in batches[:12]]
+    raise SystemExit(
+        f"❌ {base} 上找不到批次 {spec!r}（共 {len(batches)} 个）。"
+        f"最近几个：{names}")
 
 
 def fetch_results(base: str, limit: int, timeout: int = 60,

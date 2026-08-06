@@ -320,8 +320,8 @@ V4 与 `sync.py` 对齐。
 ✅ 64 步与基线完全一致
 ### GATE 2) golden postgres
 ✅ 64 步与基线完全一致
-### GATE 3) pytest sqlite
-684 passed, 22 skipped, 1 warning in 188.73s (0:03:08)
+### GATE 3) pytest sqlite（--ignore=tests/pgdb，理由见 §9）
+285 passed, 22 skipped, 1 warning in 5.21s
 ### GATE 4) pytest postgres
 705 passed, 1 skipped, 1 warning in 239.74s (0:03:59)
 ### GATE 5) unittest sqlite
@@ -519,8 +519,8 @@ V=/home/user/amazon-scraper-v3/.venv/bin/python
 # 六道门
 $V -m tests.golden.run verify                          # -> ✅ 64 步与基线完全一致
 DB_BACKEND=postgres $V -m tests.golden.run verify      # -> ✅ 64 步与基线完全一致
-$V -m pytest tests/ -q
-DB_BACKEND=postgres $V -m pytest tests/ -q
+$V -m pytest tests/ --ignore=tests/pgdb -q             # sqlite 列：**不含** tests/pgdb，见下
+DB_BACKEND=postgres $V -m pytest tests/ -q             # postgres 列：跑全树
 $V -m unittest discover -s tests
 DB_BACKEND=postgres $V -m unittest discover -s tests
 
@@ -534,6 +534,21 @@ $V -m pytest tests/pgdb/test_phase4_fields.py -q -k zip
 pg_ctlcluster 16 main start
 ```
 
-**标准规矩（还在生效）**：不改 `common/database.py`；
-不重录 `tests/golden/samples/sqlite_baseline.json`；
+**为什么 sqlite 列要 `--ignore=tests/pgdb`**：`tests/pgdb/conftest.py:41-49` 的 `pgdb`
+夹具**不读 `DB_BACKEND`**（只 `importorskip('asyncpg')` + 建一次性库），在意后端的用例
+一律自己 `monkeypatch.setenv`（`test_sync_api.py:37,938,965`、`test_retention.py:54,489,907`、
+`test_export_retention_window.py:38`）。`test_sync_api.py:11` 的模块文档自己就写着
+「两列里跑的是同一件事」。所以这 400+ 条在两列里**逐条相同**，跑第二遍是纯浪费。
+
+实测：`pytest tests/ --ignore=tests/pgdb -q` -> **285 passed, 22 skipped, 5.21s**，
+对比整列的 188s —— 六道门总时长省约 183s。
+
+⚠ **代价要说清楚**：这一列从此**不再执行任何 SQLite 存储层代码**
+（`test_admin.py:400` 的 `run_sqlite()` 与 `test_results_read.py:174` 的 `seeded_sqlite`
+都在 `tests/pgdb` 下）。SQLite 存储层的信号只剩 GATE 1 的黄金 64 步。
+别误以为那一列还在守 SQLite。
+
+**标准规矩（更新版）**：`common/database.py` 仍然只在计划明确要求时才改；
+`tests/golden/samples/sqlite_baseline.json` **可以重录，但只在 sqlite 侧、且必须先声明改了什么行为**
+——基线 blob 的 diff 就是评审物，未经声明的飘红一律先查错；
 每一条主张都要有实测输出。

@@ -25,6 +25,25 @@ from tests.golden.harness import (                      # noqa: E402
 )
 
 SAMPLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
+
+#: **只有一份基线，两个后端 verify 比的是同一份。** 三条推论，都是踩过才写下来的：
+#:
+#: 1. ``record`` 在 ``DB_BACKEND=postgres`` 下会**直接覆盖这份 sqlite 基线**。
+#:    重录一律在 sqlite 侧做。
+#: 2. 任何新增步骤，**两个后端的响应必须逐字节相同**，否则根本加不进来 ——
+#:    这是选步骤时的硬筛，不是加完再调。
+#: 3. 重录不是禁忌，但**未经声明的飘红一律先查错，不许顺手重录**。
+#:    规矩是：先在提交信息里写明改了什么行为、为什么 -> 再 record ->
+#:    基线 blob 的 diff 就是评审物。
+#:
+#: ⚠ 这份基线**盖不住的东西**，别把「全绿」读成「验过了」：
+#:    * 六次 ``/api/results`` 一次都没传 ``batch_id``，``change_filter`` 只测了 ``new``
+#:      （``scenario.py:212-233``）—— 翻页/筛选的查询改写在这里是零覆盖。
+#:    * 从不执行 ``worker/parser.py``（场景直接 POST 造好的 dict），
+#:      所以解析器改动在这里是**结构性**零覆盖，不是「可能红」。
+#:    * 不比任何响应头（``harness.py`` 的 ``diff_steps`` 只比 status/content_type/body）。
+#:    * 样本值太干净（价格全 19.99/33.50/0.00、brand 恒 GoldenBrand、
+#:      搜索样本全是单一大小写 ASCII），哨兵语义与价格解析类改动改完这里逐字节不变。
 BASELINE = os.path.join(SAMPLE_DIR, "sqlite_baseline.json")
 
 

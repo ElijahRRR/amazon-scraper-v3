@@ -217,22 +217,48 @@ def check_pg(skip_slow: bool):
         fail("PG 连接", f"{type(e).__name__}: {e}")
 
 
+def _flatten_routes(routes):
+    """展平成与 Starlette 匹配顺序一致的扁平列表（递归展开 _IncludedRouter）。
+
+    FastAPI >= 0.141 的 include_router 不再摊平子路由，而是插进一个惰性的
+    ``_IncludedRouter``（``path`` 是 None、``original_router`` 指向子 router）。
+    Phase 3.7 之后 /api/export/incremental 与 /api/export/{batch_name} 两条
+    **都在包装对象里面**（前者还多套一层：app -> export.router -> _incr.router），
+    只扫顶层两个都找不到。包含是递归的，展开也必须递归。
+    """
+    flat = []
+    for r in routes:
+        sub = getattr(r, "original_router", None)
+        if sub is not None:
+            flat.extend(_flatten_routes(sub.routes))
+        else:
+            flat.append(r)
+    return flat
+
+
 def check_route_order():
     """增量导出端点必须注册在 /api/export/{batch_name} 之前，否则静默 404。"""
     try:
         from server.app import app
-        from server.api import export_incremental as _incr
     except Exception as e:                                   # noqa: BLE001
         fail("路由顺序", f"import server.app 失败: {type(e).__name__}: {e}")
         return
-    incr = next((i for i, r in enumerate(app.routes)
-                 if getattr(r, "original_router", None) is _incr.router
-                 or getattr(r, "path", None) == "/api/export/incremental"), None)
-    catch = next((i for i, r in enumerate(app.routes)
-                  if getattr(r, "path", None) == "/api/export/{batch_name}"), None)
+    paths = [getattr(r, "path", None) for r in _flatten_routes(app.routes)]
+    incr = next((i for i, p in enumerate(paths)
+                 if p == "/api/export/incremental"), None)
+    catch = next((i for i, p in enumerate(paths)
+                  if p == "/api/export/{batch_name}"), None)
     if incr is None:
         fail("路由顺序", "/api/export/incremental 没挂上")
-    elif catch is not None and incr > catch:
+    elif catch is None:
+        # 以前这里落到 else 报绿 —— 那是这份检查最坏的一种坏法：
+        # catch-all 找不到只可能是**查找逻辑本身失效了**（改名、换 FastAPI
+        # 形态、被包进新的 router 层），而不是"catch-all 没了所以安全"。
+        # 前提没了就没资格判定，必须 fail。
+        fail("路由顺序",
+             "找不到 /api/export/{batch_name} —— 本检查的前提失效了，"
+             "不是'安全'。先修查找逻辑（是不是又多包了一层 router？）")
+    elif incr > catch:
         fail("路由顺序",
              "被 /api/export/{batch_name} 吞掉了 —— 会静默返回 404「批次不存在」")
     else:

@@ -15,22 +15,33 @@
 承重约束
 ------------------------------------------------------------------------
 
-1. **路由注册顺序是承重的，而且这条依赖是隐式的。**
-   `server/app.py:2052` 有 `@app.get("/api/export/{batch_name}")`，对不认识的
+1. **路由注册顺序是承重的。**
+   `server/api/export.py` 有 `@router.get("/api/export/{batch_name}")`，对不认识的
    名字回 **404**。实测（未挂本端点时）：
 
        GET /api/export/incremental -> 404 {"detail":"批次不存在: incremental"}
 
-   Starlette 按**注册顺序**匹配，所以本 router 必须在那条 catch-all **之前**
-   include。目前 `server/app.py:260` 的 include_router 满足这个条件，
-   `/api/export/fields`(2033) 与 `/api/export/all`(2042) 是同前缀下静态路径的
-   现成先例。
+   Starlette 按**注册顺序**匹配，所以本 router 必须排在那条 catch-all **之前**。
 
-   **为什么必须有回归守卫**：把 include_router 挪到文件末尾、或者把本端点改成
-   用 `@app.get` 直接定义在 catch-all 之后，都会让它静默退化成 404 ——
+   **这条依赖已经从「隐式」变成「局部」**（Phase 3.7）：`server/api/export.py`
+   在文件顶部、任何 `@router.get` 之前就 `router.include_router(_incr.router)`，
+   `server/app.py` 只 include 一个 export router。于是顺序由**单文件自上而下阅读**
+   保证，app.py 的 include 列表怎么重排都打不破它。
+   —— 此前它靠 app.py 里两个 include 的相对位置维系，那是隐式的、跨文件的、
+   任何一次重排都可能无声破坏。
+
+   **为什么必须有回归守卫**：把 `include_router(_incr.router)` 挪到 export.py 末尾、
+   或者把本端点改成定义在 catch-all 之后，都会让它静默退化成 404 ——
    而 404 正是消费方最容易读成「暂无数据」的码，游标于是永不推进、同步静默停摆，
    两侧都不会报错。
-   `tests/test_incremental_export.py::test_route_order_is_load_bearing` 钉死它。
+
+   守卫共四层，实测变异后**四层同时红**（Phase 3.7 审计）：
+     * 结构：`tests/test_incremental_export.py::test_route_order_is_load_bearing`
+       （必须**递归展开** `_IncludedRouter` —— 这版 FastAPI 的 include_router 不平铺，
+       而且 `_IncludedRouter` 没有 `.routes`，要走 `original_router.routes`）
+     * 行为：`::test_endpoint_is_reachable_not_swallowed`（真打一次，响应体不含「批次不存在」）
+     * 源码：`::test_export_module_includes_incremental_before_first_route`
+     * 上机：`tools/phase5_preflight.py` 的「路由顺序」一项
 
 2. **鉴权：`X-Export-Token` 请求头，契约 v1 定为可选。**
    配了 `EXPORT_TOKEN` 就强制校验（`hmac.compare_digest`，不匹配即 401）；

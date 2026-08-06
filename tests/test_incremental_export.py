@@ -26,37 +26,61 @@ except ImportError:  # pragma: no cover
 TOKEN = "test-export-token-12345"
 
 
+def _flatten_routes(routes):
+    """把 ``app.routes`` 展平成与 Starlette 匹配顺序一致的扁平列表。
+
+    FastAPI ≥ 0.141 的 ``include_router`` 不再把子路由摊平进父容器，而是插入
+    一个惰性的 ``_IncludedRouter`` 包装对象（``path`` 是 ``None``、
+    ``original_router`` 指向被包含的那个 ``APIRouter``）。Phase 3.7 之后
+    ``/api/export/incremental`` 与 ``/api/export/{batch_name}`` **两条都在
+    包装对象里面**（前者还多套一层：app → export.router → _incr.router），
+    只扫顶层一定两个都找不到 —— 而"找不到"必须是红，不能是绿。
+
+    包含是递归的，展开也必须是递归的；展开顺序就是注册顺序，也就是
+    Starlette 的匹配顺序。
+    """
+    flat = []
+    for r in routes:
+        sub = getattr(r, "original_router", None)
+        if sub is not None:
+            flat.extend(_flatten_routes(sub.routes))
+        else:
+            flat.append(r)
+    return flat
+
+
 class RouteOrderTests(unittest.TestCase):
-    """路由顺序守卫。**两个后端都要跑**——它守的是 app.py 的注册顺序，与后端无关。"""
+    """路由顺序守卫。**两个后端都要跑**——它守的是注册顺序，与后端无关。
+
+    三层，缺一层都不够：
+
+      1. **结构**：递归展平后比索引。
+      2. **行为**：真打一次，响应体不含「批次不存在」。结构断言会被下一次
+         FastAPI 版本变化绕过（0.141 那次就绕过了一半），行为断言不会。
+      3. **源码**：`server/api/export.py` 里 `include_router(_incr.router)`
+         必须出现在第一个 `@router.get` 之前 —— Phase 3.7 把顺序局部化到了
+         那个文件里，这一层直接钉住"局部化"本身还成立。
+    """
 
     def test_route_order_is_load_bearing(self):
         """结构性守卫：注册位置必须在 catch-all 之前。
 
-        写法特意做成**跨 FastAPI 版本**的。FastAPI ≥ 0.141 的 include_router
-        不再把子路由摊平进 ``app.routes``，而是插入一个惰性的 ``_IncludedRouter``
-        包装对象（``path`` 是 ``None``）；旧版本则是摊平的。两种形态都要认，
-        否则升个版本这条守卫就会静默失效——而它守的恰恰是一种静默失效。
+        写法特意做成**跨 FastAPI 版本**的：新形态（``_IncludedRouter`` 包装、
+        ``path`` 是 ``None``）与旧形态（摊平的 ``APIRoute``）都要认，否则升个
+        版本这条守卫就会静默失效——而它守的恰恰是一种静默失效。
         """
         from server.app import app
-        from server.api import export_incremental as _incr
 
-        def index_of_our_router():
-            for i, r in enumerate(app.routes):
-                # 新形态：包装对象，认它包的是不是我们那个 router
-                if getattr(r, "original_router", None) is _incr.router:
-                    return i
-                # 旧形态：摊平的 APIRoute
-                if getattr(r, "path", None) == "/api/export/incremental":
-                    return i
-            return None
+        flat = _flatten_routes(app.routes)
+        paths = [getattr(r, "path", None) for r in flat]
 
-        incr = index_of_our_router()
+        incr = next((i for i, p in enumerate(paths)
+                     if p == "/api/export/incremental"), None)
         self.assertIsNotNone(
-            incr, "端点没挂上——app.py 里的 include_router 掉了？")
+            incr, "端点没挂上——export.py 里的 include_router(_incr.router) 掉了？")
 
-        catch_all = next(
-            (i for i, r in enumerate(app.routes)
-             if getattr(r, "path", None) == "/api/export/{batch_name}"), None)
+        catch_all = next((i for i, p in enumerate(paths)
+                          if p == "/api/export/{batch_name}"), None)
         self.assertIsNotNone(catch_all, "catch-all 不见了，本守卫的前提变了")
 
         self.assertLess(
@@ -64,8 +88,8 @@ class RouteOrderTests(unittest.TestCase):
             "/api/export/incremental 必须注册在 /api/export/{batch_name} 之前。\n"
             "现在这个顺序下，它会被 catch-all 吞成 404「批次不存在: incremental」，\n"
             "而 catalog_sync 会把 404 读成「暂无数据」并永远不推进游标——两侧都不报错。\n"
-            "修法：把 app.include_router(_export_incr_api.router) 移回 app.py 顶部\n"
-            "（catch-all 定义之前），不要改成 @app.get 直接定义在下方。")
+            "修法：把 server/api/export.py 里的 router.include_router(_incr.router)\n"
+            "移回该文件第一个 @router.get 之前，不要改成在 catch-all 之后 include。")
 
     def test_endpoint_is_reachable_not_swallowed(self):
         """端到端确认：打它拿到的不是 catch-all 的 404 文案。"""
@@ -73,6 +97,38 @@ class RouteOrderTests(unittest.TestCase):
             r = c.get("/api/export/incremental", params={"cursor": 0})
             self.assertNotEqual(r.status_code, 404, r.text)
             self.assertNotIn("批次不存在", r.text)
+
+    def test_export_module_includes_incremental_before_first_route(self):
+        """源码守卫：顺序局部化本身必须还成立。
+
+        Phase 3.7 之后，「增量端点排在 catch-all 之前」这条不变量不再靠
+        `app.py` 里 include 列表的次序，而是靠 `server/api/export.py`
+        自上而下的阅读顺序。把那两行挪到任何一条 `@router.get` 之后，
+        上面的结构断言当然也会红——但这一层能直接指出**是哪一行**动了，
+        而且它在 import 之前就成立，不依赖 FastAPI 的任何内部形态。
+        """
+        import inspect
+        import re as _re
+
+        from server.api import export as _export
+
+        src = inspect.getsource(_export)
+        # 必须锚在行首：那份模块 docstring 里就写着 `@router.get` 与
+        # `include_router(_incr.router)`（讲的正是这条约束），裸 str.find
+        # 会先撞上文档里的那一处，把守卫变成对散文排版的断言。
+        m_inc = _re.search(r"^router\.include_router\(_incr\.router\)", src, _re.M)
+        self.assertIsNotNone(
+            m_inc,
+            "server/api/export.py 里找不到 router.include_router(_incr.router)——"
+            "增量端点没被包进来，会被 /api/export/{batch_name} 吞成 404")
+        m_route = _re.search(r"^@router\.get", src, _re.M)
+        self.assertIsNotNone(
+            m_route, "server/api/export.py 里一条 @router.get 都没有？")
+        self.assertLess(
+            m_inc.start(), m_route.start(),
+            "router.include_router(_incr.router) 必须写在 export.py 第一个\n"
+            "@router.get 之前。排在 @router.get(\"/api/export/{batch_name}\") 之后\n"
+            "会让 /api/export/incremental 静默退化成 404「批次不存在: incremental」。")
 
 
 @unittest.skipUnless(is_postgres(), "增量导出是 PostgreSQL 专属")

@@ -13,7 +13,6 @@ import logging
 import socket
 import time
 import uuid
-import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Set
@@ -21,7 +20,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request, UploadFile, File, Form, Query, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import openpyxl
 
@@ -323,22 +322,15 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
 # * import 方向是单向的：sync.py **不在模块级** import server.app
 #   （那是循环导入，启动即崩、整个 erpAPI 下线），它在每个 handler 里惰性取 db。
 from server.api import sync as _sync_api  # noqa: E402
-from server.api import export_incremental as _export_incr_api  # noqa: E402
 
 app.include_router(_sync_api.router)
 
-# ⚠ 这一行的**位置**是承重的，不是风格。
-#
-# /api/export/incremental 落在本文件下方 `@app.get("/api/export/{batch_name}")`
-# 那条 catch-all 的前缀里，而 Starlette 按**注册顺序**匹配。挪到那条之后，
-# 本端点会静默退化成 404 `{"detail":"批次不存在: incremental"}` ——
-# 而 404 正是 catalog_sync 最容易读成「暂无数据」的码：游标永不推进，
-# 同步静默停摆，两侧都不报错。实测过，未挂载时就是这个响应。
-#
-# /api/export/fields 与 /api/export/all 是同前缀下静态路径的现成先例，
-# 它们靠的是「定义在 catch-all 之前」这同一条规则。
-# tests/test_incremental_export.py::test_route_order_is_load_bearing 钉死它。
-app.include_router(_export_incr_api.router)
+# /api/export/incremental 的 router **不在这里挂**（Phase 3.7 顺序局部化）。
+# 它落在 /api/export/{batch_name} 这条 catch-all 的前缀里，Starlette 按注册
+# 顺序匹配，挪到 catch-all 之后就静默退化成 404「批次不存在: incremental」。
+# 这条依赖过去是跨文件的（顶部 include、几百行之后才定义 catch-all），现在
+# 由 server/api/export.py 在自己第一个 @router.get 之前 include 增量 router
+# 来保证 —— 本文件的 include 列表怎么重排都打不破它。
 
 
 # 中国时间（UTC+8）：用于批次名/导出文件名/定时任务调度判定，与前端展示口径一致。
@@ -1432,212 +1424,17 @@ async def api_reset_settings():
 
 
 # ==================== API: Worker 任务拉取和提交 ====================
+#
+# 6 个端点搬到 server/api/worker_queue.py（Phase 3.5）：tasks/pull、tasks/release、
+# tasks/result、tasks/result/batch、tasks/screenshot、tasks/screenshot/fail。
+# router 光秃，不带 tags/prefix。db / _worker_registry / _completion_check_set
+# 仍留在本文件（黄金夹具与 PG 夹具都按名字给 server.app 打补丁），
+# worker_queue.py 一律走 _srv()；_register_worker / _rollback_quietly /
+# _normalize_asin / _safe_fs_component 同理留在本文件。
+# 六条全是静态路径，/api/tasks 下没有 catch-all，注册次序不影响匹配。
+from server.api import worker_queue as _worker_queue_api  # noqa: E402
 
-@app.get("/api/tasks/pull")
-async def api_pull_tasks(request: Request,
-                         worker_id: str = Query(...),
-                         count: int = Query(10),
-                         needs_screenshot: Optional[bool] = Query(None),
-                         enable_screenshot: Optional[bool] = Query(None),
-                         prefer_zip: Optional[str] = Query(None)):
-    ip = request.client.host if request.client else None
-    # enable_screenshot 来自 worker 的 query param，更新 registry
-    _register_worker(worker_id, enable_screenshot=enable_screenshot, ip=ip)
-
-    # ns=None: 不限制; ns=False: 只拉不需要截图的任务
-    # enable_screenshot 表示 worker 是否有截图能力：
-    #   True  → 拉所有任务 (ns=None)
-    #   False → 只拉不需要截图的 (ns=False)
-    ns = None
-    if needs_screenshot is not None:
-        ns = needs_screenshot
-    elif enable_screenshot is not None:
-        if not enable_screenshot:
-            ns = False
-        # enable_screenshot=True → ns=None (拉所有任务)
-    elif worker_id in _worker_registry:
-        if not _worker_registry[worker_id].get("enable_screenshot", True):
-            ns = False
-
-    # prefer_zip 校验（防注入）：只接受 5 位数字
-    pz = None
-    if prefer_zip and re.match(r'^\d{5}$', prefer_zip):
-        pz = prefer_zip
-
-    tasks = await db.pull_tasks(worker_id, count, ns, prefer_zip=pz)
-    if worker_id in _worker_registry:
-        _worker_registry[worker_id]["tasks_pulled"] += len(tasks)
-    return {"tasks": tasks}
-
-
-@app.post("/api/tasks/release")
-async def api_release_tasks(request: Request):
-    body = await request.json()
-    worker_id = body.get("worker_id", "")
-    tasks = body.get("tasks", [])
-    # 兼容旧格式 {"task_ids": [1,2,3]}（无 lease 校验，直接释放）
-    if not tasks and "task_ids" in body:
-        task_ids = body["task_ids"]
-        if task_ids:
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            placeholders = ",".join("?" * len(task_ids))
-            async with db._write_lock:
-                await db._db.execute("BEGIN")
-                try:
-                    cursor = await db._db.execute(
-                        f"UPDATE tasks SET status='pending', worker_id=NULL, "
-                        f"lease_epoch=lease_epoch+1, updated_at=? "
-                        f"WHERE id IN ({placeholders}) AND status='processing'",
-                        [now] + task_ids
-                    )
-                    await db._db.execute("COMMIT")
-                except BaseException:
-                    await _rollback_quietly(db._db)
-                    raise
-            return {"ok": True, "released": cursor.rowcount}
-        return {"ok": True, "released": 0}
-    released = await db.release_tasks(worker_id, tasks)
-    return {"ok": True, "released": released}
-
-
-@app.post("/api/tasks/result")
-async def api_submit_result(request: Request):
-    """提交单个结果（lease 校验 → 原子写入）"""
-    data = await request.json()
-    task_id = data.pop("task_id", None)
-    batch_id = data.pop("batch_id", None)
-    worker_id = data.get("worker_id", "")
-    lease_epoch = data.pop("lease_epoch", 0)
-
-    if task_id:
-        if data.get("success", True):
-            result = await db.accept_success_result(task_id, worker_id, lease_epoch, data, batch_id)
-        else:
-            result = await db.accept_failed_result(
-                task_id, worker_id, lease_epoch,
-                data.get("error_type", ""), data.get("error_detail", ""))
-        if worker_id in _worker_registry and result.get("accepted"):
-            _worker_registry[worker_id]["results_submitted"] += 1
-        return {"ok": result.get("accepted", False), "stale": result.get("stale", False)}
-    else:
-        # 无 task_id 的直接写入（兼容）
-        saved = await db.save_result(data, batch_id)
-        return {"ok": saved, "stale": False}
-
-
-@app.post("/api/tasks/result/batch")
-async def api_submit_batch(request: Request):
-    """批量提交结果（单事务，减少锁争用）"""
-    body = await request.json()
-    results = body.get("results", [])
-
-    # 构建 batch items
-    batch_items = []
-    worker_id_set = set()
-    for item in results:
-        task_id = item.pop("task_id", None)
-        batch_id = item.pop("batch_id", None)
-        worker_id = item.get("worker_id", "")
-        lease_epoch = item.pop("lease_epoch", 0)
-        is_success = item.pop("success", True)
-        worker_id_set.add(worker_id)
-        batch_items.append({
-            "task_id": task_id,
-            "worker_id": worker_id,
-            "lease_epoch": lease_epoch,
-            "batch_id": batch_id,
-            "data": item,
-            "success": is_success,
-        })
-
-    result = await db.accept_results_batch(batch_items)
-
-    # results_submitted 只计 accepted
-    for wid in worker_id_set:
-        if wid in _worker_registry and result["accepted"] > 0:
-            _worker_registry[wid]["results_submitted"] += result["accepted"]
-
-    # 防御性入队：本次写入涉及的 batch_id 标记为"需要检查是否完成"。
-    # set.add 是 O(1) 内存操作，不会影响 worker 提交响应。
-    # 任何异常都吞掉只 log，绝不让通知机制污染采集主路径。
-    try:
-        touched = {item["batch_id"] for item in batch_items if item.get("batch_id")}
-        for bid in touched:
-            _completion_check_set.add(bid)
-    except Exception as e:
-        logger.warning(f"完成检测入队异常（不影响采集）: {e}")
-
-    return {**result, "total": len(results)}
-
-
-# POST /api/tasks/seller-result 已搬到 server/api/sellers.py（Phase 3.4）——
-# 它按域属于 F-009，不属于本节；路径是静态的，本节六条也全是静态路径，
-# 没有 /api/tasks/{x} catch-all，换模块不改路由匹配。
-
-
-@app.post("/api/tasks/screenshot")
-async def api_upload_screenshot(request: Request,
-                                asin: str = Form(...),
-                                batch_name: str = Form(...),
-                                worker_id: str = Form(""),
-                                file: UploadFile = File(...)):
-    """接收截图上传（检查 worker 存活状态）"""
-    # 拒绝已死 worker 的截图上传
-    if worker_id and worker_id not in _worker_registry:
-        raise HTTPException(409, f"Worker {worker_id} 已离线，截图被丢弃")
-    if worker_id and worker_id in _worker_registry:
-        if time.time() - _worker_registry[worker_id]["last_seen"] > 120:
-            raise HTTPException(409, f"Worker {worker_id} 心跳超时，截图被丢弃")
-
-    # 路径安全：asin / batch_name 会直接拼成磁盘路径，必须校验防穿越
-    asin = _normalize_asin(asin)
-    if not asin:
-        raise HTTPException(400, "非法 ASIN")
-    if _safe_fs_component(batch_name) is None:
-        raise HTTPException(400, "非法批次名")
-
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(400, f"批次不存在: {batch_name}")
-
-    batch_id = batch["id"]
-    save_dir = os.path.join(config.SCREENSHOT_DIR, batch_name)
-    os.makedirs(save_dir, exist_ok=True)
-
-    filename = f"{asin}.png"
-    filepath = os.path.join(save_dir, filename)
-    content = await file.read()
-    # 单张截图上限 10MB，防止恶意/损坏文件耗尽磁盘
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(413, f"截图过大：{len(content)//1024//1024}MB，上限 10MB")
-    with open(filepath, "wb") as f:
-        f.write(content)
-
-    rel_path = f"/static/screenshots/{batch_name}/{filename}"
-    updated = await db.update_screenshot_status(asin, batch_id, "done", file_path=rel_path)
-    if not updated:
-        try:
-            os.remove(filepath)
-        except OSError:
-            pass
-        raise HTTPException(409, f"截图状态不存在: {asin}@{batch_name}")
-    return {"ok": True, "path": rel_path}
-
-
-@app.post("/api/tasks/screenshot/fail")
-async def api_screenshot_fail(request: Request):
-    """截图渲染失败上报（触发重试或标记永久失败）"""
-    body = await request.json()
-    asin = body.get("asin", "")
-    batch_name = body.get("batch_name", "")
-    error = body.get("error", "unknown")
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(400, f"批次不存在: {batch_name}")
-    updated = await db.update_screenshot_status(asin, batch["id"], "failed", error=error)
-    if not updated:
-        raise HTTPException(409, f"截图状态不存在: {asin}@{batch_name}")
-    return {"ok": True}
+app.include_router(_worker_queue_api.router)
 
 
 # ==================== API: Worker 同步 ====================
@@ -1645,38 +1442,22 @@ async def api_screenshot_fail(request: Request):
 # server/api/fleet.py（Phase 3.3）；router 在上面「Worker 机群」那一节挂载。
 
 
-# ==================== API: 结果查询 ====================
+# ==================== API: 结果查询 / 结果删除 ====================
+#
+# 5 个端点搬到 server/api/results.py（Phase 3.6）：GET /api/results、
+# GET /api/results/{asin}、GET /api/changes/stats，外加两条删除
+# —— POST /api/results/delete-by-file 与 DELETE /api/results，
+# 它们原本待在下面「诊断 / 侦查」节头之后，节头骗人，按域属于结果面。
+# router 光秃，不带 tags/prefix。db / MAX_UPLOAD_BYTES / _rollback_quietly /
+# _remove_screenshot_files 仍留在本文件，results.py 一律走 _srv()。
+# 两条删除里的裸 db._db / db._write_lock 与自拼的 f-string LIKE 原文照搬 ——
+# 那段 LIKE 的 PG 语义靠 common/pgdb/pool.py 的 _LIKE_QMARK_RE 按字面文本改写
+# 撑着（D-16），收进 db 方法是 3.8 批 (3) 的事，不在搬运这一步顺手做。
+# 路由匹配不变：GET /api/results/{asin} 与 POST /api/results/delete-by-file
+# 方法不同，GET/DELETE /api/results 同理，两者相对顺序也与拆分前一致。
+from server.api import results as _results_api  # noqa: E402
 
-@app.get("/api/results")
-async def api_results(batch_id: int = None,
-                      cursor: int = None,
-                      limit: int = Query(50, le=200),
-                      search: str = None,
-                      change_filter: str = "all",
-                      direction: str = "next"):
-    result = await db.get_results(
-        batch_id=batch_id,
-        cursor_id=cursor,
-        limit=limit,
-        search=search,
-        change_filter=change_filter,
-        direction=direction,
-    )
-    return result
-
-
-@app.get("/api/results/{asin}")
-async def api_result_detail(asin: str):
-    data = await db.get_result_by_asin(asin)
-    if not data:
-        raise HTTPException(404, f"ASIN {asin} 不存在")
-    changes = await db.get_asin_changes(asin)
-    return {"data": data, "changes": changes}
-
-
-@app.get("/api/changes/stats")
-async def api_change_stats(batch_id: int = None):
-    return await db.get_change_stats(batch_id)
+app.include_router(_results_api.router)
 
 
 # ==================== API: 设置 ====================
@@ -1701,365 +1482,23 @@ async def api_update_settings(request: Request):
 
 
 # ==================== API: 导出 ====================
+#
+# 4 个端点搬到 server/api/export.py（Phase 3.7）：export/fields、export/all、
+# export/{batch_name}（catch-all）、export/{batch_name}/screenshots，
+# 连同 _parse_selected_fields / _get_export_headers / _prepare_row /
+# _export_xlsx_streaming / _export_csv_streaming 等私有助手。
+# router 光秃，不带 tags/prefix。db / logger / _cn_now / _safe_fs_component
+# 仍留在本文件，export.py 一律走 _srv()。
+#
+# ⚠ /api/export/incremental 的注册顺序**不再由这里保证**（顺序局部化）：
+#   它现在由 export.py 在自己第一个 @router.get 之前 include 进来，
+#   所以「增量端点排在 catch-all 之前」这条不变量由单文件自上而下阅读保证，
+#   下面这份 include 列表怎么重排都打不破它。守卫见
+#   tests/test_incremental_export.py::RouteOrderTests（结构 + 行为 + 源码三层）
+#   与 tools/phase5_preflight.py:check_route_order。
+from server.api import export as _export_api  # noqa: E402
 
-from common.models import EXPORTABLE_FIELDS
-from common.database import _parse_price_float
-
-BATCH_STATUS_EXPORT_HEADERS = [
-    "本批采集结果",
-    "数据来源",
-    "失败类型",
-    "失败详情",
-    "实际页面ASIN",
-    "重试次数",
-    "本批任务更新时间",
-    "产品库数据更新时间",
-]
-
-_VARIANT_PAGE_ASIN_RE = re.compile(r"\bpage=([A-Z0-9]{10})\b", re.IGNORECASE)
-
-
-def _parse_selected_fields(fields_param: str = None):
-    """解析并校验字段选择，返回 None 表示全选"""
-    if not fields_param:
-        return None
-    selected = [f for f in fields_param.split(",") if f in EXPORTABLE_FIELDS]
-    return selected if selected else None
-
-
-# 导出时每攒够这么多行就交给工作线程处理一次（append/格式化）。
-# 取值权衡：太小 → executor 往返频繁；太大 → 单次线程调用持锁时间变长。
-_EXPORT_ROWS_PER_CHUNK = 2000
-
-
-def _export_needed_columns(field_keys, include_total: bool):
-    """导出实际需要从 asin_data 读取的列（供 iter_results 收窄投影用）。
-
-    = 用户勾选的输出列 field_keys；若含虚拟列「总价」，额外需要 buybox_price /
-    buybox_shipping 两列参与计算。批次状态列来自 tasks/别名，不在此列出。
-    """
-    needed = list(field_keys)
-    if include_total:
-        for c in ("buybox_price", "buybox_shipping"):
-            if c not in needed:
-                needed.append(c)
-    return needed
-
-
-def _get_export_headers(selected_fields=None, include_batch_status: bool = False):
-    """构建导出表头和字段键"""
-    if selected_fields is None:
-        selected_fields = list(EXPORTABLE_FIELDS)
-
-    include_total = "total_price" in selected_fields
-    field_keys = [f for f in selected_fields if f != "total_price"]
-    headers = [config.HEADER_MAP.get(f, f) for f in field_keys]
-
-    if include_total:
-        shipping_h = config.HEADER_MAP.get("buybox_shipping", "buybox_shipping")
-        idx = headers.index(shipping_h) + 1 if shipping_h in headers else len(headers)
-        headers.insert(idx, config.HEADER_MAP.get("total_price", "总价"))
-
-    if include_batch_status:
-        headers.extend(BATCH_STATUS_EXPORT_HEADERS)
-
-    return headers, field_keys, include_total
-
-
-def _batch_status_export_values(item: dict) -> list:
-    status = str(item.get("batch_task_status") or "")
-    has_asin_data = bool(item.get("batch_has_asin_data"))
-    error_type = str(item.get("batch_error_type") or "") if status == "failed" else ""
-    error_detail = str(item.get("batch_error_detail") or "") if status == "failed" else ""
-
-    result_map = {
-        "done": "成功",
-        "failed": "失败",
-        "processing": "处理中",
-        "pending": "待采集",
-    }
-    batch_result = result_map.get(status, status)
-
-    if status == "done" and has_asin_data:
-        data_source = "本次采集更新"
-    elif has_asin_data:
-        data_source = "历史产品库数据，本次未更新"
-    elif status == "failed":
-        data_source = "无产品库数据，本次失败"
-    elif status in ("pending", "processing"):
-        data_source = "无产品库数据，本次未完成"
-    else:
-        data_source = "无产品库数据"
-
-    actual_page_asin = ""
-    if error_type == "variant_offset":
-        m = _VARIANT_PAGE_ASIN_RE.search(error_detail)
-        if m:
-            actual_page_asin = m.group(1).upper()
-
-    return [
-        batch_result,
-        data_source,
-        error_type,
-        error_detail,
-        actual_page_asin,
-        str(item.get("batch_retry_count") or ""),
-        str(item.get("batch_task_updated_at") or ""),
-        str(item.get("batch_asin_data_updated_at") or ""),
-    ]
-
-
-def _prepare_row(item: dict, field_keys: list, headers: list, include_total: bool,
-                 include_batch_status: bool = False):
-    """构建单行导出数据"""
-    row = [str(item.get(f, "") or "") for f in field_keys]
-    if include_total:
-        bp = _parse_price_float(item.get("buybox_price", ""))
-        bs_str = str(item.get("buybox_shipping", ""))
-        if bp is not None:
-            bs = 0.0 if bs_str.upper() == "FREE" else (_parse_price_float(bs_str) or 0.0)
-            total = f"${bp + bs:.2f}"
-        else:
-            total = ""
-        shipping_h = config.HEADER_MAP.get("buybox_shipping", "buybox_shipping")
-        idx = headers.index(shipping_h) + 1 if shipping_h in headers else len(row)
-        row.insert(idx, total)
-    if include_batch_status:
-        row.extend(_batch_status_export_values(item))
-    return row
-
-
-@app.get("/api/export/fields")
-async def api_export_fields():
-    """返回可导出字段列表"""
-    return {
-        "fields": EXPORTABLE_FIELDS,
-        "headers": {f: config.HEADER_MAP.get(f, f) for f in EXPORTABLE_FIELDS},
-    }
-
-
-@app.get("/api/export/all")
-async def api_export_all(format: str = "xlsx", change_filter: str = "all", fields: str = None):
-    selected = _parse_selected_fields(fields)
-    name = f"all_{_cn_now().strftime('%Y%m%d_%H%M%S')}"
-    if format == "csv":
-        return await _export_csv_streaming(name, batch_id=None, change_filter=change_filter, selected_fields=selected)
-    else:
-        return await _export_xlsx_streaming(name, batch_id=None, change_filter=change_filter, selected_fields=selected)
-
-
-@app.get("/api/export/{batch_name}")
-async def api_export_batch(batch_name: str, format: str = "xlsx", change_filter: str = "all", fields: str = None):
-    batch = await db.get_batch_by_name(batch_name)
-    if not batch:
-        raise HTTPException(404, f"批次不存在: {batch_name}")
-    selected = _parse_selected_fields(fields)
-    if format == "csv":
-        return await _export_csv_streaming(batch_name, batch_id=batch["id"], change_filter=change_filter, selected_fields=selected)
-    else:
-        return await _export_xlsx_streaming(batch_name, batch_id=batch["id"], change_filter=change_filter, selected_fields=selected)
-
-
-async def _export_xlsx_streaming(filename: str, batch_id: int = None,
-                                  change_filter: str = "all", selected_fields=None):
-    """write_only 模式 + 临时文件 + 流式响应（百万级不 OOM）。
-
-    P2：openpyxl 的行 append 与 wb.save() 是纯 CPU/序列化重活，若在事件循环里同步做，
-    会在导出期间卡住仪表盘轮询与 worker 拉取/上传。这里把所有 openpyxl 操作放到一条
-    专属工作线程（max_workers=1，保证 lxml/zip 有状态对象始终同线程），DB 迭代仍在事件
-    循环里 async 进行；run_in_executor 让出事件循环，save 的 lxml 序列化 + zlib 压缩会
-    释放 GIL，从而与仪表盘/worker 的请求处理真正并行。
-    """
-    import tempfile
-    from concurrent.futures import ThreadPoolExecutor
-    include_batch_status = batch_id is not None
-    headers, field_keys, include_total = _get_export_headers(
-        selected_fields, include_batch_status=include_batch_status)
-    needed_cols = _export_needed_columns(field_keys, include_total)
-
-    loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xlsx-export")
-    st = {"wb": None, "ws": None, "count": 0}
-
-    def _init():
-        wb = openpyxl.Workbook(write_only=True)
-        ws = wb.create_sheet(title="采集结果")
-        ws.append(headers)
-        st["wb"], st["ws"] = wb, ws
-
-    def _append(items):
-        ws = st["ws"]
-        for item in items:
-            ws.append(_prepare_row(
-                item, field_keys, headers, include_total,
-                include_batch_status=include_batch_status))
-        st["count"] += len(items)
-
-    def _close():
-        try:
-            st["wb"].close()
-        except Exception:
-            logger.debug("openpyxl workbook close 失败（忽略）", exc_info=True)
-
-    tmp_path = None
-    try:
-        await loop.run_in_executor(executor, _init)
-
-        buf = []
-        async for item in db.iter_results(batch_id, change_filter=change_filter, columns=needed_cols):
-            buf.append(item)
-            if len(buf) >= _EXPORT_ROWS_PER_CHUNK:
-                await loop.run_in_executor(executor, _append, buf)
-                buf = []
-        if buf:
-            await loop.run_in_executor(executor, _append, buf)
-
-        if st["count"] == 0:
-            await loop.run_in_executor(executor, _close)
-            raise HTTPException(404, "无数据")
-
-        os.makedirs(config.EXPORT_DIR, exist_ok=True)
-        tmp = tempfile.NamedTemporaryFile(
-            delete=False, suffix=".xlsx", prefix="export_",
-            dir=config.EXPORT_DIR)
-        tmp_path = tmp.name
-        tmp.close()
-        try:
-            await loop.run_in_executor(executor, st["wb"].save, tmp_path)
-        except Exception:
-            await loop.run_in_executor(executor, _close)
-            os.unlink(tmp_path)
-            raise
-        await loop.run_in_executor(executor, _close)
-    finally:
-        executor.shutdown(wait=False)
-
-    async def stream_and_cleanup():
-        try:
-            with open(tmp_path, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-        finally:
-            os.unlink(tmp_path)
-
-    safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', filename)
-    return StreamingResponse(
-        stream_and_cleanup(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={safe}.xlsx"},
-    )
-
-
-async def _export_csv_streaming(filename: str, batch_id: int = None,
-                                 change_filter: str = "all", selected_fields=None):
-    """分块流式 CSV（百万级不 OOM）。
-
-    P2：把每 _EXPORT_ROWS_PER_CHUNK 行的 _prepare_row + csv 格式化放到工作线程
-    （run_in_executor），避免行格式化的 CPU 工作占住事件循环；同时按块 yield 而非逐行，
-    减少 chunk 数量。DB 迭代仍在事件循环里 async 进行。
-    """
-    include_batch_status = batch_id is not None
-    headers, field_keys, include_total = _get_export_headers(
-        selected_fields, include_batch_status=include_batch_status)
-    needed_cols = _export_needed_columns(field_keys, include_total)
-
-    def _format_chunk(items):
-        out = io.StringIO()
-        w = csv.writer(out)
-        for item in items:
-            w.writerow(_prepare_row(
-                item, field_keys, headers, include_total,
-                include_batch_status=include_batch_status))
-        return out.getvalue().encode("utf-8")
-
-    async def generate():
-        loop = asyncio.get_running_loop()
-        out = io.StringIO()
-        csv.writer(out).writerow(headers)
-        yield out.getvalue().encode("utf-8-sig")
-
-        buf = []
-        async for item in db.iter_results(batch_id, change_filter=change_filter, columns=needed_cols):
-            buf.append(item)
-            if len(buf) >= _EXPORT_ROWS_PER_CHUNK:
-                yield await loop.run_in_executor(None, _format_chunk, buf)
-                buf = []
-        if buf:
-            yield await loop.run_in_executor(None, _format_chunk, buf)
-
-    safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', filename)
-    return StreamingResponse(
-        generate(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={safe}.csv"},
-    )
-
-
-@app.get("/api/export/{batch_name}/screenshots")
-async def api_export_screenshots(batch_name: str):
-    # 路径安全：batch_name 直接拼成磁盘目录，校验防穿越
-    if _safe_fs_component(batch_name) is None:
-        raise HTTPException(400, "非法批次名")
-    ss_dir = os.path.join(config.SCREENSHOT_DIR, batch_name)
-    if not os.path.isdir(ss_dir):
-        raise HTTPException(404, "无截图文件")
-
-    png_files = [
-        fname for fname in os.listdir(ss_dir)
-        if fname.lower().endswith(".png")
-        and os.path.isfile(os.path.join(ss_dir, fname))
-    ]
-    if not png_files:
-        raise HTTPException(404, "无截图文件")
-
-    # BytesIO 会让完整 ZIP 常驻进程内存；并发下载时按 ZIP 大小线性叠加。
-    # 落盘临时文件后按块发送，让常驻内存与截图批次大小脱钩。
-    import tempfile
-    os.makedirs(config.EXPORT_DIR, exist_ok=True)
-    tmp = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".zip", prefix="screenshots_",
-        dir=config.EXPORT_DIR,
-    )
-    tmp_path = tmp.name
-    tmp.close()
-
-    def build_zip():
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-            for fname in png_files:
-                zf.write(os.path.join(ss_dir, fname), fname)
-
-    try:
-        await asyncio.to_thread(build_zip)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-    async def stream_and_cleanup():
-        try:
-            with open(tmp_path, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-    filename = f"screenshots_{batch_name}.zip"
-    return StreamingResponse(
-        stream_and_cleanup(),
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
-    )
+app.include_router(_export_api.router)
 
 
 # ==================== API: 诊断 / 侦查 ====================
@@ -2072,162 +1511,6 @@ async def api_export_screenshots(batch_name: str):
 from server.api import debug as _debug_api  # noqa: E402
 
 app.include_router(_debug_api.router)
-
-
-@app.post("/api/results/delete-by-file")
-async def api_delete_by_file(file: UploadFile = File(...)):
-    """上传文件识别 ASIN 后删除对应数据"""
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"文件过大：{len(content)//1024//1024}MB，上限 {MAX_UPLOAD_BYTES//1024//1024}MB")
-    filename = file.filename or ""
-
-    asins = []
-    if filename.endswith(".xlsx"):
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
-        try:
-            ws = wb.active
-            for row in ws.iter_rows(min_row=1, values_only=True):
-                for cell in row:
-                    if cell:
-                        val = str(cell).strip().upper()
-                        if re.match(r'^B[0-9A-Z]{9}$', val):
-                            asins.append(val)
-        finally:
-            wb.close()
-    elif filename.endswith(".csv"):
-        text = content.decode("utf-8", errors="ignore")
-        reader = csv.reader(io.StringIO(text))
-        for row in reader:
-            for cell in row:
-                val = cell.strip().upper()
-                if re.match(r'^B[0-9A-Z]{9}$', val):
-                    asins.append(val)
-    else:
-        text = content.decode("utf-8", errors="ignore")
-        for line in text.splitlines():
-            val = line.strip().upper()
-            if re.match(r'^B[0-9A-Z]{9}$', val):
-                asins.append(val)
-
-    # 去重
-    asin_list = list(dict.fromkeys(asins))
-    if not asin_list:
-        raise HTTPException(400, "文件中未找到有效 ASIN")
-
-    CHUNK = 500
-    # 收集截图文件
-    screenshot_files = []
-    for i in range(0, len(asin_list), CHUNK):
-        chunk = asin_list[i:i+CHUNK]
-        placeholders = ",".join("?" * len(chunk))
-        async with db._db.execute(
-            f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", chunk
-        ) as c:
-            screenshot_files.extend(row["file_path"] for row in await c.fetchall())
-
-    # 分批删除
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            for i in range(0, len(asin_list), CHUNK):
-                chunk = asin_list[i:i+CHUNK]
-                placeholders = ",".join("?" * len(chunk))
-                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _rollback_quietly(db._db)
-            raise
-
-    _remove_screenshot_files(screenshot_files)
-    return {"ok": True, "deleted": len(asin_list), "asin_count": len(asin_list)}
-
-
-@app.delete("/api/results")
-async def api_delete_results(request: Request):
-    """按条件删除采集结果"""
-    body = await request.json()
-    batch_id = body.get("batch_id")
-    asins = body.get("asins")  # list of ASIN strings
-    search = body.get("search")  # fuzzy search string
-
-    # 构建 ASIN 列表
-    target_asins = set()
-    has_explicit_filter = bool(asins or search)
-
-    if asins:
-        # asins 列表也做上限保护，避免一次投递百万级 ASIN 触发巨量 SELECT
-        if len(asins) > 100000:
-            raise HTTPException(400, f"asins 列表过长（{len(asins)}），单次上限 100000")
-        target_asins.update(asins)
-
-    if search:
-        # 限长防 DoS：500 字符 / 10 关键词 / 单词 100 字符
-        search = str(search)[:500]
-        terms = [t.strip()[:100] for t in search.split(",") if t.strip()][:10]
-        if terms:
-            or_clauses = []
-            params = []
-            for term in terms:
-                or_clauses.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
-                params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
-            where = " OR ".join(or_clauses)
-            sql = f"SELECT d.asin FROM asin_data d WHERE {where}"
-            async with db._db.execute(sql, params) as c:
-                rows = await c.fetchall()
-                for row in rows:
-                    target_asins.add(row["asin"])
-
-    # 纯 batch_id（无 asins/search）→ 删除该批次所有 ASIN
-    if batch_id and not has_explicit_filter:
-        sql = "SELECT asin FROM batch_asins WHERE batch_id = ?"
-        async with db._db.execute(sql, (batch_id,)) as c:
-            target_asins = {row["asin"] for row in await c.fetchall()}
-    # batch_id + 其他条件 → 取交集
-    elif batch_id and target_asins:
-        sql = "SELECT asin FROM batch_asins WHERE batch_id = ?"
-        async with db._db.execute(sql, (batch_id,)) as c:
-            batch_asins = {row["asin"] for row in await c.fetchall()}
-        target_asins &= batch_asins
-
-    if not target_asins:
-        return {"ok": True, "deleted": 0}
-
-    asin_list = list(target_asins)
-    CHUNK = 500  # SQLite 变量数上限安全值
-
-    # 先收集截图物理文件路径
-    screenshot_files = []
-    for i in range(0, len(asin_list), CHUNK):
-        chunk = asin_list[i:i+CHUNK]
-        placeholders = ",".join("?" * len(chunk))
-        async with db._db.execute(
-            f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", chunk
-        ) as c:
-            screenshot_files.extend(row["file_path"] for row in await c.fetchall())
-
-    # 分批删除
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            for i in range(0, len(asin_list), CHUNK):
-                chunk = asin_list[i:i+CHUNK]
-                placeholders = ",".join("?" * len(chunk))
-                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _rollback_quietly(db._db)
-            raise
-
-    # 删除物理截图文件
-    _remove_screenshot_files(screenshot_files)
-    return {"ok": True, "deleted": len(asin_list)}
 
 
 # ==================== 定时采集管理 ====================

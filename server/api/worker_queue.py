@@ -1,0 +1,281 @@
+"""Worker 任务队列：拉取 / 释放 / 结果提交 / 截图（6 个端点）—— Phase 3.5 从
+`server/app.py` 拆出。
+
+    GET  /api/tasks/pull
+    POST /api/tasks/release
+    POST /api/tasks/result
+    POST /api/tasks/result/batch
+    POST /api/tasks/screenshot
+    POST /api/tasks/screenshot/fail
+
+------------------------------------------------------------------------
+承重约束
+------------------------------------------------------------------------
+
+1. **模块级可变全局一个都不搬。** `db` / `_worker_registry` /
+   `_completion_check_set` 全部留在 `server/app.py`，这里一律 `_srv().xxx`
+   属性访问，**禁止 from-import**。
+   `tests/golden/harness.py` 按名字给 `server.app` 打补丁（每个样本前
+   `srv._worker_registry.clear()` 等），三个 PG 夹具还
+   `monkeypatch.setattr(srv, "db", pgdb)` —— 名字搬走 = 补丁打空 = 样本漂移。
+
+2. **`_completion_check_set.add`（`api_submit_batch` 里那处）是全仓唯一的
+   HTTP 层写点**，其余读写都在 `app.py` 的 `_completion_watcher` 后台协程里。
+   它必须写成 `_srv()._completion_check_set.add(...)`：from-import 拿到的是
+   同一个 set 对象没错，但夹具会**整体替换**这个属性，快照下来的旧 set
+   之后没人读，完成通知静默失效。
+
+3. **`_register_worker` / `_rollback_quietly` / `_normalize_asin` /
+   `_safe_fs_component` 留在 `app.py`**（前两个直接读写全局，后两个另有
+   调用点），这里走 `_srv().xxx(...)`。
+
+4. `api_release_tasks` 的旧格式 `task_ids` 分支（裸 `db._write_lock` +
+   `db._db.execute`）**本步原文照搬，一个字不改**。它是不是该删是 X.1 的
+   独立决策，不在搬运这一步里顺手做 —— 搬运步只允许「位置变了、行为没变」
+   这一种 diff。
+
+5. **router 光秃**：`APIRouter()`，不带 `tags=` / `prefix=` /
+   `include_in_schema`。`/openapi.json` 是黄金基线的一步、逐字节钉死，
+   而整份 schema 里没有 `tags` 键。
+
+6. **函数名 / docstring / 路径一个字不改** —— 它们被编码进 `operationId` /
+   `summary` / `description` / `Body_*` schema 名。
+
+7. **路由匹配不受影响**：本节六条全是静态路径，`/api/tasks/` 下没有任何
+   `/api/tasks/{x}` catch-all（`/api/tasks/seller-result` 也是静态的，
+   它在 Phase 3.4 按域搬去了 `sellers.py`）。
+"""
+
+import os
+import re
+import time
+from datetime import datetime
+from typing import Optional
+
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+
+from common import config
+
+
+def _srv():
+    from server import app as _s
+    return _s
+
+
+router = APIRouter()
+
+
+# ==================== API: Worker 任务拉取和提交 ====================
+
+@router.get("/api/tasks/pull")
+async def api_pull_tasks(request: Request,
+                         worker_id: str = Query(...),
+                         count: int = Query(10),
+                         needs_screenshot: Optional[bool] = Query(None),
+                         enable_screenshot: Optional[bool] = Query(None),
+                         prefer_zip: Optional[str] = Query(None)):
+    _s = _srv()
+    ip = request.client.host if request.client else None
+    # enable_screenshot 来自 worker 的 query param，更新 registry
+    _s._register_worker(worker_id, enable_screenshot=enable_screenshot, ip=ip)
+
+    # ns=None: 不限制; ns=False: 只拉不需要截图的任务
+    # enable_screenshot 表示 worker 是否有截图能力：
+    #   True  → 拉所有任务 (ns=None)
+    #   False → 只拉不需要截图的 (ns=False)
+    ns = None
+    if needs_screenshot is not None:
+        ns = needs_screenshot
+    elif enable_screenshot is not None:
+        if not enable_screenshot:
+            ns = False
+        # enable_screenshot=True → ns=None (拉所有任务)
+    elif worker_id in _s._worker_registry:
+        if not _s._worker_registry[worker_id].get("enable_screenshot", True):
+            ns = False
+
+    # prefer_zip 校验（防注入）：只接受 5 位数字
+    pz = None
+    if prefer_zip and re.match(r'^\d{5}$', prefer_zip):
+        pz = prefer_zip
+
+    tasks = await _s.db.pull_tasks(worker_id, count, ns, prefer_zip=pz)
+    if worker_id in _s._worker_registry:
+        _s._worker_registry[worker_id]["tasks_pulled"] += len(tasks)
+    return {"tasks": tasks}
+
+
+@router.post("/api/tasks/release")
+async def api_release_tasks(request: Request):
+    _s = _srv()
+    db = _s.db
+    body = await request.json()
+    worker_id = body.get("worker_id", "")
+    tasks = body.get("tasks", [])
+    # 兼容旧格式 {"task_ids": [1,2,3]}（无 lease 校验，直接释放）
+    if not tasks and "task_ids" in body:
+        task_ids = body["task_ids"]
+        if task_ids:
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            placeholders = ",".join("?" * len(task_ids))
+            async with db._write_lock:
+                await db._db.execute("BEGIN")
+                try:
+                    cursor = await db._db.execute(
+                        f"UPDATE tasks SET status='pending', worker_id=NULL, "
+                        f"lease_epoch=lease_epoch+1, updated_at=? "
+                        f"WHERE id IN ({placeholders}) AND status='processing'",
+                        [now] + task_ids
+                    )
+                    await db._db.execute("COMMIT")
+                except BaseException:
+                    await _s._rollback_quietly(db._db)
+                    raise
+            return {"ok": True, "released": cursor.rowcount}
+        return {"ok": True, "released": 0}
+    released = await db.release_tasks(worker_id, tasks)
+    return {"ok": True, "released": released}
+
+
+@router.post("/api/tasks/result")
+async def api_submit_result(request: Request):
+    """提交单个结果（lease 校验 → 原子写入）"""
+    _s = _srv()
+    data = await request.json()
+    task_id = data.pop("task_id", None)
+    batch_id = data.pop("batch_id", None)
+    worker_id = data.get("worker_id", "")
+    lease_epoch = data.pop("lease_epoch", 0)
+
+    if task_id:
+        if data.get("success", True):
+            result = await _s.db.accept_success_result(task_id, worker_id, lease_epoch, data, batch_id)
+        else:
+            result = await _s.db.accept_failed_result(
+                task_id, worker_id, lease_epoch,
+                data.get("error_type", ""), data.get("error_detail", ""))
+        if worker_id in _s._worker_registry and result.get("accepted"):
+            _s._worker_registry[worker_id]["results_submitted"] += 1
+        return {"ok": result.get("accepted", False), "stale": result.get("stale", False)}
+    else:
+        # 无 task_id 的直接写入（兼容）
+        saved = await _s.db.save_result(data, batch_id)
+        return {"ok": saved, "stale": False}
+
+
+@router.post("/api/tasks/result/batch")
+async def api_submit_batch(request: Request):
+    """批量提交结果（单事务，减少锁争用）"""
+    _s = _srv()
+    body = await request.json()
+    results = body.get("results", [])
+
+    # 构建 batch items
+    batch_items = []
+    worker_id_set = set()
+    for item in results:
+        task_id = item.pop("task_id", None)
+        batch_id = item.pop("batch_id", None)
+        worker_id = item.get("worker_id", "")
+        lease_epoch = item.pop("lease_epoch", 0)
+        is_success = item.pop("success", True)
+        worker_id_set.add(worker_id)
+        batch_items.append({
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "lease_epoch": lease_epoch,
+            "batch_id": batch_id,
+            "data": item,
+            "success": is_success,
+        })
+
+    result = await _s.db.accept_results_batch(batch_items)
+
+    # results_submitted 只计 accepted
+    for wid in worker_id_set:
+        if wid in _s._worker_registry and result["accepted"] > 0:
+            _s._worker_registry[wid]["results_submitted"] += result["accepted"]
+
+    # 防御性入队：本次写入涉及的 batch_id 标记为"需要检查是否完成"。
+    # set.add 是 O(1) 内存操作，不会影响 worker 提交响应。
+    # 任何异常都吞掉只 log，绝不让通知机制污染采集主路径。
+    try:
+        touched = {item["batch_id"] for item in batch_items if item.get("batch_id")}
+        for bid in touched:
+            _s._completion_check_set.add(bid)
+    except Exception as e:
+        _s.logger.warning(f"完成检测入队异常（不影响采集）: {e}")
+
+    return {**result, "total": len(results)}
+
+
+# POST /api/tasks/seller-result 已搬到 server/api/sellers.py（Phase 3.4）——
+# 它按域属于 F-009，不属于本节；路径是静态的，本节六条也全是静态路径，
+# 没有 /api/tasks/{x} catch-all，换模块不改路由匹配。
+
+
+@router.post("/api/tasks/screenshot")
+async def api_upload_screenshot(request: Request,
+                                asin: str = Form(...),
+                                batch_name: str = Form(...),
+                                worker_id: str = Form(""),
+                                file: UploadFile = File(...)):
+    """接收截图上传（检查 worker 存活状态）"""
+    _s = _srv()
+    # 拒绝已死 worker 的截图上传
+    if worker_id and worker_id not in _s._worker_registry:
+        raise HTTPException(409, f"Worker {worker_id} 已离线，截图被丢弃")
+    if worker_id and worker_id in _s._worker_registry:
+        if time.time() - _s._worker_registry[worker_id]["last_seen"] > 120:
+            raise HTTPException(409, f"Worker {worker_id} 心跳超时，截图被丢弃")
+
+    # 路径安全：asin / batch_name 会直接拼成磁盘路径，必须校验防穿越
+    asin = _s._normalize_asin(asin)
+    if not asin:
+        raise HTTPException(400, "非法 ASIN")
+    if _s._safe_fs_component(batch_name) is None:
+        raise HTTPException(400, "非法批次名")
+
+    batch = await _s.db.get_batch_by_name(batch_name)
+    if not batch:
+        raise HTTPException(400, f"批次不存在: {batch_name}")
+
+    batch_id = batch["id"]
+    save_dir = os.path.join(config.SCREENSHOT_DIR, batch_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    filename = f"{asin}.png"
+    filepath = os.path.join(save_dir, filename)
+    content = await file.read()
+    # 单张截图上限 10MB，防止恶意/损坏文件耗尽磁盘
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(413, f"截图过大：{len(content)//1024//1024}MB，上限 10MB")
+    with open(filepath, "wb") as f:
+        f.write(content)
+
+    rel_path = f"/static/screenshots/{batch_name}/{filename}"
+    updated = await _s.db.update_screenshot_status(asin, batch_id, "done", file_path=rel_path)
+    if not updated:
+        try:
+            os.remove(filepath)
+        except OSError:
+            pass
+        raise HTTPException(409, f"截图状态不存在: {asin}@{batch_name}")
+    return {"ok": True, "path": rel_path}
+
+
+@router.post("/api/tasks/screenshot/fail")
+async def api_screenshot_fail(request: Request):
+    """截图渲染失败上报（触发重试或标记永久失败）"""
+    _s = _srv()
+    body = await request.json()
+    asin = body.get("asin", "")
+    batch_name = body.get("batch_name", "")
+    error = body.get("error", "unknown")
+    batch = await _s.db.get_batch_by_name(batch_name)
+    if not batch:
+        raise HTTPException(400, f"批次不存在: {batch_name}")
+    updated = await _s.db.update_screenshot_status(asin, batch["id"], "failed", error=error)
+    if not updated:
+        raise HTTPException(409, f"截图状态不存在: {asin}@{batch_name}")
+    return {"ok": True}

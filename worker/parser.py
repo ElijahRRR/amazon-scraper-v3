@@ -198,6 +198,59 @@ def _slx_iter_subtree(node):
     yield from _slx_iter_descendants(node)
 
 
+# ── 叶子文本：``<br>`` 必须产生换行 ──────────────────────────────────────────
+# 两个引擎原本各自用「把子树里的文本首尾相接」取叶子文本
+# （selectolax ``node.text(deep=True)`` / lxml ``"".join(node.xpath('.//text()'))``），
+# 而 ``<br>`` 自身不含文本，于是它两侧的文字被直接粘在一起。真机记录实测（B09TT9X92Q
+# 的 A+ 描述）四处：
+#     fight corrosion.<br>The durable   -> "fight corrosion.The durable"
+#     lightweight alloy<br>that does    -> "lightweight alloythat does"
+#     a push<br>and pull mechanism      -> "a pushand pull mechanism"
+#     Vintage Pull<br>Drawer Dresser    -> "Vintage PullDrawer Dresser"
+#
+# 影响不止可读性：``long_description ∈ SLOW_HASH_FIELDS``，而 slowhash 会折叠空白
+# —— 粘住的词折不开，等于把两个词永久变成一个新词喂进哈希与导出。
+#
+# 两个引擎各一份实现、语义必须一致：解析器被重写成引擎无关之后，两条路径分叉过
+# 一次（四个字段在 lxml 路径上结转旧值），所以这里配了对等性用例
+# （tests/test_long_description.py::BrSeparatorParity）。
+def _slx_leaf_text(node) -> str:
+    """selectolax：叶子节点的全部文本，``<br>`` 记作 ``\n``。"""
+    out = []
+
+    def walk(n):
+        for c in n.iter(include_text=True):
+            tag = c.tag
+            if tag == "br":
+                out.append("\n")
+            elif tag == "-text":
+                out.append(c.text(deep=False) or "")
+            else:
+                walk(c)
+
+    walk(node)
+    return "".join(out)
+
+
+def _lxml_leaf_text(node) -> str:
+    """lxml：同上。``<br>`` 的文字挂在它的 ``tail`` 上，所以 tail 必须收。"""
+    out = []
+
+    def walk(el, is_root):
+        tag = el.tag if isinstance(el.tag, str) else ""
+        if tag == "br":
+            out.append("\n")
+        elif el.text:
+            out.append(el.text)
+        for child in el:
+            walk(child, False)
+        if not is_root and el.tail:
+            out.append(el.tail)
+
+    walk(node, True)
+    return "".join(out)
+
+
 class AmazonParser:
     """Amazon 商品页面解析器"""
 
@@ -853,10 +906,10 @@ class AmazonParser:
                         has_text_descendant = any(c.tag in _TEXT_TAGS
                                                   for c in _slx_iter_descendants(node))
                         if not has_text_descendant:
-                            # 与 lxml 版 "".join(node.xpath('.//text()')).strip() 对齐：
-                            # 整体 strip，而不是 strip=True 的逐个文本节点 strip
-                            # （后者会把 "Hello <b>world</b> again" 拼成 "Helloworldagain"）。
-                            text = (node.text(deep=True) or "").strip()
+                            # 与 lxml 版 _lxml_leaf_text 对齐：整体 strip，而不是
+                            # 逐个文本节点 strip（后者会把 "Hello <b>world</b> again"
+                            # 拼成 "Helloworldagain"）。<br> 记作换行，见 _slx_leaf_text。
+                            text = _slx_leaf_text(node).strip()
                             if text and len(text) > 5:
                                 parts.append(text)
 
@@ -2379,7 +2432,7 @@ class AmazonParser:
                     elif tag in _TEXT_TAGS:
                         children_with_text = [c for c in node.iter() if (isinstance(c.tag, str) and c.tag in _TEXT_TAGS and c is not node)]
                         if not children_with_text:
-                            text = "".join(node.xpath('.//text()')).strip()
+                            text = _lxml_leaf_text(node).strip()
                             if text and len(text) > 5:
                                 parts.append(text)
 

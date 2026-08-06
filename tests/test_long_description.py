@@ -316,3 +316,78 @@ class LxmlLongDescriptionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(_HAS_SLX and _HAS_LXML, "selectolax 或 lxml 未安装")
+class BrSeparatorParity(unittest.TestCase):
+    """``<br>`` 必须产生换行，两个引擎口径一致。
+
+    这条是真机第一条真实记录（B09TT9X92Q 的 A+ 描述）逼出来的。两个引擎原本各自用
+    「把子树里的文本首尾相接」取叶子文本，而 ``<br>`` 自身不含文本，于是它两侧的
+    文字被直接粘住。实测四处：
+
+        fight corrosion.<br>The durable   -> "fight corrosion.The durable"
+        lightweight alloy<br>that does    -> "lightweight alloythat does"
+        a push<br>and pull mechanism      -> "a pushand pull mechanism"
+        Vintage Pull<br>Drawer Dresser    -> "Vintage PullDrawer Dresser"
+
+    不只是难看：``long_description ∈ SLOW_HASH_FIELDS``，而 slowhash 会折叠空白 ——
+    粘住的词折不开，等于把两个词永久变成一个新词喂进哈希和导出。
+
+    为什么必须验**对等性**而不只验 selectolax：解析器被重写成引擎无关之后，两条
+    路径分叉过一次（四个字段在 lxml 路径上结转旧值）。只修生产引擎、回退引擎照旧
+    粘着，就等于在无人看守的那条分支上留了个不一样的答案。
+    """
+
+    def setUp(self):
+        self.p = AmazonParser()
+
+    def _both(self, html):
+        return (self.p._slx_parse_long_description(_Slx(html), html),
+                self.p._parse_long_description(_lxml_html.fromstring(html), html))
+
+    def test_br_becomes_a_line_break_not_glue(self):
+        html = ('<html><body><div class="aplus"><p>'
+                'fight corrosion.<br>The durable alloy gives you a trouble-free run.'
+                '</p></div></body></html>')
+        slx, lxm = self._both(html)
+        self.assertEqual(slx, lxm, "两个引擎对 <br> 的处理必须一致")
+        self.assertNotIn("corrosion.The", slx, "<br> 两侧的词被粘住了")
+        self.assertIn("corrosion.", slx)
+        self.assertIn("The durable alloy", slx)
+
+    def test_self_closing_br_too(self):
+        html = ('<html><body><div class="aplus"><p>'
+                'Vintage Pull<br/>Drawer Dresser Pulls Handles Square'
+                '</p></div></body></html>')
+        slx, lxm = self._both(html)
+        self.assertEqual(slx, lxm)
+        self.assertNotIn("PullDrawer", slx)
+
+    def test_multiple_br_in_one_leaf(self):
+        html = ('<html><body><div class="aplus"><p>'
+                'alpha bravo<br>charlie delta<br>echo foxtrot golf'
+                '</p></div></body></html>')
+        slx, lxm = self._both(html)
+        self.assertEqual(slx, lxm)
+        for glued in ("bravocharlie", "deltaecho"):
+            self.assertNotIn(glued, slx)
+
+    def test_br_next_to_inline_markup(self):
+        """``<br>`` 与 ``<b>`` 混排：既不能粘，也不能把行内标记切开。"""
+        html = ('<html><body><div class="aplus"><p>'
+                'Designed for <b>creators</b><br>and <i>gamers</i> alike, truly.'
+                '</p></div></body></html>')
+        slx, lxm = self._both(html)
+        self.assertEqual(slx, lxm)
+        self.assertIn("Designed for creators", slx, "行内标记两侧的空格丢了")
+        self.assertNotIn("creatorsand", slx)
+
+    def test_no_br_output_is_unchanged(self):
+        """没有 <br> 的页面必须逐字不变 —— 这次改动的爆炸半径就该只有 <br>。"""
+        html = ('<html><body><div id="productDescription">'
+                '<p>Designed for <b>creators</b> and <i>gamers</i> alike.</p>'
+                '</div></body></html>')
+        slx, lxm = self._both(html)
+        self.assertEqual(slx, lxm)
+        self.assertEqual(slx, "Designed for creators and gamers alike.")

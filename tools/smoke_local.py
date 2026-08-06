@@ -160,7 +160,10 @@ def stage_submit(http: Http, batch_name: str, zip_code: str):
                            title=f"Smoke Widget {i}", brand="SmokeBrand",
                            category_tree="Home > Tools > Wrenches",
                            image_urls="https://m.media-amazon.com/images/I/A1smoke.jpg",
-                           bullet_points="第一点|第二点",
+                           # parser 用换行拼接 bullet_points，这里必须照抄真实形态。
+                           # 曾经写成 "第一点|第二点" —— 夹具自己编了个分隔符，
+                           # 于是导出成一个元素还全绿，正是它掩盖了真实的分隔符 bug。
+                           bullet_points="第一点\n第二点",
                            long_description="一段正常的长描述。",
                            current_price="19.99", stock_status="In Stock",
                            stock_count="7", rating="4.5", review_count="128",
@@ -293,6 +296,17 @@ def stage_export(http: Http):
     check(isinstance(r0.get("scrape_params"), dict)
           and "zipcode" in r0["scrape_params"],
           "scrape_params.zipcode 在（契约键名是 zipcode，不是 zip_code）")
+
+    # 多值字段必须切开。整块塞进单个元素是这条链路真实发生过的坏法：
+    # 导出适配器的分隔符和 parser 的拼接方式对不上，六条图片 URL 变成一个元素。
+    multi = next((r for r in records
+                  if len(r.get("slow", {}).get("bullet_points") or []) or
+                     len(r.get("slow", {}).get("images") or [])), None)
+    if multi:
+        for f in ("images", "bullet_points"):
+            vals = multi["slow"].get(f) or []
+            check(not any("\n" in v for v in vals),
+                  f"slow.{f} 的元素里不含换行（含了就是整块没切开）")
 
     outcomes = sorted({r.get("outcome") for r in records if r.get("outcome")})
     check(any(o != "ok" for o in outcomes), f"非 ok 的采集也进了流（outcome 取值：{outcomes}）")

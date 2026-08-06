@@ -57,6 +57,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 
+from common.slowhash import split_multivalue
 from server.api import sync as _sync
 
 logger = logging.getLogger(__name__)
@@ -107,9 +108,24 @@ def _clean(v: Any) -> Optional[str]:
     return None if s.lower() in _NA else s
 
 
-def _split_list(v: Any, sep: str = ",") -> List[str]:
+def _split_list(field: str, v: Any) -> List[str]:
+    """多值字段 -> 列表。分隔符**只能**来自 common/slowhash 的那张表。
+
+    这里曾经自带一份分隔符（images 按 ','、bullet_points 按 '|'），而 parser 的
+    四条路径（selectolax/lxml × images/bullets）全是 ``"\n".join(...)``。真机第一条
+    真实记录就把它照出来了：``slow.images`` 是一个长度为 1 的列表，里面塞着 6 条
+    换行拼起来的 URL；``slow.bullet_points`` 同理。两个都是契约字段。
+
+    逗号那份还不只是"切不开"：老式 Amazon 图片 URL 的变换参数里**含逗号**
+    （``._AC_,0,0_.jpg``），真按逗号切会把一条 URL 打成碎片 —— 比不切更坏。
+
+    ``_clean`` 这道前置不能省：它比 slowhash 的 ``SENTINELS`` 宽 —— 大小写不敏感，
+    而且认 ``none`` / ``null`` / ``-``。哈希那侧的哨兵是**全等匹配**（有意的，
+    见 ``normalize_text`` 的 docstring），直接透传会让 ``"n/a"`` 变成一个真元素。
+    本次只该改分隔符，不该顺手改哨兵语义。
+    """
     s = _clean(v)
-    return [] if s is None else [p.strip() for p in s.split(sep) if p.strip()]
+    return [] if s is None else split_multivalue(field, s)
 
 
 def _price(v: Any) -> Optional[float]:
@@ -252,9 +268,9 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
             "title": _clean(payload.get("title")),
             "brand": _clean(payload.get("brand")),
             "category_path": _category_path(payload),
-            "images": _split_list(payload.get("image_urls")),
+            "images": _split_list("image_urls", payload.get("image_urls")),
             # ---- 契约可选，采集侧有就给 ----
-            "bullet_points": _split_list(payload.get("bullet_points"), sep="|"),
+            "bullet_points": _split_list("bullet_points", payload.get("bullet_points")),
             "description": _clean(payload.get("long_description")),
             "weight": {
                 "package": _clean(payload.get("package_weight")),

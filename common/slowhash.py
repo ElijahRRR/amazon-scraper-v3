@@ -65,6 +65,7 @@ __all__ = [
     "canonical_object",
     "normalize_text",
     "extract_image_ids",
+    "split_multivalue",
     "parse_variant_attributes",
 ]
 
@@ -165,6 +166,9 @@ _SPLIT_PATTERNS = {
     # （如 ``._AC_,0,0_.jpg``），按逗号切会把一条 URL 打成碎片混进哈希。
     "image_ids": re.compile(r"\n+"),
 }
+# ``image_urls`` 是 ``image_ids`` 的原始列名。导出适配器按列名切分，
+# 哈希按字段名切分，两者必须落到**同一个** pattern 上。
+_SPLIT_PATTERNS["image_urls"] = _SPLIT_PATTERNS["image_ids"]
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -223,6 +227,33 @@ def _dedupe_preserving_order(values: Sequence[str]) -> List[str]:
             seen.add(v)
             out.append(v)
     return out
+
+
+def split_multivalue(field: str, value: Any) -> List[str]:
+    """按该字段的分隔符切分，**只 strip、不做哈希归一化**。
+
+    给导出适配器用。不能让它直接调 ``_split``：那条路会 ``normalize_text``，
+    而归一化包含 **casefold** —— 图片 URL 里的 Amazon 图片 ID 是大小写敏感的
+    （``61VjrZZw2GL``），casefold 之后就不是同一张图了。
+
+    存在的理由是**单一事实源**：导出侧曾经自己维护了一份分隔符（images 按 ','、
+    bullet_points 按 '|'），而 parser 四条路径全是 ``"\n".join(...)``，于是整块
+    字符串变成列表里的单个元素，``slow.images`` / ``slow.bullet_points`` 两个
+    契约字段一起坏掉。逗号那份还更危险：老式 Amazon 图片 URL 的变换参数里含
+    逗号（``._AC_,0,0_.jpg``），按逗号切会把一条 URL 打成碎片。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value]
+    else:
+        if not isinstance(value, str):
+            value = str(value)
+        if value in SENTINELS or value.strip() in SENTINELS:
+            return []
+        pattern = _SPLIT_PATTERNS.get(field)
+        parts = pattern.split(value) if pattern is not None else [value]
+    return [p.strip() for p in parts if p and p.strip() and p.strip() not in SENTINELS]
 
 
 def _split(field: str, value: Any) -> List[str]:

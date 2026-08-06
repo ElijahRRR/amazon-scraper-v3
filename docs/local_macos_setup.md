@@ -142,45 +142,36 @@ DB_BACKEND=postgres .venv/bin/python run_server.py
 首次启动会建 schema、表、索引、分区。**看日志确认没有 DDL 报错。**
 然后开 http://localhost:8899 ——仪表盘、任务、结果、Worker、设置五个页面。
 
-### 冒烟（不需要真 worker，用 HTTP 模拟）
+### 冒烟（不需要真 worker，不需要代理）
+
+**另开一个终端**（第一个跑着服务），把环境变量重设一遍再跑：
 
 ```bash
-# 1) 事件流健康
-curl -s localhost:8899/api/_debug/event-stream | python3 -m json.tool
-#    relay_state 应为 running，outbox_depth 不应单调增长
+cd ~/你的路径/amazon-scraper-v3
+export DB_BACKEND=postgres
+export EXPORT_TOKEN=<和起服务那个终端里同一个值>
 
-# 2) 上传一个小批次
-printf 'B0CXXXXXX1\nB0CXXXXXX2\n' > /tmp/asins.txt
-curl -s -F "file=@/tmp/asins.txt" -F "batch_name=smoke" -F "zip_code=10001" \
-     localhost:8899/api/upload | python3 -m json.tool
-
-# 3) 模拟 worker 拉任务
-curl -s "localhost:8899/api/tasks/pull?worker_id=w1&count=10" | python3 -m json.tool
-
-# 4) 用上一步返回的 id / lease_epoch / batch_id 提交一条结果
-curl -s -X POST localhost:8899/api/tasks/result \
-  -H 'Content-Type: application/json' \
-  -d '{"task_id":1,"batch_id":1,"worker_id":"w1","lease_epoch":0,"success":true,
-       "asin":"B0CXXXXXX1","title":"Smoke Test","brand":"SmokeBrand",
-       "category_tree":"Home > Tools","current_price":"9.99",
-       "stock_status":"In Stock","stock_count":"3",
-       "crawl_time":"2026-08-06T10:00:00Z","site":"US","zip_code":"10001"}'
-
-# 5) 看结果进没进去
-curl -s "localhost:8899/api/results?limit=5" | python3 -m json.tool
-
-# 6) 等一两秒让 relay 抽干，然后验增量导出（这是新东西）
-curl -s -H "X-Export-Token: $EXPORT_TOKEN" \
-     "localhost:8899/api/export/incremental?cursor=0&limit=10" | python3 -m json.tool
+.venv/bin/python tools/smoke_local.py
 ```
 
-第 6 步要看的：
+它把上传 → 拉任务 → 提交结果 → 查结果 → 增量导出整条串起来，逐条断言，
+跑完自己删掉测试批次（想留着人工翻加 `--keep`）。
 
-- `records[0].source_id` 有值、`cursor` 是正整数
-- `scraped_at` 形如 `2026-08-06T10:00:00Z`（**带 Z、精确到秒**）
-- `slow` / `fast` 两个对象都在，`marketplace` 是 `"US"`
-- 再打一次同样的 `cursor=0`，结果应**完全一致**（重复返回无害）
-- 拿 `next_cursor` 再打一次，应返回空页 + **200**（不是 404）且 `next_cursor` 不推进
+手工 curl 也能做完这些，但要来回拷 `task_id` / `batch_id` / `lease_epoch`，
+而**契约里最容易坏的几条恰恰是手工最难验的**：
+
+| 检查项 | 坏了会怎样 |
+|---|---|
+| 空页返回 **200** 且 `next_cursor` 不推进 | 坏成 404 会被消费方读成「暂无数据」，游标永不推进、同步静默停摆，两侧都不报错 |
+| 同一个 `cursor` 重复拉结果完全一致 | 契约允许重复投递，消费侧靠 `source_id` 去重；不一致就没法幂等 |
+| `source_id` 全局唯一、`cursor` 严格升序 | 断点续传和去重都压在这两条上 |
+| 404/下架标成 `outcome='not_found'` | 归进 `parse_failed` 的话，消费侧分不出「商品下架」和「解析坏了」 |
+| `not_found` 记录不带慢变字段 | 带了就会 upsert 进 `catalog.products`，一次假 404 永久损坏一条目录记录 |
+| 终态失败进流 | 重试用尽才叫「产品没了」；中途重试不进流是**有意的**，否则一个 ASIN 刷三条噪声 |
+
+`SERVER_PORT` 不是 8899 就加 `--base-url http://127.0.0.1:<端口>`。
+
+> `DB_BACKEND=sqlite` 也能跑，增量导出那一段会跳过并给警告（SQLite 后端没有事件流）。
 
 ---
 

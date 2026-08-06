@@ -32,10 +32,13 @@
    两侧都不会报错。
    `tests/test_incremental_export.py::test_route_order_is_load_bearing` 钉死它。
 
-2. **鉴权：`X-Export-Token` 请求头。** 服务器是公网 IP。
-   未配置 `EXPORT_TOKEN` 时**拒绝服务**（503），不是放行 —— fail closed。
-   比对用 `hmac.compare_digest`。**只加在本 router 上，不加全局中间件**：
-   本服务今天一处鉴权都没有，全局中间件会当场打死所有 worker 与 erpAPI。
+2. **鉴权：`X-Export-Token` 请求头，契约 v1 定为可选。**
+   配了 `EXPORT_TOKEN` 就强制校验（`hmac.compare_digest`，不匹配即 401）；
+   没配则放行并打 WARNING，要 fail closed 设 `EXPORT_REQUIRE_TOKEN=1`。
+   完整理由见 `_check_token` 的 docstring —— 那里记着为什么最初的 fail-closed
+   实现被改掉了（契约是权威）。
+   **只加在本 router 上，不加全局中间件**：本服务今天一处鉴权都没有，
+   全局中间件会当场打死所有 worker 与 erpAPI。
 
 3. **永不用 404 表达「没有数据」。** 空就是 `200 + records: [] + has_more: false`。
    这与同前缀下 `/api/export/{batch_name}` 的既有行为**故意相反**，理由见第 1 条。

@@ -164,23 +164,28 @@ class ResultsReadMixin:
             count_join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
             join_params.append(as_int(batch_id))
 
-        # 变动筛选 - 通过 asin_changes JOIN（JOIN params 在 WHERE params 之前绑定）
-        if change_filter == "price_stock":
-            sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'price_stock'"
+        # 变动筛选 —— 由 `JOIN (SELECT DISTINCT asin FROM asin_changes ...)`
+        # 改写成 EXISTS 半连接。
+        #
+        # 等价性：子查询里的 DISTINCT 保证每个 asin 至多匹配一行，所以那个 JOIN
+        # 本来就不放大行数，与 EXISTS 的半连接语义逐行相同（ac 的列一个都没投影出去）。
+        #
+        # ⚠ 参数绑定顺序变了：谓词从 join_parts 挪进 where_parts，绑定参数就必须
+        #   同步从 join_params 挪进 where_params —— 因为下面是
+        #   `params = join_params + where_params`。这里在 search 之前追加，
+        #   与 SQL 文本里 WHERE 子句的先后顺序一致。
+        # ⚠ D-8：谓词文本里**绝不能出现 "d.id"**。下面 count 查询的
+        #   `[p for p in where_parts if "d.id" not in p]` 是刻意保留的缺陷复现
+        #   （只该剔掉 keyset 谓词和 FTS 快路径谓词）；这里写的是 `ac.asin = d.asin`，
+        #   不含 "d.id"，所以不会被误剔、count 的参数个数照旧对得上。
+        if change_filter in ("price_stock", "title_bullets"):
+            # change_filter 的取值被上面这个成员判断限死在两个字面量上，不是外部拼接
+            pred = ("EXISTS (SELECT 1 FROM asin_changes ac "
+                    f"WHERE ac.asin = d.asin AND ac.change_type = '{change_filter}'")
             if batch_id:
-                sub += " AND batch_id = ?"
-                join_params.append(as_int(batch_id))
-            sub += ") ac ON ac.asin = d.asin"
-            join_parts.append(sub)
-            count_join_parts.append(sub)
-        elif change_filter == "title_bullets":
-            sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'title_bullets'"
-            if batch_id:
-                sub += " AND batch_id = ?"
-                join_params.append(as_int(batch_id))
-            sub += ") ac ON ac.asin = d.asin"
-            join_parts.append(sub)
-            count_join_parts.append(sub)
+                pred += " AND ac.batch_id = ?"
+                where_params.append(as_int(batch_id))
+            where_parts.append(pred + ")")
         elif change_filter == "new":
             if batch_id:
                 sub = "JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1"
@@ -188,9 +193,9 @@ class ResultsReadMixin:
                 join_parts.append(sub)
                 count_join_parts.append(sub)
             else:
-                sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'new') ac ON ac.asin = d.asin"
-                join_parts.append(sub)
-                count_join_parts.append(sub)
+                where_parts.append(
+                    "EXISTS (SELECT 1 FROM asin_changes ac "
+                    "WHERE ac.asin = d.asin AND ac.change_type = 'new')")
 
         # 搜索（支持逗号分隔的批量搜索）—— 限长防 DoS
         # PG 侧没有 FTS5：两条分支产生**同一个**扁平 OR 谓词（实测 SQLite 的
@@ -347,18 +352,17 @@ class ResultsReadMixin:
                     where = ["ba.batch_id = ?", "ba.asin > ?"]
                     where_params: list = [as_int(batch_id), cursor]
 
-                    if change_filter == "price_stock":
-                        joins.append(
-                            "JOIN (SELECT DISTINCT asin FROM asin_changes "
-                            "WHERE change_type='price_stock' AND batch_id=?) ac ON ac.asin = ba.asin"
-                        )
-                        join_params.append(as_int(batch_id))
-                    elif change_filter == "title_bullets":
-                        joins.append(
-                            "JOIN (SELECT DISTINCT asin FROM asin_changes "
-                            "WHERE change_type='title_bullets' AND batch_id=?) ac ON ac.asin = ba.asin"
-                        )
-                        join_params.append(as_int(batch_id))
+                    # 同 get_results：JOIN (SELECT DISTINCT ...) 改 EXISTS 半连接。
+                    # ⚠ 这一处的驱动表是 **batch_asins (ba)**，不是 asin_data —— 原
+                    #   join 条件写的就是 `ac.asin = ba.asin`，EXISTS 里必须照抄 ba.asin。
+                    # ⚠ 参数从 join_params 挪到 where_params：`params = join_params +
+                    #   where_params + [batch_size]`，而 where 里这一条排在
+                    #   ba.batch_id / ba.asin 之后，追加顺序因此天然对齐。
+                    if change_filter in ("price_stock", "title_bullets"):
+                        where.append(
+                            "EXISTS (SELECT 1 FROM asin_changes ac WHERE ac.asin = ba.asin "
+                            f"AND ac.change_type='{change_filter}' AND ac.batch_id=?)")
+                        where_params.append(as_int(batch_id))
                     elif change_filter == "new":
                         where.append("ba.is_new = 1")
 
@@ -405,15 +409,11 @@ class ResultsReadMixin:
                 where = ["d.id > ?"]
                 where_params = [cursor]
 
-                if change_filter == "price_stock":
-                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes "
-                                 "WHERE change_type='price_stock') ac ON ac.asin = d.asin")
-                elif change_filter == "title_bullets":
-                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes "
-                                 "WHERE change_type='title_bullets') ac ON ac.asin = d.asin")
-                elif change_filter == "new":
-                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes "
-                                 "WHERE change_type='new') ac ON ac.asin = d.asin")
+                # 同上，改 EXISTS 半连接。这三条都不带参数，绑定顺序不受影响。
+                if change_filter in ("price_stock", "title_bullets", "new"):
+                    where.append(
+                        "EXISTS (SELECT 1 FROM asin_changes ac WHERE ac.asin = d.asin "
+                        f"AND ac.change_type='{change_filter}')")
 
                 join_clause = " ".join(joins)
                 where_clause = " AND ".join(where)

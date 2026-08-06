@@ -544,6 +544,9 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_changes_asin ON asin_changes(asin);
             CREATE INDEX IF NOT EXISTS idx_changes_type ON asin_changes(change_type);
             CREATE INDEX IF NOT EXISTS idx_changes_batch_type ON asin_changes(batch_id, change_type);
+            -- change_filter 的 EXISTS 半连接（change_type + asin 双等值）的支撑索引。
+            -- 与 PG 侧 common/pgdb/schema.py 的 idx_changes_type_asin 一一对应（C4）。
+            CREATE INDEX IF NOT EXISTS idx_changes_type_asin ON asin_changes(change_type, asin);
 
             -- 采集任务表
             CREATE TABLE IF NOT EXISTS tasks (
@@ -572,6 +575,11 @@ class Database:
             -- 覆盖索引：让 get_batches 的「按 batch 分组 + 统计各 status」走 index-only，
             -- 不再为 113 万行逐行回表读 status（仪表盘 /api/batches 每几秒轮询一次）。
             CREATE INDEX IF NOT EXISTS idx_tasks_batch_status ON tasks(batch_id, status);
+            -- pull_tasks 拆分后的两条候选查询各自的有序输出都由它提供。
+            -- 与 PG 侧 common/pgdb/schema.py 的 idx_tasks_pull 一一对应（C4），
+            -- 但**不写 NULLS FIRST 修饰符**：SQLite 的 ASC 默认就是 NULLS FIRST，
+            -- 而 PG 的 ASC 默认是 NULLS LAST 所以那边必须显式写。
+            CREATE INDEX IF NOT EXISTS idx_tasks_pull ON tasks(status, priority, zip_code, id);
 
             -- 截图任务表（独立追踪，可靠重试）
             CREATE TABLE IF NOT EXISTS screenshots (
@@ -588,6 +596,13 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_screenshots_status ON screenshots(status);
             CREATE INDEX IF NOT EXISTS idx_screenshots_batch ON screenshots(batch_id);
+            -- _get_done_screenshot_paths 的第二次 load() 不带 batch 过滤，
+            -- 而这张表上原本没有以 asin 打头的索引。SQLite 侧本来能靠
+            -- UNIQUE(batch_id,asin) 的跳跃扫描凑合，但跳跃扫描依赖
+            -- sqlite_stat1（见本文件 PRAGMA analysis_limit + 启动期 ANALYZE）；
+            -- 加了这条就不再依赖统计信息。与 PG 侧
+            -- common/pgdb/schema.py 的 idx_screenshots_asin_done 一一对应（C4）。
+            CREATE INDEX IF NOT EXISTS idx_screenshots_asin_done ON screenshots(asin) WHERE status = 'done';
 
             -- 卖家店铺发现结果表（F-009：seller storefront 模式）
             -- 每行 = 某 batch 在某 seller 店内发现的一个 ASIN
@@ -1182,28 +1197,55 @@ class Database:
                 # 排序策略：
                 #   1. prefer_zip 匹配优先（同 zip 任务先派发，节省 session 切换）
                 #   2. 同 zip 内按 id 升序（FIFO，先入先出）
-                if prefer_zip:
-                    order_clause = ("ORDER BY CASE WHEN t.zip_code = ? THEN 0 ELSE 1 END, "
-                                    "t.zip_code, t.id ASC")
-                    extra_params = [prefer_zip]
-                else:
-                    # 无偏好时按 zip_code 分组，同 zip 仍尽量连续派发
-                    order_clause = "ORDER BY t.zip_code, t.id ASC"
-                    extra_params = []
-
-                async with self._db.execute(
+                #
+                # prefer_zip 非空时拆成两条查询，等价性论证见
+                # common/pgdb/tasks.py 的同名注释（组 0 内 zip 恒定 → 只按 id；
+                # zip IS NULL 落 ELSE 分支 → 归组 1）。
+                # ⚠ 两处 C4 不对称，与 PG 侧**有意**不同：
+                #   (a) `IS DISTINCT FROM` 要 SQLite ≥3.39，这里写等价的
+                #       `t.zip_code IS NOT ?`（IS/IS NOT 在 SQLite 里就是 null-safe 比较）；
+                #   (b) SQLite 没有 FOR UPDATE / SKIP LOCKED，PG 侧那两句这里不存在。
+                # 另外 SQLite 的 ASC 默认就是 NULLS FIRST，不写修饰符（写了要 ≥3.30）。
+                base_sql = (
                     f"""SELECT t.id, t.batch_id, t.asin, t.zip_code, t.retry_count,
                                t.priority, t.needs_screenshot, t.lease_epoch,
                                t.task_type, t.task_meta,
                                b.name as batch_name, b.discover_mode
                         FROM tasks t
                         JOIN batches b ON b.id = t.batch_id
-                        WHERE t.status = 'pending' AND t.priority = ?{ss_filter}
-                        {order_clause}
-                        LIMIT ?""",
-                    (top_priority, *ss_params, *extra_params, count)
-                ) as cursor:
-                    rows = await cursor.fetchall()
+                        WHERE t.status = 'pending' AND t.priority = ?{ss_filter}"""
+                )
+
+                async def _candidates(zip_pred, zip_params, order_clause, limit):
+                    # limit <= 0 -> 空表，两个作用：
+                    # (1) Q2 的 limit 是 count - len(Q1)，Q1 填满配额时它就是 0；
+                    # (2) **顺带改掉了一处既有行为**，本轮显式声明：
+                    #     端点 server/app.py 的 `count: int = Query(10)` 没有下界，
+                    #     GET /api/tasks/pull?count=-1 可达。改动前两个后端在这里
+                    #     不一致（违反 C4）：SQLite 的 LIMIT -1 等于不限，会把整个
+                    #     pending 队列派给一个 worker 并全部置 processing；PG 抛
+                    #     InvalidRowCountInLimitClauseError（HTTP 500）。
+                    #     两种都不该留，现在统一返回 0 行。
+                    if limit <= 0:
+                        return []
+                    async with self._db.execute(
+                        f"{base_sql}{zip_pred}\n                        {order_clause}\n"
+                        f"                        LIMIT ?",
+                        (top_priority, *ss_params, *zip_params, limit)
+                    ) as cursor:
+                        return list(await cursor.fetchall())
+
+                want = int(count)
+                if prefer_zip:
+                    rows = await _candidates(" AND t.zip_code = ?", [prefer_zip],
+                                             "ORDER BY t.id ASC", want)
+                    if len(rows) < want:
+                        rows += await _candidates(
+                            " AND t.zip_code IS NOT ?", [prefer_zip],
+                            "ORDER BY t.zip_code, t.id ASC", want - len(rows))
+                else:
+                    # 无偏好时按 zip_code 分组，同 zip 仍尽量连续派发
+                    rows = await _candidates("", [], "ORDER BY t.zip_code, t.id ASC", want)
 
                 if not rows:
                     await self._db.execute("COMMIT")
@@ -2139,23 +2181,18 @@ class Database:
             count_join_parts.append("JOIN batch_asins ba ON ba.asin = d.asin AND ba.batch_id = ?")
             join_params.append(batch_id)
 
-        # 变动筛选 - 通过 asin_changes JOIN（JOIN params 在 WHERE params 之前绑定）
-        if change_filter == "price_stock":
-            sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'price_stock'"
+        # 变动筛选 —— 由 `JOIN (SELECT DISTINCT asin FROM asin_changes ...)`
+        # 改写成 EXISTS 半连接。等价性与两条注意事项见 common/pgdb/results_read.py
+        # 的同名注释（DISTINCT 本就不放大行数；参数随谓词从 join_params 挪进
+        # where_params；谓词文本不含 "d.id" 所以不会被 D-8 的 count 过滤误剔）。
+        if change_filter in ("price_stock", "title_bullets"):
+            # change_filter 的取值被上面这个成员判断限死在两个字面量上，不是外部拼接
+            pred = ("EXISTS (SELECT 1 FROM asin_changes ac "
+                    f"WHERE ac.asin = d.asin AND ac.change_type = '{change_filter}'")
             if batch_id:
-                sub += " AND batch_id = ?"
-                join_params.append(batch_id)
-            sub += ") ac ON ac.asin = d.asin"
-            join_parts.append(sub)
-            count_join_parts.append(sub)
-        elif change_filter == "title_bullets":
-            sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'title_bullets'"
-            if batch_id:
-                sub += " AND batch_id = ?"
-                join_params.append(batch_id)
-            sub += ") ac ON ac.asin = d.asin"
-            join_parts.append(sub)
-            count_join_parts.append(sub)
+                pred += " AND ac.batch_id = ?"
+                where_params.append(batch_id)
+            where_parts.append(pred + ")")
         elif change_filter == "new":
             if batch_id:
                 sub = "JOIN batch_asins ba2 ON ba2.asin = d.asin AND ba2.batch_id = ? AND ba2.is_new = 1"
@@ -2163,9 +2200,9 @@ class Database:
                 join_parts.append(sub)
                 count_join_parts.append(sub)
             else:
-                sub = "JOIN (SELECT DISTINCT asin FROM asin_changes WHERE change_type = 'new') ac ON ac.asin = d.asin"
-                join_parts.append(sub)
-                count_join_parts.append(sub)
+                where_parts.append(
+                    "EXISTS (SELECT 1 FROM asin_changes ac "
+                    "WHERE ac.asin = d.asin AND ac.change_type = 'new')")
 
         # 搜索（支持逗号分隔的批量搜索）—— 限长防 DoS
         # FTS5 trigram 优化路径：对每个 term × 每列做 UNION 子查询，rowid 命中再 JOIN 回主表
@@ -2376,18 +2413,17 @@ class Database:
                     where = ["ba.batch_id = ?", "ba.asin > ?"]
                     where_params: list = [batch_id, cursor]
 
-                    if change_filter == "price_stock":
-                        joins.append(
-                            "JOIN (SELECT DISTINCT asin FROM asin_changes "
-                            "WHERE change_type='price_stock' AND batch_id=?) ac ON ac.asin = ba.asin"
-                        )
-                        join_params.append(batch_id)
-                    elif change_filter == "title_bullets":
-                        joins.append(
-                            "JOIN (SELECT DISTINCT asin FROM asin_changes "
-                            "WHERE change_type='title_bullets' AND batch_id=?) ac ON ac.asin = ba.asin"
-                        )
-                        join_params.append(batch_id)
+                    # 同 get_results：改 EXISTS 半连接。
+                    # ⚠ 这一处的驱动表是 **batch_asins (ba)**，不是 asin_data —— 原
+                    #   join 条件写的就是 `ac.asin = ba.asin`，EXISTS 里必须照抄 ba.asin。
+                    # ⚠ 参数从 join_params 挪到 where_params：`params = join_params +
+                    #   where_params + [batch_size]`，这一条排在 ba.batch_id / ba.asin
+                    #   之后追加，与 SQL 文本顺序天然对齐。
+                    if change_filter in ("price_stock", "title_bullets"):
+                        where.append(
+                            "EXISTS (SELECT 1 FROM asin_changes ac WHERE ac.asin = ba.asin "
+                            f"AND ac.change_type='{change_filter}' AND ac.batch_id=?)")
+                        where_params.append(batch_id)
                     elif change_filter == "new":
                         where.append("ba.is_new = 1")
 
@@ -2434,15 +2470,11 @@ class Database:
                 where = ["d.id > ?"]
                 where_params = [cursor]
 
-                if change_filter == "price_stock":
-                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes "
-                                 "WHERE change_type='price_stock') ac ON ac.asin = d.asin")
-                elif change_filter == "title_bullets":
-                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes "
-                                 "WHERE change_type='title_bullets') ac ON ac.asin = d.asin")
-                elif change_filter == "new":
-                    joins.append("JOIN (SELECT DISTINCT asin FROM asin_changes "
-                                 "WHERE change_type='new') ac ON ac.asin = d.asin")
+                # 同上，改 EXISTS 半连接。这三条都不带参数，绑定顺序不受影响。
+                if change_filter in ("price_stock", "title_bullets", "new"):
+                    where.append(
+                        "EXISTS (SELECT 1 FROM asin_changes ac WHERE ac.asin = d.asin "
+                        f"AND ac.change_type='{change_filter}')")
 
                 join_clause = " ".join(joins)
                 where_clause = " AND ".join(where)

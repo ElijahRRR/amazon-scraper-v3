@@ -74,6 +74,19 @@ CHANGE_ROWS = [
     ("B0GOLDEN02", 1, "price_stock", "stock", "0", "5", "2026-01-01 00:13:00"),
     ("B0GOLDEN03", 2, "price_stock", "price", "1", "2", "2026-01-01 00:14:00"),
     ("b0lower04", None, "new", "first_seen", None, None, "2026-01-01 00:15:00"),
+    # ⚠ 这一行是**判别行**，不是凑数的。B0MISSING99 在 batch_asins 里有、在
+    # asin_data 里没有（见 BATCH_ASIN_ROWS 的 (1,"B0MISSING99",0)），所以它是
+    # 批次导出那条 `batch_asins ba LEFT JOIN asin_data d` 的 NULL 侧。
+    #
+    # 批次导出的 change_filter 谓词写 `ac.asin = ba.asin`（正确）还是
+    # `ac.asin = d.asin`（错误）**只在这种行上分岔** —— d.asin 为 NULL 时
+    # 后者恒不成立，这一行会被静默丢掉。审计实测：
+    #     ba.asin 写法 -> ['B0GOLDEN01','B0GOLDEN02','B0MISSING99']
+    #     d.asin  写法 -> ['B0GOLDEN01','B0GOLDEN02']            少一行
+    #
+    # 补这一行之前，把 ba.asin 改成 d.asin 跑完整 tests/pgdb 是 **415 passed**
+    # —— 那处改写完全没有回归网，只由评审保着。
+    ("B0MISSING99", 1, "price_stock", "price", "1", "2", "2026-01-01 00:16:00"),
 ]
 
 SHOT_ROWS = [

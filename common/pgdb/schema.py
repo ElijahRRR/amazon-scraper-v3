@@ -252,6 +252,10 @@ DDL_INDEXES: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_changes_asin ON asin_changes(asin)",
     "CREATE INDEX IF NOT EXISTS idx_changes_type ON asin_changes(change_type)",
     "CREATE INDEX IF NOT EXISTS idx_changes_batch_type ON asin_changes(batch_id, change_type)",
+    # change_filter 的 EXISTS 半连接（`ac.change_type = ? AND ac.asin = ?`）的支撑索引。
+    # 只加索引不改写只能从 736ms 降到 678ms，两件事必须一起做：
+    # 原来的 JOIN (SELECT DISTINCT asin ...) 会先把整个 change_type 桶物化去重。
+    "CREATE INDEX IF NOT EXISTS idx_changes_type_asin ON asin_changes(change_type, asin)",
 
     "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
     "CREATE INDEX IF NOT EXISTS idx_tasks_batch ON tasks(batch_id)",
@@ -260,9 +264,22 @@ DDL_INDEXES: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at)",
     # 覆盖索引：让 get_batches 的分组统计走 index-only
     "CREATE INDEX IF NOT EXISTS idx_tasks_batch_status ON tasks(batch_id, status)",
+    # pull_tasks 拆分后的两条候选查询各自的有序输出都由它提供，
+    # 顺带让 `SELECT MAX(priority) ... WHERE status='pending'` 走反向 index-only。
+    # ⚠ NULLS FIRST 必须显式写：PG 的 ASC 默认 NULLS LAST，而 SQLite 的 ASC 是
+    #   NULLS FIRST（common/database.py 的同名索引因此不写修饰符）。写错了
+    #   索引顺序与 ORDER BY 对不上，规划器会退回排序 —— tasks.py:57-58 已经踩过一次。
+    "CREATE INDEX IF NOT EXISTS idx_tasks_pull "
+    "ON tasks(status, priority, zip_code NULLS FIRST, id)",
 
     "CREATE INDEX IF NOT EXISTS idx_screenshots_status ON screenshots(status)",
     "CREATE INDEX IF NOT EXISTS idx_screenshots_batch ON screenshots(batch_id)",
+    # media.py:_get_done_screenshot_paths 的第二次 load() 不带 batch 过滤，
+    # 而 screenshots 上原本没有任何以 asin 打头的索引（只有 UNIQUE(batch_id,asin)，
+    # PG 16 无 skip scan）→ 每次 /api/results/{asin} 都吃一次全表扫。
+    # 部分索引：status='done' 是该查询的固定谓词，索引只收这一部分。
+    "CREATE INDEX IF NOT EXISTS idx_screenshots_asin_done "
+    "ON screenshots(asin) WHERE status = 'done'",
 
     "CREATE INDEX IF NOT EXISTS idx_seller_disc_seller ON seller_discoveries(seller_id)",
     "CREATE INDEX IF NOT EXISTS idx_seller_disc_asin ON seller_discoveries(asin)",

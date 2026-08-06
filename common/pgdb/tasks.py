@@ -252,31 +252,68 @@ class TasksMixin:
                 #   1. prefer_zip 匹配优先（同 zip 任务先派发，节省 session 切换）
                 #   2. 同 zip 内按 id 升序（FIFO，先入先出）
                 # zip_code 可空 → 显式 NULLS FIRST，才等于 SQLite 的 ASC 排序
-                if prefer_zip:
-                    order_clause = ("ORDER BY CASE WHEN t.zip_code = ? THEN 0 ELSE 1 END, "
-                                    "t.zip_code ASC NULLS FIRST, t.id ASC")
-                    extra_params = [self.text_affinity(prefer_zip)]
-                else:
-                    # 无偏好时按 zip_code 分组，同 zip 仍尽量连续派发
-                    order_clause = "ORDER BY t.zip_code ASC NULLS FIRST, t.id ASC"
-                    extra_params = []
-
-                # FOR UPDATE OF t SKIP LOCKED：只锁 tasks，不锁 join 进来的 batches。
-                # 单写连接下是 no-op；多进程部署时它是唯一挡住"同一任务双发"的东西。
-                async with self._db.execute(
+                #
+                # prefer_zip 非空时**拆成两条查询**，等价于原先那条
+                #   ORDER BY CASE WHEN t.zip_code = ? THEN 0 ELSE 1 END,
+                #            t.zip_code ASC NULLS FIRST, t.id ASC
+                # 论证：
+                #   组 0 = zip_code = prefer_zip。组内 zip 恒定，故次级键 zip 无作用，
+                #          排序退化成 t.id ASC。
+                #   组 1 = 其余全部，**包含 zip_code IS NULL**（CASE WHEN NULL = 'x'
+                #          结果是 NULL，不为真，落 ELSE 1），正好被 IS DISTINCT FROM 收走。
+                #   组 0 恒排在组 1 之前，所以「先从组 0 取满 count，不够再从组 1 补」
+                #   与「合起来排序后取前 count」逐行同序。
+                # 收益：拆开后两条都能直接吃 idx_tasks_pull 的有序输出，
+                # 不必把整个 priority 桶取出来重排（实测原查询 external merge 落盘）。
+                base_sql = (
                     f"""SELECT t.id, t.batch_id, t.asin, t.zip_code, t.retry_count,
                                t.priority, t.needs_screenshot, t.lease_epoch,
                                t.task_type, t.task_meta,
                                b.name as batch_name, b.discover_mode
                         FROM tasks t
                         JOIN batches b ON b.id = t.batch_id
-                        WHERE t.status = 'pending' AND t.priority = ?{ss_filter}
-                        {order_clause}
-                        LIMIT ?
-                        FOR UPDATE OF t SKIP LOCKED""",
-                    (top_priority, *ss_params, *extra_params, int(count))
-                ) as cursor:
-                    rows = await cursor.fetchall()
+                        WHERE t.status = 'pending' AND t.priority = ?{ss_filter}"""
+                )
+
+                # FOR UPDATE OF t SKIP LOCKED：只锁 tasks，不锁 join 进来的 batches。
+                # 单写连接下是 no-op；多进程部署时它是唯一挡住"同一任务双发"的东西。
+                # ⚠ C4：这一段是 PG 专有的，SQLite 侧（common/database.py）没有
+                #    FOR UPDATE / SKIP LOCKED，也没有 IS DISTINCT FROM（要 ≥3.39），
+                #    那边写 `t.zip_code IS NOT ?`。
+                async def _candidates(zip_pred, zip_params, order_clause, limit):
+                    # limit <= 0 -> 空表，两个作用：
+                    # (1) Q2 的 limit 是 count - len(Q1)，Q1 填满配额时它就是 0；
+                    # (2) **顺带改掉了一处既有行为**，本轮显式声明：
+                    #     端点 server/app.py 的 `count: int = Query(10)` 没有下界，
+                    #     GET /api/tasks/pull?count=-1 可达。改动前两个后端在这里
+                    #     不一致（违反 C4）：SQLite 的 LIMIT -1 等于不限，会把整个
+                    #     pending 队列派给一个 worker 并全部置 processing；PG 抛
+                    #     InvalidRowCountInLimitClauseError（HTTP 500）。
+                    #     两种都不该留，现在统一返回 0 行。
+                    if limit <= 0:
+                        return []
+                    async with self._db.execute(
+                        f"{base_sql}{zip_pred}\n                        {order_clause}\n"
+                        f"                        LIMIT ?\n"
+                        f"                        FOR UPDATE OF t SKIP LOCKED",
+                        (top_priority, *ss_params, *zip_params, int(limit))
+                    ) as cursor:
+                        return list(await cursor.fetchall())
+
+                want = int(count)
+                if prefer_zip:
+                    pz = self.text_affinity(prefer_zip)
+                    rows = await _candidates(" AND t.zip_code = ?", [pz],
+                                             "ORDER BY t.id ASC", want)
+                    if len(rows) < want:
+                        rows += await _candidates(
+                            " AND t.zip_code IS DISTINCT FROM ?", [pz],
+                            "ORDER BY t.zip_code ASC NULLS FIRST, t.id ASC",
+                            want - len(rows))
+                else:
+                    # 无偏好时按 zip_code 分组，同 zip 仍尽量连续派发
+                    rows = await _candidates(
+                        "", [], "ORDER BY t.zip_code ASC NULLS FIRST, t.id ASC", want)
 
                 if not rows:
                     await self._db.execute("COMMIT")

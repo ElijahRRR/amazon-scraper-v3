@@ -283,7 +283,9 @@ LIKE_NO_ESCAPE = " ESCAPE ''"
 # SQLite 独有、无法机械翻译的整条语句 -> PG 等价语句序列。
 # key 是"压平空白后转小写"的语句文本。
 _STATEMENT_OVERRIDES: Dict[str, List[str]] = {
-    # server/app.py:2654，DELETE /api/database 的收尾。
+    # server/api/debug.py:148 `api_clear_database`，DELETE /api/database 的收尾。
+    # （Phase 3.2 之前它在 server/app.py 里；键按"压平空白后转小写"匹配，
+    #   改 SQL 文本一个字符就静默失配 —— identity 不重启，响应仍是 {"ok": true}。）
     # SQLite 里删掉 sqlite_sequence 行 = 下一个 id 回到 1；PG 要显式重启 identity。
     # 只重启 SQLite 那 5 张有 AUTOINCREMENT 的表（batch_asins / seller_discoveries
     # 是复合主键，没有序列）。响应体仍然只是 {"ok": true}。

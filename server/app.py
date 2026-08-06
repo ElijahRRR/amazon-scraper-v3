@@ -21,9 +21,8 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request, UploadFile, File, Form, Query, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 import openpyxl
 
 from common import config
@@ -245,7 +244,6 @@ async def lifespan(app):
 
 app = FastAPI(title="Amazon Scraper v3", version="3.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
-templates = Jinja2Templates(directory=config.TEMPLATE_DIR)
 
 
 # ==================== 全局 500：结构化 JSON + 可关联的 request_id ====================
@@ -342,20 +340,6 @@ app.include_router(_sync_api.router)
 # tests/test_incremental_export.py::test_route_order_is_load_bearing 钉死它。
 app.include_router(_export_incr_api.router)
 
-
-def _cst_filter(value):
-    """Jinja 过滤器 `| cst`：把 UTC 时间字符串转中国时间（Asia/Shanghai, UTC+8）显示。
-    服务器存 UTC（系统时区 Etc/UTC），前端统一显示中国时间。"""
-    if not value:
-        return ""
-    try:
-        dt = datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
-        return (dt + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        return value
-
-
-templates.env.filters["cst"] = _cst_filter
 
 # 中国时间（UTC+8）：用于批次名/导出文件名/定时任务调度判定，与前端展示口径一致。
 # 注意：数据库里存储的 created_at/updated_at 仍是 UTC（系统时区 Etc/UTC），由前端 +8 显示。
@@ -828,53 +812,14 @@ def _allocate_quotas():
 
 
 # ==================== HTML 页面 ====================
+#
+# 5 个页面搬到 server/api/pages.py（Phase 3.1）。router 光秃 —— 不带 tags/prefix，
+# 因为 /openapi.json 是黄金基线的一步、逐字节钉死，加 tags 会让 51 个 path 一起飘红。
+# `templates` 与 `| cst` 过滤器一并搬走（全仓只有那 5 个 handler 用）；
+# `app.mount("/static", ...)` 是 app 级挂载不是路由，留在上面原地。
+from server.api import pages as _pages_api  # noqa: E402
 
-@app.get("/", response_class=HTMLResponse)
-async def page_dashboard(request: Request):
-    progress = await db.get_progress()
-    total = progress["done"] + progress["failed"]
-    progress["completion_rate"] = round(progress["done"] / progress["total"] * 100, 1) if progress["total"] else 0
-    progress["success_rate"] = round(progress["done"] / total * 100, 1) if total else 0
-    batches = await db.get_batches()
-    return templates.TemplateResponse(request=request, name="dashboard.html", context={
-        "request": request,
-        "progress": progress,
-        "batches": batches,
-        "active_workers": len([w for w in _worker_registry.values() if time.time() - w["last_seen"] < 60]),
-    })
-
-
-@app.get("/tasks", response_class=HTMLResponse)
-async def page_tasks(request: Request):
-    batches = await db.get_batches()
-    return templates.TemplateResponse(request=request, name="tasks.html", context={
-        "request": request,
-        "batches": batches,
-        "default_zip_code": _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE),
-    })
-
-
-@app.get("/results", response_class=HTMLResponse)
-async def page_results(request: Request):
-    return templates.TemplateResponse(request=request, name="results.html", context={"request": request})
-
-
-@app.get("/workers", response_class=HTMLResponse)
-async def page_workers(request: Request):
-    return templates.TemplateResponse(request=request, name="workers.html", context={"request": request})
-
-
-@app.get("/settings", response_class=HTMLResponse)
-async def page_settings(request: Request):
-    return templates.TemplateResponse(request=request, name="settings.html", context={
-        "request": request,
-        "settings": _runtime_settings,
-        "config": {
-            "port": config.SERVER_PORT,
-            "timeout": config.REQUEST_TIMEOUT,
-            "db_path": config.DB_PATH,
-        },
-    })
+app.include_router(_pages_api.router)
 
 
 # ==================== API: 批次和任务 ====================
@@ -1150,135 +1095,20 @@ async def api_upload(request: Request,
 
 
 # ==================== F-009: 卖家店铺采集 ====================
+#
+# 4 个端点搬到 server/api/sellers.py（Phase 3.4）：upload-sellers、
+# seller-batches/{id}/progress、seller-batches/{id}/discoveries，
+# 外加 POST /api/tasks/seller-result —— 它原本待在下面的「Worker 任务拉取和
+# 提交」节里，节头骗人，按域它属于 F-009，所以一起搬走。
+#
+# ⚠ 归域是逐端点判定的：紧跟本节头的 @app.get("/api/batches") 往下 300+ 行
+#   是被挤下来的批次 / worker / 设置端点，**不属于**卖家采集，留在原地。
+#
+# 这一族黄金 78 步一步都没覆盖（upload-sellers 的响应含逐次不同的批次名，
+# 补不进基线），替代网是 tests/test_seller_api.py，两个后端都跑。
+from server.api import sellers as _sellers_api  # noqa: E402
 
-# Amazon 三方卖家 ID 通常是 13-14 位 A 开头的字母数字串（如 A2L77EE7U53NWQ）。
-# 同时支持从 URL 中提取 me=... / seller=... 参数。
-_SELLER_URL_RE = re.compile(r'(?:[?&](?:me|seller)=)([A-Z0-9]{10,16})', re.IGNORECASE)
-_BARE_SELLER_RE = re.compile(r'^A[A-Z0-9]{12,14}$')
-
-
-def _extract_sellers_from_text(text: str) -> List[str]:
-    """从一段文本中提取所有 seller_id（去重，保持出现顺序）。
-
-    支持 3 种形式：
-      1. 完整 URL: https://www.amazon.com/s?me=A2L77EE7U53NWQ
-      2. URL 片段: ?me=A2L77... 或 ?seller=A2L77...
-      3. 裸 ID: A2L77EE7U53NWQ
-    """
-    seen = set()
-    out = []
-    for line in text.splitlines():
-        candidates = []
-        for m in _SELLER_URL_RE.finditer(line):
-            candidates.append(m.group(1).upper())
-        for tok in re.split(r'[\s,;\t]+', line):
-            tok = tok.strip().upper()
-            if _BARE_SELLER_RE.match(tok):
-                candidates.append(tok)
-        for sid in candidates:
-            if sid not in seen:
-                seen.add(sid)
-                out.append(sid)
-    return out
-
-
-@app.post("/api/upload-sellers")
-async def api_upload_sellers(request: Request,
-                              file: UploadFile = File(...),
-                              batch_name: str = Form(None),
-                              discover_mode: str = Form("with_detail"),
-                              zip_code: str = Form(None),
-                              needs_screenshot: bool = Form(False)):
-    """上传卖家 ID/URL 文件，创建一个 seller_discovery 批次。
-
-    discover_mode:
-      - 'discover_only': 仅翻页发现 ASIN，写入 seller_discoveries 表
-      - 'with_detail':   发现后自动衍生 ASIN 详情任务进入主采集队列
-    """
-    if discover_mode not in ("discover_only", "with_detail"):
-        raise HTTPException(400, f"非法 discover_mode: {discover_mode}")
-
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(413, f"文件过大：{len(content)//1024//1024}MB，上限 {MAX_UPLOAD_BYTES//1024//1024}MB")
-    filename = (file.filename or "").lower()
-
-    seller_ids: List[str] = []
-    if filename.endswith(".xlsx"):
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
-        try:
-            ws = wb.active
-            buf = []
-            for row in ws.iter_rows(min_row=1, values_only=True):
-                for cell in row:
-                    if cell:
-                        buf.append(str(cell))
-            seller_ids = _extract_sellers_from_text("\n".join(buf))
-        finally:
-            wb.close()
-    elif filename.endswith(".csv"):
-        text = content.decode("utf-8", errors="ignore")
-        seller_ids = _extract_sellers_from_text(text)
-    else:
-        text = content.decode("utf-8", errors="ignore")
-        seller_ids = _extract_sellers_from_text(text)
-
-    if not seller_ids:
-        raise HTTPException(400, "未识别到任何 seller ID（支持裸 ID、含 me=/seller= 的 URL）")
-
-    if not batch_name:
-        batch_name = f"sellers_{_cn_now().strftime('%Y%m%d_%H%M%S')}"
-
-    zc = zip_code or _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
-    batch_id, inserted = await db.create_seller_batch(
-        name=batch_name,
-        seller_ids=seller_ids,
-        discover_mode=discover_mode,
-        zip_code=zc,
-        needs_screenshot=needs_screenshot,
-    )
-    if not batch_id:
-        raise HTTPException(500, "创建卖家批次失败")
-
-    return {
-        "batch_id": batch_id,
-        "batch_name": batch_name,
-        "discover_mode": discover_mode,
-        "total_sellers": len(seller_ids),
-        "inserted_tasks": inserted,
-    }
-
-
-@app.get("/api/seller-batches/{batch_id}/progress")
-async def api_seller_batch_progress(batch_id: int):
-    """seller_discovery 批次专属进度端点：discover + detail + 已发现 ASIN 数。"""
-    return await db.get_seller_batch_progress(batch_id)
-
-
-@app.get("/api/seller-batches/{batch_id}/discoveries")
-async def api_seller_discoveries(batch_id: int,
-                                  seller_id: Optional[str] = None,
-                                  limit: int = 200,
-                                  offset: int = 0):
-    """列出某批次发现的 ASIN（可按 seller_id 过滤）。"""
-    limit = max(1, min(limit, 1000))
-    offset = max(0, offset)
-    where = ["batch_id = ?"]
-    params: List[Any] = [batch_id]
-    if seller_id:
-        where.append("seller_id = ?")
-        params.append(seller_id.strip().upper())
-    sql = (
-        "SELECT seller_id, asin, list_title, list_price, list_image, discovered_at "
-        f"FROM seller_discoveries WHERE {' AND '.join(where)} "
-        "ORDER BY discovered_at DESC, asin ASC LIMIT ? OFFSET ?"
-    )
-    params.extend([limit, offset])
-    rows = []
-    async with db.read() as rc, rc.execute(sql, params) as c:
-        async for r in c:
-            rows.append(dict(r))
-    return {"items": rows, "limit": limit, "offset": offset}
+app.include_router(_sellers_api.router)
 
 
 @app.get("/api/batches")
@@ -1579,42 +1409,16 @@ async def api_batch_failures(
     return {"batch_id": batch_id, "failed_tasks": failed_tasks, "count": len(failed_tasks)}
 
 
-@app.get("/api/coordinator")
-async def api_coordinator():
-    """全局并发协调器状态"""
-    max_conc = _runtime_settings.get("global_max_concurrency", config.GLOBAL_MAX_CONCURRENCY)
-    max_qps = _runtime_settings.get("global_max_qps", config.GLOBAL_MAX_QPS)
-    allocated_conc = sum(info.get("quota", {}).get("max_concurrency", 0)
-                        for info in _global_coordinator.values())
-    allocated_qps = sum(info.get("quota", {}).get("max_qps", 0)
-                        for info in _global_coordinator.values())
-    return {
-        "max_concurrency": max_conc,
-        "allocated_concurrency": allocated_conc,
-        "max_qps": max_qps,
-        "allocated_qps": allocated_qps,
-        "active_workers": len(_global_coordinator),
-        "global_block_until": 0,
-        "global_block_count": 0,
-    }
+# ==================== API: Worker 机群（注册表 / 心跳 / 配额）====================
+#
+# 6 个端点搬到 server/api/fleet.py（Phase 3.3）：coordinator、清离线、restart、
+# worker/sync、workers、delete worker。router 光秃，不带 tags/prefix。
+# _register_worker / _allocate_quotas 仍留在本文件（它们直接读写下面那几个模块级
+# 全局，而黄金夹具按名字给 server.app 打补丁），fleet.py 走 _srv() 调它们。
+# 路径全无遮蔽：/api/workers 是静态的，与 /api/workers/{worker_id} 不互吃。
+from server.api import fleet as _fleet_api  # noqa: E402
 
-
-@app.delete("/api/workers")
-async def api_delete_all_offline():
-    """清除所有离线 worker"""
-    cutoff = time.time() - 60
-    offline = [wid for wid, w in _worker_registry.items() if w["last_seen"] < cutoff]
-    for wid in offline:
-        del _worker_registry[wid]
-        _global_coordinator.pop(wid, None)
-    return {"ok": True, "removed": len(offline)}
-
-
-@app.post("/api/workers/{worker_id}/restart")
-async def api_restart_worker(worker_id: str):
-    """标记 worker 软重启（下次 sync 时生效）"""
-    _worker_restart_flags[worker_id] = True
-    return {"ok": True, "message": f"重启指令已下发，{worker_id} 将在 30 秒内重启"}
+app.include_router(_fleet_api.router)
 
 
 @app.post("/api/settings/reset")
@@ -1766,36 +1570,9 @@ async def api_submit_batch(request: Request):
     return {**result, "total": len(results)}
 
 
-@app.post("/api/tasks/seller-result")
-async def api_submit_seller_result(request: Request):
-    """接收 worker 的 discover_seller 任务结果（F-009）。
-
-    Payload: {task_id, batch_id, worker_id, lease_epoch, seller_id, items, meta}
-    """
-    body = await request.json()
-    task_id = body.get("task_id")
-    batch_id = body.get("batch_id")
-    worker_id = body.get("worker_id", "")
-    lease_epoch = body.get("lease_epoch", 0)
-    seller_id = (body.get("seller_id") or "").strip().upper()
-    items = body.get("items") or []
-    meta = body.get("meta") or {}
-
-    if not task_id or not seller_id:
-        raise HTTPException(400, "task_id 和 seller_id 必填")
-
-    result = await db.accept_seller_discovery_result(
-        task_id=task_id,
-        worker_id=worker_id,
-        lease_epoch=lease_epoch,
-        batch_id=batch_id,
-        seller_id=seller_id,
-        items=items,
-        meta=meta,
-    )
-    if worker_id in _worker_registry and result.get("accepted"):
-        _worker_registry[worker_id]["results_submitted"] += 1
-    return result
+# POST /api/tasks/seller-result 已搬到 server/api/sellers.py（Phase 3.4）——
+# 它按域属于 F-009，不属于本节；路径是静态的，本节六条也全是静态路径，
+# 没有 /api/tasks/{x} catch-all，换模块不改路由匹配。
 
 
 @app.post("/api/tasks/screenshot")
@@ -1864,69 +1641,8 @@ async def api_screenshot_fail(request: Request):
 
 
 # ==================== API: Worker 同步 ====================
-
-@app.post("/api/worker/sync")
-async def api_worker_sync(request: Request):
-    """Worker 心跳 + 指标上报 + 设置/配额下发"""
-    body = await request.json()
-    worker_id = body.get("worker_id", "")
-    ip = request.client.host if request.client else None
-
-    _register_worker(worker_id, body.get("enable_screenshot"), ip)
-
-    # 更新指标
-    metrics = body.get("metrics", {})
-    if worker_id not in _global_coordinator:
-        _global_coordinator[worker_id] = {"metrics": {}, "quota": {}}
-    _global_coordinator[worker_id]["metrics"] = metrics
-    _allocate_quotas()
-
-    quota = _global_coordinator.get(worker_id, {}).get("quota", {})
-
-    # 检查重启标记
-    restart = _worker_restart_flags.pop(worker_id, False)
-
-    return {
-        "settings": _runtime_settings,
-        "settings_version": _settings_version,
-        "quota": quota,
-        "restart": restart,
-    }
-
-
-@app.get("/api/workers")
-async def api_workers():
-    now = time.time()
-    workers = []
-    for wid, w in _worker_registry.items():
-        coord = _global_coordinator.get(wid, {})
-        metrics = coord.get("metrics", {})
-        quota = coord.get("quota", {})
-        uptime = now - w.get("first_seen", now)
-        workers.append({
-            **w,
-            "online": (now - w["last_seen"]) < 60,
-            "last_seen_ago": int(now - w["last_seen"]),
-            "uptime": int(uptime),
-            "success_rate": metrics.get("success_rate"),
-            "block_rate": metrics.get("block_rate"),
-            "latency_p50": metrics.get("latency_p50"),
-            "inflight": metrics.get("inflight"),
-            "task_queue_size": metrics.get("task_queue_size"),
-            "result_queue_size": metrics.get("result_queue_size"),
-            "accepted": metrics.get("accepted", 0),
-            "stale": metrics.get("stale", 0),
-            "quota_concurrency": quota.get("max_concurrency"),
-            "quota_qps": quota.get("max_qps"),
-        })
-    return {"workers": workers}
-
-
-@app.delete("/api/workers/{worker_id}")
-async def api_delete_worker(worker_id: str):
-    _worker_registry.pop(worker_id, None)
-    _global_coordinator.pop(worker_id, None)
-    return {"ok": True}
+# /api/worker/sync、GET /api/workers、DELETE /api/workers/{worker_id} 已搬到
+# server/api/fleet.py（Phase 3.3）；router 在上面「Worker 机群」那一节挂载。
 
 
 # ==================== API: 结果查询 ====================
@@ -2346,18 +2062,16 @@ async def api_export_screenshots(batch_name: str):
     )
 
 
-# ==================== API: 诊断 ====================
+# ==================== API: 诊断 / 侦查 ====================
+#
+# 5 个端点（/api/diagnostic、/api/_debug/* 三个、DELETE /api/database）
+# 搬到 server/api/debug.py（Phase 3.2）。router 光秃，不带 tags/prefix、
+# 不在 router 上设 include_in_schema —— event-stream 那条的
+# include_in_schema=False 是装饰器级参数，跟着函数走。
+# 这一族路径全是静态的，`/api` 下没有一级 catch-all，注册次序不影响匹配。
+from server.api import debug as _debug_api  # noqa: E402
 
-@app.get("/api/diagnostic")
-async def api_diagnostic():
-    total_asins = await db.get_total_asins()
-    progress = await db.get_progress()
-    return {
-        "total_asins": total_asins,
-        "task_progress": progress,
-        "active_workers": len(_worker_registry),
-        "settings_version": _settings_version,
-    }
+app.include_router(_debug_api.router)
 
 
 @app.post("/api/results/delete-by-file")
@@ -2786,109 +2500,9 @@ async def api_legacy_delete_schedule(index: int):
 
 
 # ==================== Recon 侦查端点（锁竞争 / 阶段耗时）====================
-# 临时仪表，用于诊断 _write_lock 竞争和 accept_results_batch 内部瓶颈
-# 完成诊断后可删除（含 common/database.py 中的 TimedLock / LOCK_STATS）
-
-def _pct(samples: list, p: float) -> float:
-    if not samples:
-        return 0.0
-    s = sorted(samples)
-    i = max(0, min(len(s) - 1, int(len(s) * p)))
-    return round(s[i], 2)
-
-
-def _summary(samples: list) -> dict:
-    if not samples:
-        return {"count": 0}
-    return {
-        "count": len(samples),
-        "p50": _pct(samples, 0.50),
-        "p95": _pct(samples, 0.95),
-        "p99": _pct(samples, 0.99),
-        "max": round(max(samples), 2),
-        "mean": round(sum(samples) / len(samples), 2),
-    }
-
-
-@app.get("/api/_debug/lock-stats")
-async def api_debug_lock_stats():
-    """返回锁等待 / 持锁 / 内部分阶段耗时分布。单位：毫秒。"""
-    from common.database import LOCK_STATS
-    return {
-        "waits": {k: _summary(list(v)) for k, v in LOCK_STATS["waits"].items()},
-        "holds": {k: _summary(list(v)) for k, v in LOCK_STATS["holds"].items()},
-        "stage_timings": {k: _summary(list(v)) for k, v in LOCK_STATS["stage_timings"].items()},
-        "slow_holds_recent": LOCK_STATS["slow_holds"][-50:],
-        "slow_holds_count": len(LOCK_STATS["slow_holds"]),
-    }
-
-
-@app.get("/api/_debug/event-stream", include_in_schema=False)
-async def api_debug_event_stream():
-    """Phase 2 事件流的可观测面：outbox 深度、relay 滞后、每分钟事件数、
-    seq 窗口、分区、死信、计数器。
-
-    三条约束决定了它长这样：
-
-    * **``include_in_schema=False``**。``/openapi.json`` 是黄金基线的第 5 步，
-      逐字节钉死；新端点只要进了 schema，64 步当场挂。同一个理由写在计划
-      §Phase 3 里（sync router 也是这么挂的）。
-    * **不动任何既有响应**。指标本来最自然的去处是 ``/api/diagnostic``，
-      但那个端点是基线 step 55，多一个 key 就是"字段出现"差异。所以另开一个
-      端点，而不是往老的里塞。
-    * **两个后端都必须能回**。SQLite 上事件流在结构上就不存在，这里如实回
-      ``enabled: false`` 而不是 404 或 500 —— 运维拿同一个 URL 探两种部署。
-    """
-    from common.dbfactory import get_backend, is_postgres
-
-    out = {"backend": get_backend(), "enabled": False}
-    if not is_postgres() or db is None or not hasattr(db, "event_stream_stats"):
-        # SQLite：事件流是 PG 专属，这不是错误状态。
-        out["reason"] = "event stream is postgres-only"
-        return out
-    out["enabled"] = True
-    try:
-        out.update(await db.event_stream_stats())
-    except Exception as e:  # noqa: BLE001
-        # 观测端点自己不许把服务搞挂：库还没引导好 / 表还没建时如实报错。
-        out["error"] = f"{type(e).__name__}: {e}"
-        out.update(db.event_relay_metrics())
-    return out
-
-
-@app.post("/api/_debug/lock-stats/reset")
-async def api_debug_lock_stats_reset():
-    """清空所有计时统计（开始新一轮观察前调用）。"""
-    from common.database import LOCK_STATS
-    LOCK_STATS["waits"].clear()
-    LOCK_STATS["holds"].clear()
-    LOCK_STATS["stage_timings"].clear()
-    LOCK_STATS["slow_holds"].clear()
-    return {"ok": True}
-
-
-@app.delete("/api/database")
-async def api_clear_database():
-    """清空所有数据 + 截图文件"""
-    import shutil
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            for table in ["asin_changes", "asin_data", "batch_asins", "tasks", "screenshots", "batches"]:
-                await db._db.execute(f"DELETE FROM {table}")
-            await db._db.execute("DELETE FROM sqlite_sequence")
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _rollback_quietly(db._db)
-            raise
-
-    # 清理截图文件
-    ss_dir = config.SCREENSHOT_DIR
-    if os.path.isdir(ss_dir):
-        shutil.rmtree(ss_dir)
-        os.makedirs(ss_dir, exist_ok=True)
-
-    return {"ok": True}
+# 已搬到 server/api/debug.py（Phase 3.2）：_pct / _summary / lock-stats /
+# event-stream / lock-stats-reset，连同 DELETE /api/database 的裸事务。
+# router 在上面「API: 诊断 / 侦查」那一节挂载。
 
 
 # ==================== 入口 ====================

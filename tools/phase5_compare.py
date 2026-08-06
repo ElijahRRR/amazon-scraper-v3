@@ -68,15 +68,38 @@ def _exp_crawl_time(old, new) -> bool:
     return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", str(new)))
 
 
-def _exp_long_description(old, new) -> bool:
-    """D-60/B5：不再吸进容器外的文本，所以**新值应当是旧值的子集或更短**。
+_WS_ONLY_RE = re.compile(r"\s+")
 
-    旧值里混进了价格/库存/评分/BSR/CDN 图片 URL。新值变长几乎一定是错的。
+
+def _exp_long_description(old, new) -> bool:
+    """``long_description`` 现在有**两个**有意变更，任一成立即算预期内。
+
+    1. **D-63 `<br>` 修复**：`<br>` 过去不产生任何分隔符，两侧的词被粘成一个
+       （`corrosion.The` / `alloythat` / `pushand` / `PullDrawer`）。修复后它产出
+       换行，所以新值**变长**。判据是精确的：**去掉全部空白之后必须逐字节相等** ——
+       这次改动只注入空白，一个内容字符都不动。
+    2. **D-60/B5**：不再吸进容器外的价格/库存/评分/BSR/CDN URL，所以新值**变短**。
+
+    第一条是真机比对逼出来的：只按「应变短」判，7 条 `<br>` 修复全被报成
+    「方向不对」的 UNEXPECTED。实测那 7 条**只有插入、没有删除**，插入的
+    全是空白（`' '` / `'\n '` / `' \n '`），去掉空白后两侧逐字节相同。
+
+    两条都不成立才是真回归 —— 那意味着**内容**变了，而慢变字段短时间内不该变。
+
+    ⚠ **已知盲点：「变短」一律放行。** 真机数据里变短有两个合法来源 ——
+    去掉容器外文本（带 `$xx.xx` / `Add to Cart` 这类标志），以及**去重**
+    （旧代码里 selectolax 的 `node.iter()` 只产出直接子节点，`<div><a><span>t</span></a></div>`
+    的 div 被判成叶子，同一段文字取两遍）。一次真的截断也是纯删除，形态与它们
+    重合。试过两种自动判据（要求删除内容带 D-60 标志 / 要求删除内容仍出现在新值里），
+    在真机 44 条上都产生假阳性，所以**不收紧**：宁可这一支宽，也不要一个会误报的
+    规则让人习惯性忽略报告。人工核对靠报告末尾的抽样。
     """
     if _is_na(old) and _is_na(new):
         return False                      # 都空，本就不该算差异
     o, n = str(old or ""), str(new or "")
-    return len(n) <= len(o)
+    if _WS_ONLY_RE.sub("", o) == _WS_ONLY_RE.sub("", n):
+        return True                       # 只差空白 = D-63
+    return len(n) <= len(o)               # 变短 = D-60
 
 
 def _exp_sorted_list(old, new) -> bool:
@@ -113,10 +136,16 @@ def _exp_hash_changed(old, new) -> bool:
 
 INTENTIONAL: Dict[str, Tuple[str, str, Any]] = {
     "crawl_time":          ("D-61", "裸 UTC+8 -> RFC3339 带 Z", _exp_crawl_time),
-    "long_description":    ("D-60", "不再吸进容器外的价格/库存/评分文本（应变短）", _exp_long_description),
+    "long_description":    ("D-60/D-63", "变短=不再吸容器外文本；只差空白=<br> 现在产出换行",
+                            _exp_long_description),
     "manufacturer":        ("D-58", "精确匹配，不再被 'Manufacturer recommended age' 污染", _exp_manufacturer),
     "upc_list":            ("D-59", "排序输出（集合应相同）", _exp_sorted_list),
-    "variation_asins":     ("D-59", "排序输出（集合应相同）", _exp_sorted_list),
+    # ⚠ variation_asins 有**两条产出路径**：兜底的正则路径（_parse_variation_asins）
+    # 排序了，但优先走的变体矩阵路径（",".join(dvdd.keys())）是**文档顺序**。
+    # 后者本来就确定（dict 保插入序），不受 D-59 要消的 set 哈希种子影响，
+    # 所以「完全没变」是正常的，不代表修复没生效。
+    "variation_asins":     ("D-59", "排序输出（集合应相同）；主路径是文档顺序，没变也正常",
+                            _exp_sorted_list),
     "ean_list":            ("D-59", "排序输出（集合应相同）", _exp_sorted_list),
     "rating":              ("D-60", "不再结转旧值，恒存在", _exp_now_present),
     "review_count":        ("D-60", "不再结转旧值，恒存在", _exp_now_present),
@@ -334,7 +363,12 @@ def report(res: dict) -> int:
         print(f"{field:<26} {exp:>7} {vol:>7} {unexp:>7} {unchanged:>9}{mark}")
 
     if missing_change:
-        print(f"\n⚠ 有意变更**没有出现**（修复可能没生效，或两边跑的是同一版本）：")
+        print("\n⚠ 有意变更**没有出现** —— 三种可能，别默认是第一种：")
+        print("   (a) 修复没生效 / 两边跑的是同一版本")
+        print("   (b) **样本没覆盖到**：修复只在特定形态上现形。真机第一轮 44 个 ASIN 里")
+        print("       一个 Amazon 自营页都没有，seller_* 的修复自然无从显现；邮编全部")
+        print("       verify=confirmed（请求值==观测值），D-55 也就没有可见差异。")
+        print("   (c) 该字段本就不总是变（见下方各条的备注）")
         for f, n in missing_change:
             print(f"    {f}: {n} 条完全没变 —— 期望 {INTENTIONAL[f][0]} {INTENTIONAL[f][1]}")
 

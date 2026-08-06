@@ -151,27 +151,67 @@ SLOW_CRITICAL = {
 
 # ---------------------------------------------------------------- 取数
 
-def fetch_results(base: str, limit: int, timeout: int = 60) -> Dict[str, dict]:
-    """翻页拉 /api/results，返回 {asin: row}。两套系统的响应形状由黄金基线钉死。"""
+def fetch_results(base: str, limit: int, timeout: int = 60,
+                  wanted: Optional[set] = None, max_scan: int = 200000
+                  ) -> Dict[str, dict]:
+    """翻页拉 /api/results，返回 {asin: row}。两套系统的响应形状由黄金基线钉死。
+
+    ``wanted`` 给定时**只收这些 ASIN**，并一直翻到全部找齐或翻完为止 ——
+    这一条是必须的，不是优化。``/api/results`` 的排序是 ``ORDER BY d.id DESC``，
+    而 ``asin_data`` 是**一 ASIN 一行、重采走 UPDATE**：行 id 在**第一次**见到
+    这个 ASIN 时分配，之后永不变。
+
+    于是「取前 N 行」= 「最近**首次收录**的 N 个 ASIN」。真机第一次跑比对就栽在
+    这儿：旧系统是跑了很久的生产库（11920 行），测试用的 ASIN 早就在里面、id 很小，
+    重采只是把行 UPDATE 了一遍，**永远排不进前 600**；新系统是全新库所以全在。
+    两边明明采的是同一批，交集却是 0。
+    """
     out: Dict[str, dict] = {}
     cursor: Optional[int] = None
+    scanned = 0
     while True:
-        q = {"limit": min(200, limit)}
+        q = {"limit": 200}
         if cursor is not None:
             q["cursor"] = cursor
         url = f"{base.rstrip('/')}/api/results?" + urllib.parse.urlencode(q)
         with urllib.request.urlopen(url, timeout=timeout) as r:
             body = json.loads(r.read())
         items = body.get("items") or []
+        scanned += len(items)
         for it in items:
             asin = it.get("asin")
-            if asin:
+            if not asin:
+                continue
+            if wanted is None or asin in wanted:
                 out[asin] = it
-        if not body.get("has_more") or len(out) >= limit or not items:
+        if not items or not body.get("has_more"):
             break
+        if wanted is None:
+            if len(out) >= limit:
+                break
+        else:
+            if len(out) >= len(wanted):
+                break                      # 全找齐了，不用再翻
+            if scanned >= max_scan:
+                print(f"⚠ 已扫描 {scanned} 行仍未找齐（{len(out)}/{len(wanted)}），"
+                      f"提前停止。加大 --max-scan 或缩小 ASIN 列表。", file=sys.stderr)
+                break
         cursor = body.get("next_cursor")
         if cursor is None:
             break
+    return out
+
+
+def read_asin_file(path: str) -> set:
+    """从文件读 ASIN 列表（每行一个，忽略空行与 # 注释）。"""
+    out = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.add(line.split()[0])
+    if not out:
+        raise SystemExit(f"❌ {path} 里没有任何 ASIN")
     return out
 
 
@@ -291,7 +331,7 @@ def _dump_asins(a) -> int:
     asins = set()
     if a.dump_from in ("old", "both"):
         print(f"拉取旧系统 {a.old} …", file=sys.stderr)
-        asins |= set(fetch_results(a.old, a.limit))
+        asins |= set(fetch_results(a.old, a.limit))   # 无 wanted：取前 N 行
     if a.dump_from in ("new", "both"):
         print(f"拉取新系统 {a.new} …", file=sys.stderr)
         asins |= set(fetch_results(a.new, a.limit))
@@ -314,6 +354,11 @@ def main() -> int:
     ap.add_argument("--dump-asins", metavar="FILE",
                     help="不比对，只把 ASIN 列表导出到文件（配合 --dump-from）。"
                          "两套系统必须采**同一份列表**才有得比")
+    ap.add_argument("--asins", metavar="FILE",
+                    help="只比对这个文件里的 ASIN（每行一个）。**强烈建议给**，"
+                         "理由见 fetch_results 的 docstring")
+    ap.add_argument("--max-scan", type=int, default=200000,
+                    help="配合 --asins：每侧最多翻多少行去找（默认 20 万）")
     ap.add_argument("--dump-from", choices=("old", "new", "both"), default="old",
                     help="从哪一侧取 ASIN。默认 old —— 旧系统是生产库，"
                          "它的 ASIN 才是真实语料；both 取并集")
@@ -322,11 +367,19 @@ def main() -> int:
     if a.dump_asins:
         return _dump_asins(a)
 
+    wanted = read_asin_file(a.asins) if a.asins else None
+    if wanted:
+        print(f"限定在 {len(wanted)} 个指定 ASIN 上比对", file=sys.stderr)
+    else:
+        print("⚠ 没给 --asins：按「/api/results 的前 N 行」取，而那是"
+              "「最近首次收录的 N 个 ASIN」，不是「最近采集的」。"
+              "生产库上这样几乎必然交集为空 —— 强烈建议用 --asins。", file=sys.stderr)
+
     print(f"拉取旧系统 {a.old} …", file=sys.stderr)
-    old = fetch_results(a.old, a.limit)
+    old = fetch_results(a.old, a.limit, wanted=wanted, max_scan=a.max_scan)
     print(f"  {len(old)} 行", file=sys.stderr)
     print(f"拉取新系统 {a.new} …", file=sys.stderr)
-    new = fetch_results(a.new, a.limit)
+    new = fetch_results(a.new, a.limit, wanted=wanted, max_scan=a.max_scan)
     print(f"  {len(new)} 行", file=sys.stderr)
 
     if not old or not new:

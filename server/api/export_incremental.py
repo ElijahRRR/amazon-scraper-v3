@@ -385,7 +385,7 @@ async def export_incremental(
                 "WHERE seq > $1 ORDER BY seq LIMIT $2",
                 cursor, limit + 1)
             # 快照内复核下界（保守方向）：宁可多报一次 409，也不能漏。
-            min_after, _ = await _sync._bounds(conn)
+            min_after, max_after = await _sync._bounds(conn)
     except _sync._PoolUnavailable:
         return _sync._err(503, "event_stream_unavailable", "连接池尚未就绪。")
     except Exception as exc:                                   # noqa: BLE001
@@ -394,9 +394,23 @@ async def export_incremental(
                               f"事件流表还没建好: {type(exc).__name__}")
         raise
 
-    min_available, max_seq = _sync._window(
-        max(_sync._as_int(min_raw) or 0, _sync._as_int(min_after) or 0),
-        max_raw, _sync._as_int(meta.get("max_seq_ever")))
+    # ⚠ 两次 _window **各自算完再比**，绝不能先把两个 min 压成一个数再传进去。
+    # 这里曾经写成 `max(_as_int(min_raw) or 0, _as_int(min_after) or 0)`：空表时
+    # `min(seq)` 是 NULL -> None -> `or 0` -> **0**，而 _window 判空靠的正是
+    # `min_seq is None`，于是它走进「非空」分支返回 min_available=0，
+    # 而 `cursor + 1 < 0` 永假 —— **409 永远发不出来**。
+    #
+    # 真机实测（TRUNCATE 掉事件流之后）：/api/v1/sync/status 正确报
+    # min_available_seq=676 / max_seq=675，同一时刻 /api/export/incremental?cursor=0
+    # 却回 200 空页。一个丢了全部数据的消费者会就此永远等下去，两侧都不告警 ——
+    # 正是 _window 的 docstring 点名要防的那一种。
+    # `/api/v1/sync/records` 一直是对的（sync.py:512），照它的写法对齐。
+    ever = _sync._as_int(meta.get("max_seq_ever"))
+    min_available, max_seq = _sync._window(min_raw, max_raw, ever)
+    min_available_after, max_seq_after = _sync._window(min_after, max_after, ever)
+    if min_available_after > min_available:
+        min_available = min_available_after
+        max_seq = max(max_seq, max_seq_after)
 
     # 游标掉出保留窗口 —— 契约 v1 没写这一种，但静默跳过是不可接受的。
     # 见交付说明假设清单第 6 条：需要写进 v1.1。

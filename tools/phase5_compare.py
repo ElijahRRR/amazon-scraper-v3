@@ -280,13 +280,47 @@ def report(res: dict) -> int:
     return 0 if ok else 1
 
 
+
+def _dump_asins(a) -> int:
+    """导出 ASIN 列表，供两侧各上传一次。
+
+    为什么需要这一步：比对的前提是**两边采过同一批 ASIN**。第一次跑的时候
+    旧系统 600 个、新系统 44 个、交集 **0** —— 工具正确地报了不通过，但也
+    没比出任何东西。两边各采各的，比对就是空转。
+    """
+    asins = set()
+    if a.dump_from in ("old", "both"):
+        print(f"拉取旧系统 {a.old} …", file=sys.stderr)
+        asins |= set(fetch_results(a.old, a.limit))
+    if a.dump_from in ("new", "both"):
+        print(f"拉取新系统 {a.new} …", file=sys.stderr)
+        asins |= set(fetch_results(a.new, a.limit))
+
+    ordered = sorted(asins)[:a.limit]
+    with open(a.dump_asins, "w", encoding="utf-8") as f:
+        f.write("\n".join(ordered) + "\n")
+    print(f"已写出 {len(ordered)} 个 ASIN -> {a.dump_asins}\n")
+    print("接下来：把这个文件**同时**传给两套系统，各采一遍，然后再跑比对。")
+    print("⚠ 两边开采的时间别差太远（建议 1 小时内）——差太远的话慢变字段可能")
+    print("  真的变了，那是商品变了不是系统错了，会造成假阳性。")
+    return 0
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Phase 5 新旧系统内容比对")
     ap.add_argument("--old", required=True, help="旧 SQLite 系统 base URL")
     ap.add_argument("--new", required=True, help="新 PostgreSQL 系统 base URL")
     ap.add_argument("--limit", type=int, default=500, help="最多比对多少个 ASIN")
     ap.add_argument("--json", help="把完整结果写到这个文件")
+    ap.add_argument("--dump-asins", metavar="FILE",
+                    help="不比对，只把 ASIN 列表导出到文件（配合 --dump-from）。"
+                         "两套系统必须采**同一份列表**才有得比")
+    ap.add_argument("--dump-from", choices=("old", "new", "both"), default="old",
+                    help="从哪一侧取 ASIN。默认 old —— 旧系统是生产库，"
+                         "它的 ASIN 才是真实语料；both 取并集")
     a = ap.parse_args()
+
+    if a.dump_asins:
+        return _dump_asins(a)
 
     print(f"拉取旧系统 {a.old} …", file=sys.stderr)
     old = fetch_results(a.old, a.limit)

@@ -236,9 +236,21 @@ OK (skipped=12)
 
 ## 7. 切换运行手册（Phase 5）
 
-### 7.0 前置：Phase 5 还没做
+### 7.0 Phase 5 的工具已就绪，但**必须在真机上跑**
 
-**下面的步骤假设 Phase 5 的并行验证已经跑完并通过。** 它还没跑。
+工具与手册已交付（本文只留摘要，操作以手册为准）：
+
+| 交付物 | 用途 |
+|---|---|
+| `docs/phase5_runbook.md` | 完整运行手册：前置体检 → 并行比对 → 事件流对账 → 切换 → 回滚 → 上机后盯的指标 |
+| `tools/phase5_preflight.py` | 目标机器体检。**实测**而非读配置：PG 版本/扩展/编码/排序规则、能否建分区表、advisory lock、路由顺序、依赖、磁盘 |
+| `tools/phase5_compare.py` | 新旧两套系统的内容比对，把差异分成 EXPECTED / VOLATILE / UNEXPECTED |
+| `tests/test_phase5_compare.py` | 比对工具分类逻辑的 13 个用例 |
+
+**但并行比对本身还没跑过**——它需要真实采集：两套系统各自的 worker、代理、
+真的去抓亚马逊。这在开发环境里做不到。
+
+下面的切换步骤假设并行比对已经跑完并通过。
 Phase 5 要做的（`.agent/pg_migration_plan.md` §Phase 5）：
 
 1. 新 PG 系统与旧 SQLite 系统**同时**采同一批 ASIN（各自独立 worker），比对**内容**差异。

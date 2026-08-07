@@ -32,7 +32,8 @@
   第 1 步的 `from common.domain import *` 拿不到 15 个下划线符号；第 3/5 步违反 C4（只给 PG 一侧）；
   第 4 步的删除清单漏了 `tests/golden/harness.py:234-243`——**照它做会把黄金回归网自己删掉**。详见 §5 与 §7。
 - **不碰 `worker/parser.py` 一个字节**（C3 / D-27）。
-- **不删、不改名任何既有端点**（erpAPI 清单未到）。所有删除候选集中登记在 §6。
+- **不删、不改名任何既有端点。**（写这一条时的理由是「erpAPI 清单未到」——**清单已于 2026-08-07 到手**，待确认项已在 §4 X.1 逐条结案，但「本轮不删端点」这条**结论不变**：`/api/auto-scrape/schedules*` 的 GET/PUT/DELETE 三条现已确认可删，删它们会改 `/openapi.json` = breaks_golden，必须单独立项。）删除候选集中登记在 **§4 X.1**（原文误写成 §6）。
+- **有意改了两个既有端点的行为**（清单到手后追加，已声明并重录基线）：`POST /api/upload` 撞名 200 静默合并 → **409**；`GET /api/results` 的 `limit` 上限 200 → **1000**。对外契约文档 `docs/erpapi_contract.md`，逐条结论见 §4 X.1。
 - **不做「为兼容旧调用方而设的可选参数」**——性能计划的 P4/P5 就是因为这个被驳回（C1 第一句）。
 - **不做仪表盘默认查询（batch_id 翻页 262ms）的修复**——唯一的方案 P6 事实有误被驳回，见 §5 与 §6。
 
@@ -720,16 +721,64 @@ DB_BACKEND=postgres python -m unittest discover -s tests
 
 ---
 
-## 4. X.1 删除 / 待确认候选（**只登记，本轮不执行**）
+## 4. X.1 删除 / 待确认候选（**erpAPI 清单已到手，待确认项已逐条结案**）
 
-C1 说既有端点可以改，但 erpAPI 用到的那些端点在清单到手前**不能默默动**。以下全部单独列出、标记待确认：
+> **本节状态变更（2026-08-07）**：C1 说既有端点可以改，但 erpAPI 用到的那些
+> 在清单到手前**不能默默动**。**清单现已到手**（7 个端点），
+> 于是本节从「待确认登记表」升级为「结论表」。
+>
+> 采集侧对外契约文档：**`docs/erpapi_contract.md`**（逐端点规格 + 与旧系统的
+> 差异 + 轮询建议 + 守卫用例索引）。下表的每一条结论都在那份文档里有对应章节。
+>
+> **erpAPI 实际在用的 7 个端点**（清单原文）：
+> `/api/export/incremental`、`POST /api/upload`、`/api/batches/{name}/status`、
+> `/api/results`、`/api/batches/{id}/failures`、
+> `POST /api/batches/{id}/prioritize`、`/static/screenshots/...`。
+> 外加一个**点名要废弃**的 `/api/batches/{name}/errors`。
+>
+> ⚠ 清单的作用是**双向**的：它既解锁了「不在清单里 = 可以动」，
+> 也把「在清单里 = 从此是对外契约」钉死了（见下表第二组）。
 
-| 候选 | 位置 | 证据 | 待确认什么 |
+### 4.1 原「待确认」四条 —— 全部结案
+
+| 候选 | 位置 | 结论 | 依据 |
 |---|---|---|---|
-| `/api/tasks/release` 的 `task_ids` 分支 | `server/app.py:1606-1623` | 全仓无发送方：`worker/engine.py:993-998` 与 `tools/smoke_local.py:142-145/217-220` 都只发 `tasks`；注释自认「兼容旧格式（无 lease 校验，直接释放）」 | 是否还有老 worker / erpAPI 在发 `{"task_ids":[...]}`。删掉能消灭 1 个裸事务 + 1 处本地时钟(`:1609`) + 一个「任意 worker 可释放别人任务」的降级路径。**若最终保留兼容，最小改法是走 db 层新方法，不要在 app.py 里内联 UPDATE。** 注意还有**第三份副本**在 `tests/pgdb/test_admin.py:246-254`（注释里的 `app.py:1497-1511` 已过期，真值 `:1606-1623`） |
-| 4 个 legacy `/api/auto-scrape/schedules*` | `server/app.py:2658-2718` | **只有 1/4 有前端调用方**：grep 全部模板只有 `settings.html:485` 调 `POST /api/auto-scrape/schedules`；GET(`:2660`)/PUT(`:2696`)/DELETE(`:2707`) 无任何前端调用。它们与 `/api/schedules` 是同一份数据的两套 CRUD | 这两条 path 在黄金第 11 步 openapi 的 51 条里，是 erpAPI 最可能真在用的一组 |
-| `/api/worker/download` | 模板引用：`server/templates/settings.html:223`、`workers.html:65`、`:68` | 59 条路由里**没有这个路径**，三个按钮点了就是 404 | 要么实现要么删按钮——**但不要在拆分提交里顺手做** |
-| `worker/parser.py:2575` / `:2614` 的 ASIN 大小写 | 同左 | `server/app.py:912` 的 `_normalize_asin` 会 `.upper()`，parser 不会：同一个小写 asin 串，上传接口收、列表页解析器丢 | 列表页 ASIN 的实际来源。改它踩 C3（D-27） |
+| `/api/tasks/release` 的 `task_ids` 分支 | `server/app.py:1606-1623` | **erpAPI 侧已排除；仍不删，降级为「老 worker 待确认」** | 清单里没有任何 `/api/tasks/*` —— 那一族本来就是 worker 面，不是 erpAPI 面。所以原来的问句「是否还有 erpAPI 在发 `{"task_ids":[...]}`」**答案是否**。剩下的唯一未知是**老 worker**，而清单对它无话可说，**阻塞未完全解除**。删掉的收益不变（1 个裸事务 + 1 处本地时钟 `:1609` + 一个「任意 worker 可释放别人任务」的降级路径）。**若最终保留兼容，最小改法仍是走 db 层新方法，不要在 app.py 里内联 UPDATE。** 第三份副本仍在 `tests/pgdb/test_admin.py:246-254` |
+| 4 个 legacy `/api/auto-scrape/schedules*` | `server/app.py:2658-2718` | **可删 GET/PUT/DELETE 三条；`POST` 保留** | 原顾虑是「这两条 path 在黄金第 11 步 openapi 的 51 条里，是 erpAPI 最可能真在用的一组」——**清单证伪了它**：erpAPI 一条都不用。于是唯一的调用方判据回到前端 grep：只有 `settings.html:485` 调 `POST /api/auto-scrape/schedules`，GET(`:2660`)/PUT(`:2696`)/DELETE(`:2707`) 无任何调用方。删这三条会改 `/openapi.json`（黄金逐字节钉死的一步）→ **breaks_golden = yes，要单独立项、单独重录**，不许在别的提交里顺手做 |
+| `/api/worker/download` | 模板引用：`settings.html:223`、`workers.html:65`、`:68` | **与 erpAPI 无关，结论不变：要么实现要么删按钮** | 清单里没有；59 条路由里也没有这个路径，三个按钮点了就是 404。纯前端问题，**不要在拆分/契约提交里顺手做** |
+| `worker/parser.py:2575` / `:2614` 的 ASIN 大小写 | 同左 | **不动（C3 + 本轮 R4 双重封锁）** | 清单不涉及 parser。`server/app.py` 的 `_normalize_asin` 会 `.upper()`、parser 不会，分叉仍在，但改它踩 C3（D-27）。ASIN 正则本身已在 Phase 4.2 收进 `common/core/idents.py`（含两条有意保留的行为），大小写归一仍在**调用侧**，这条登记原样保留 |
+
+### 4.2 清单到手后新增的结论 —— erpAPI 面的 8 个端点
+
+| 端点 | 结论 | 本轮做了什么 | 详见 |
+|---|---|---|---|
+| `GET /api/export/incremental` | **对外契约 v1，不许单方面改** | 未动。沃尔玛侧已按 v1 实现并上线（R1） | `docs/erpapi_contract.md` §3.1 / §4.8；`docs/incremental_export_contract.md` |
+| `POST /api/upload` | **已修**（有意的破坏性变更） | 撞名 200 静默合并 → **409 Conflict**。走新方法 `create_batch_if_absent`（`common/database.py:625` / `common/pgdb/batches.py:136`，已进 `PUBLIC_API`）；`create_batch` 签名与行为一字未动，自动调度器不受波及。200 的 `external_id`/`callback_url` 改成回显**存下来的**值 | 契约文档 §4.1 / §5.1-5.3 |
+| `GET /api/batches/{name}/status` | **保留，未改** | 只补了文档：`status` 是权威完成判据，`stats.open == 0` 会领先它 0~2s（`_completion_watcher` 间隔 2.0s），对 `expand_variants` 批次更是主动错的 | 契约文档 §4.2 / §6.3 |
+| `GET /api/results` | **已修**（单页上限） | `le=200` → `le=MAX_PAGE_LIMIT`（**1000**）。旧的 200 是**从旧 erpAPI 原样抄来、一行注释都没有**的数字，本轮用 15 万行 bench 库重测后重定，出处与重估条件写在 `server/api/results.py:86-147`。⚠ `le=` 会渲染进 `/openapi.json` 的 `maximum` → **改它就是改契约**，黄金基线已按此重录 | 契约文档 §4.3 / §5.5 |
+| `GET /api/results` 的游标 | **旧坑不成立，已补守卫** | 谓词是**严格** `<` / `>`（`common/pgdb/results_read.py:231/233`、`common/database.py:2218/2220`），`next_cursor = items[-1].id`，翻页卡死在结构上不可能。但**在这一轮之前没有任何用例钉住它**（黄金只翻一页，一个不前进的实现在只翻一页时表现正常）→ 新增 `tests/test_results_cursor_liveness.py`，翻满全程 + 硬轮次上限 + 分片完整性 | 契约文档 §4.3 / §5.6 |
+| `GET /api/batches/{id}/failures` | **保留；旧坑在我们这边本来就不存在** | 未动。`limit` 上限已是 `le=100000`（`server/app.py:1496`），docstring 明写「不截断到 200 条」（`:1498`），排序带 `id` tiebreaker 是全序 | 契约文档 §4.4 / §5.4 |
+| `POST /api/batches/{id}/prioritize` | **保留，未改**（但记一笔已知缺陷） | 是一条无条件 `UPDATE`，不查批次是否存在、不看 rowcount → **`ok:true` 不代表批次存在**（实测 `batch_id=99999` 也回 `200 {"ok":true}`，两个后端一致）。与 erpAPI「best-effort 不抛」的用法吻合，**本轮不改**；要改就得先定「批次不存在该不该 404」，那是行为变更，单独立项 | 契约文档 §4.6 |
+| `GET /static/screenshots/...` | **保留，未改** | `StaticFiles` 挂载（`server/app.py:253`）。拉不到 404、body 是 JSON `{"detail":"Not Found"}`。路径不要自己拼，用 `/api/results` 的 `items[].screenshot_path`（占位值已统一成 `null`） | 契约文档 §4.7 |
+
+### 4.3 明确废弃
+
+| 端点 | 结论 | 处置 |
+|---|---|---|
+| `GET /api/batches/{name}/errors` | **废弃，不再接受新接入；不删** | erpAPI 清单点名「**不要**用它」。两条硬限制属实：`LIMIT 200` 写死在 SQL 里（`server/app.py:1485`），且排序在同一批提交内部无业务含义（`updated_at` 秒精度 + 整批同戳）。本轮**只改 docstring**（→ `/openapi.json` 的 `description`），**没有**往响应体加 deprecation 字段 —— 那是线上格式变更，严格反序列化的在跑调用方会崩，而 `errors_batch_a` 还是黄金的一步。指针由 `tests/test_errors_endpoint_points_at_failures.py` 钉住。迁移目标：`/api/batches/{id}/failures` |
+
+### 4.4 清单带来的**反向**约束（新增，不是删除候选）
+
+清单不只解锁删除，它也把 8 条 path 变成了对外契约。以下几条原本「可以随便动」
+的东西**从此不能了**，其中两条直接影响 §5 里已否决提案的重提条件：
+
+| 事项 | 新约束 |
+|---|---|
+| `/api/results` 的 `items[]` 形状 | 它是 `SELECT d.*` 且**无 `response_model`**（`server/api/results.py:151-166`），当前 55 个键。**任何加到 `asin_data` 的列都会自动泄进 erpAPI 响应** —— 这条早在审计 §2.17 / `pg_migration_plan.md` 就实锤过，现在它有了确定的受害者。契约文档已要求 erpAPI 按「忽略未知字段」实现，但采集侧仍应把加列当作**有影响**的变更 |
+| `/api/results` 的 `total` | §5 里那条「把 total 从翻页响应里去掉」的提案，其重提条件之一是「把 `/api/results` 列进 erpAPI 待确认」——**现在确认了：erpAPI 真在用这个端点**。`total` 是契约字段（契约文档 §4.3 已写明它是不含游标谓词的全集计数、翻页途中恒定），去掉它是**破坏性变更**，重提门槛因此变高，不是变低 |
+| 所有 `Query(...)` 的 `le=` / `ge=` | 会渲染成 `/openapi.json` 的 `maximum` / `minimum`，而那份 schema 是黄金逐字节钉死的一步。**改边界值 = 改契约**，流程见契约文档 §3.2。这条已写进 `server/api/results.py:42-48` |
+| `asin_changes` 的口径 | §5 里那条提案的重提条件包含「把口径变化写进 erpAPI 待确认清单」。清单里**没有** `/api/changes/stats`，但 `change_filter` 是 `/api/results` 的参数、且 `baseline_*` 列在 `items[]` 里 —— 所以口径变化**间接可见**。重提时按「`/api/results` 是契约」处理 |
+| 错误码字面量 | `error` 的值是机器读枚举，封闭集在 `server/api/sync.py:132-149`。本轮新增 `batch_name_conflict`（走 `HTTPException` 不走 `_err`，AST 扫不到，由 `tests/test_error_codes.py` 一条显式断言看守，与 `internal_error` 同例） |
 
 ---
 

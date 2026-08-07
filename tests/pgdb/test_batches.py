@@ -27,14 +27,51 @@ async def _seed_tasks(db, batch_id, statuses):
 # ============================ create_batch ============================
 
 @pytest.mark.asyncio
-async def test_create_batch_returns_id_and_duplicate_is_noop(pgdb):
+async def test_create_batch_returns_id_and_duplicate_reuses_it(pgdb):
     first = await pgdb.create_batch("b1")
     assert first == 1
     again = await pgdb.create_batch("b1", needs_screenshot=True)
-    # 同名重传：静默 no-op，返回**已有** id（不是 0、不是新 id）
+    # 同名重传：返回**已有** id（不是 0、不是新 id）。
+    # ⚠ 这**不是** no-op：第二次的参数被静默丢弃，既有行一个字段都没更新。
+    #   分辨「新建 vs 命中已有」要用 create_batch_if_absent（下面几条）；
+    #   POST /api/upload 据此回 409，不再静默合并。
     assert again == first
     row = await pgdb.get_batch_by_name("b1")
     assert row["needs_screenshot"] == 0          # 第二次的参数没有生效
+
+
+@pytest.mark.asyncio
+async def test_create_batch_if_absent_reports_created(pgdb):
+    """``created`` 位来自命令标签：'INSERT 0 1' -> 真插了，'INSERT 0 0' -> 撞名。"""
+    assert await pgdb.create_batch_if_absent("b1") == (1, True)
+    assert await pgdb.create_batch_if_absent("b1") == (1, False)
+    # 撞名照样烧号，所以下一个新名字拿的是 3
+    assert await pgdb.create_batch_if_absent("b2") == (3, True)
+
+
+@pytest.mark.asyncio
+async def test_create_batch_if_absent_drops_the_second_calls_fields(pgdb):
+    """撞名时既有行**一个字段都不更新** —— 这正是 409 要挡住的那个静默丢弃。
+
+    旧行为下 HTTP 响应回显的是**请求**里的 callback_url，而库里存的是第一次的，
+    于是调用方以为回调注册好了。这条把「库里到底是什么」钉死。
+    """
+    bid, created = await pgdb.create_batch_if_absent(
+        "b1", external_id="E1", callback_url="http://x/1")
+    assert (bid, created) == (1, True)
+    again = await pgdb.create_batch_if_absent(
+        "b1", external_id="E2", callback_url="http://x/2")
+    assert again == (1, False)
+    row = await pgdb.get_batch_by_name("b1")
+    assert row["external_id"] == "E1"
+    assert row["callback_url"] == "http://x/1"
+
+
+@pytest.mark.asyncio
+async def test_create_batch_if_absent_none_name_is_not_created(pgdb):
+    """NOT NULL 冲突走的是 IntegrityConstraintViolationError 那条补差路径：
+    返回 (0, False) —— 没拿到 id 就谈不上"新建"。与 SQLite 一致。"""
+    assert await pgdb.create_batch_if_absent(None) == (0, False)
 
 
 @pytest.mark.asyncio

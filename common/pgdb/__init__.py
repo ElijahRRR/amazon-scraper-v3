@@ -59,7 +59,8 @@ PUBLIC_API = (
     "maintenance_loop", "start_maintenance", "close", "wal_checkpoint",
     "init_tables",
     # 批次
-    "create_batch", "get_batches", "get_batch_by_name", "expand_batch_variants",
+    "create_batch", "create_batch_if_absent", "get_batches", "get_batch_by_name",
+    "expand_batch_variants",
     "get_batch_completion_status", "mark_batch_completed", "list_callback_due",
     "mark_callback_attempt", "reset_callback_for_retry", "delete_batches",
     # 任务

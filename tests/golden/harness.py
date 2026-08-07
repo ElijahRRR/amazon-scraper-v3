@@ -182,9 +182,10 @@ _ENV_DERIVED_SETTINGS = {
 def _pg_scratch_db():
     """DB_BACKEND=postgres 时：建一个本次运行专用的库，返回 (dsn, drop_fn)。
 
-    黄金场景把 **自增 id 的烧号**钉死在基线里（golden_batch_b 是 id 3 不是 2，
-    task id 是 1,3,7,8），所以每次重放都必须从全新的序列开始 —— SQLite 侧靠
-    临时 DB_PATH 拿到这份隔离，PG 侧只能靠"一次运行一个库"。
+    黄金场景把 **自增 id 的烧号**钉死在基线里（golden_batch_b 是 id 3 不是 2 ——
+    撞名那一发回 409 之后照样烧掉 batch 号 2；task id 是 1,3,4,5），所以每次
+    重放都必须从全新的序列开始 —— SQLite 侧靠临时 DB_PATH 拿到这份隔离，
+    PG 侧只能靠"一次运行一个库"。
     """
     import asyncio
     import uuid

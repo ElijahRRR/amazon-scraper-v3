@@ -378,8 +378,15 @@ def _batch_name(prefix: str) -> str:
     于是「同一分钟内自动触发 + 手动触发同一个定时任务 = 什么都不做」
     **只在 ASIN 清单没变时成立**。清单变了（文件加了行、或者走全库而库里
     新增了 ASIN），新 ASIN 会被**悄悄塞进上一个批次**——批次的语义
-    「一次采集」就此破掉，而且没有任何一侧会报错：
-    接口照样回 200、照样回那个既有的 batch_id。
+    「一次采集」就此破掉，而且没有任何一侧会报错。
+
+    ⚠ **本条今天只对自动调度那两条路径成立了，但它们恰好就是本函数的用户。**
+    ``POST /api/upload`` 已经改成撞名 -> 409（走 ``create_batch_if_absent``），
+    那条路上的静默合并不复存在；而 ``_auto_scrape_scheduler`` 与
+    ``/api/schedules/{name}/run`` 仍然走 ``create_batch``（撞名返回既有 id，
+    静默合并照旧）—— 它们是内部触发、没有调用方接得住 409，让定时任务因为
+    撞名而整轮不跑是更坏的结果。所以**秒精度对它们仍然是承重的**，
+    ``tests/test_batch_name_precision.py`` 那两条守卫一条都不能撤。
 
     **有意的行为改动，已声明**：``auto_*`` 两处从分钟精度升到秒精度。
     同一分钟内的第二次触发从此建**新批次**，而不是往上一个里塞。
@@ -883,6 +890,16 @@ app.include_router(_pages_api.router)
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB 上限，防止 2GB 内存 VPS OOM
 
+#: ``POST /api/upload`` 撞名时的**机器读**错误码，放在 409 响应体的
+#: ``detail.error`` 里。人读的说明在 ``detail.message``。
+#:
+#: 这个码走的是 ``HTTPException``，不经过 ``server/api/sync.py`` 的 ``_err``，
+#: 所以 ``tests/test_error_codes.py`` 那道 AST 扫描**扫不到它** —— 与全局 500 的
+#: ``"internal_error"`` 完全同例。两者都由该文件里一条**显式**的注册断言看守
+#: （``test_batch_name_conflict_is_registered`` / ``test_internal_error_is_registered``）。
+#: 改这里的字面量、或把它从 ``ERROR_CODES`` 里删掉，那条用例当场红。
+_BATCH_NAME_CONFLICT_CODE = "batch_name_conflict"
+
 
 # ==================== 完成通知 / Callback 基础设施 ====================
 
@@ -1052,6 +1069,19 @@ async def api_upload(request: Request,
     可选 callback：
     - `callback_url`：批次完成时（含截图）POST 到此 URL 通知调用方
     - `external_id`：调用方自己的批次 ID，原样回传，便于追踪
+
+    批次名冲突 → **409 Conflict**，绝不静默合并进已有批次。409 的响应体里带
+    `detail.batch_id` / `detail.batch_name` / `detail.status_url`，调用方可以
+    直接拿去接着轮询。
+
+    由此得到的三条性质（调用方可以依赖）：
+    - **本端点可以安全重试**：网络超时后重发，若上一次其实成功了，拿到的是
+      409 + 那个既有 batch_id，而不是又建一个批次、也不会悄悄并进去。
+    - 批次名不需要毫秒精度去躲开合并。
+    - **200 恒等于「新建了一个批次」**，`inserted` 因此不再有歧义。
+
+    200 响应里的 `external_id` / `callback_url` 回显的是**批次实际存下来的**值
+    （读回后再回显），不是请求里的值。
     """
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
@@ -1137,28 +1167,63 @@ async def api_upload(request: Request,
     ext_id = (external_id or "").strip()[:120] or None  # 上限 120 字符防滥用
 
     zc = zip_code or _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
-    batch_id = await db.create_batch(
+
+    # 构造 status URL（调用方可以轮询）。409 也要带上它，所以在建批次之前先算好。
+    base = str(request.base_url).rstrip("/")
+    status_url = f"{base}/api/batches/{batch_name}/status"
+
+    batch_id, created = await db.create_batch_if_absent(
         batch_name, needs_screenshot,
         external_id=ext_id, callback_url=cb_url,
         expand_variants=expand_variants,
     )
+    if not created:
+        # 撞名 -> 409，**绝不静默合并**。
+        #
+        # 以前这里是 200 + 既有 batch_id，实测后果（Phase 4.7 已证明撞名不是
+        # no-op，本轮修的就是它）：
+        #   * 本次的新 ASIN 被悄悄塞进上一个批次，「一次采集」的语义破掉；
+        #   * `inserted` 在部分重叠时是非零，看起来像成功新建；
+        #   * **本次的 external_id / callback_url 被静默丢弃**（INSERT OR IGNORE
+        #     整行不插，既有行一个字段都不更新），而响应回显的是**请求**里的值 ——
+        #     调用方以为回调注册好了，回调永远不会触发。
+        #
+        # 为什么是 409，而不是「自动加后缀」或「200 加个 merged 标志」：只有让
+        # 撞名变成一个**可识别的失败**，POST /api/upload 才是可安全重试的 ——
+        # 网络超时后重发，上一次若其实成功了，这里回的是 409 + 那个 batch_id。
+        # 自动加后缀会让重试造出第二个批次，200+标志则要求每个调用方都记得读那个
+        # 标志，漏读的代价与今天一模一样。
+        #
+        # 注意 batch_id 是**既有批次**的 id（create_batch_if_absent 撞名时照样把它
+        # SELECT 回来），调用方可以直接拿 status_url 接着轮询，不必再查一次。
+        raise HTTPException(409, {
+            "error": _BATCH_NAME_CONFLICT_CODE,
+            "message": f"批次名已存在: {batch_name}（未合并，也未改动既有批次）",
+            "batch_id": batch_id,
+            "batch_name": batch_name,
+            "status_url": status_url,
+        })
+
     inserted = await db.create_tasks(
         batch_id, unique_asins, zc, needs_screenshot,
         per_asin_zip=per_asin_zip,
     )
 
-    # 构造 status URL（调用方可以轮询）
-    base = str(request.base_url).rstrip("/")
+    # 回显**存下来的**值，不是请求里的值。
+    # 撞名已经在上面 409 掉了，所以走到这里两者必然相等——但「回显请求值」这个
+    # 写法本身就是上面那个回调撒谎 bug 的载体，留着它等于把地雷埋回去。
+    # 读回一行的代价（一次主键级 SELECT）远小于「回调注册成功了吗」这种问题。
+    stored = await db.get_batch_by_name(batch_name)
     return {
         "batch_id": batch_id,
         "batch_name": batch_name,
-        "external_id": ext_id,
+        "external_id": stored.get("external_id") if stored else ext_id,
         "total_asins": len(unique_asins),
         "inserted": inserted,
         "per_asin_zip_count": len(per_asin_zip),
         "invalid_zip_rows": invalid_zip_count,
-        "callback_url": cb_url,
-        "status_url": f"{base}/api/batches/{batch_name}/status",
+        "callback_url": stored.get("callback_url") if stored else cb_url,
+        "status_url": status_url,
     }
 
 
@@ -1365,9 +1430,35 @@ async def api_delete_batches_bulk(request: Request):
     return {"ok": True, "deleted": len(batch_ids)}
 
 
+# ⚠ 下面这个端点是**旧接口**，新接入方一律用 /api/batches/{batch_id}/failures。
+#
+# 指向 /failures 这件事只写进 docstring（= /openapi.json 的 description），
+# **没有**往响应体里加 deprecation 提示字段。理由是实测出来的，不是口味：
+#   * `errors_batch_a` 是黄金 78 步里的一步（body 录着
+#     {"error_summary": [], "failed_tasks": []}），加字段当场改基线，
+#     而这一步与本轮要改的撞名行为毫无关系；
+#   * 更要紧的是它是**线上格式变更**：今天在跑的调用方拿到一个没见过的键，
+#     严格反序列化的那种会直接崩。为了一句提示去冒这个险不划算。
+# docstring 走的是 /openapi.json（那**也**是黄金的一步），但它只动
+# description 字符串、不动任何响应形状，对在跑的调用方是零风险。
+# 「docstring 里必须指得出 /failures」由
+# tests/test_errors_endpoint_points_at_failures.py 钉住。
 @app.get("/api/batches/{batch_name}/errors")
 async def api_batch_errors(batch_name: str):
-    """获取批次错误详情"""
+    """获取批次错误详情（**旧接口，请改用 `/api/batches/{batch_id}/failures`**）。
+
+    本端点有两条硬限制，都是设计如此、调大参数也没用：
+
+    - `failed_tasks` **最多 200 条**，超出的部分直接看不见；
+    - 排序是 `updated_at DESC, id DESC` —— 一次批量提交里的失败任务共享同一个
+      秒级 `updated_at`，所以「最近 200 条」在同一批内部并不是一个有业务含义的切片。
+
+    需要**完整**失败明细请用 `GET /api/batches/{batch_id}/failures`：按 batch_id
+    取（不依赖批次名）、`limit` 上限 100000、不截断到 200 条，还支持
+    `error_type` 过滤。
+
+    保留本端点只是为了不打断已在使用它的调用方，不再接受新接入。
+    """
     batch = await db.get_batch_by_name(batch_name)
     if not batch:
         raise HTTPException(404, f"批次不存在: {batch_name}")

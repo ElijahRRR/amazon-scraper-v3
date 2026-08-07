@@ -142,8 +142,10 @@ common.pgdb` 直接炸。多重继承下重复定义不会报错、只会被 MRO
 `run_startup_optimize()` (372) · `maintenance_loop()` (385) ·
 `start_maintenance()` (402，**同步方法**) · `wal_checkpoint()` (426，恒返回 None)
 
-### batches.py（8 项）— BatchesMixin · agent C
-`create_batch` (799) · `get_batches` (828) · `get_batch_by_name` (846) ·
+### batches.py（9 项）— BatchesMixin · agent C
+`create_batch` (799) · `create_batch_if_absent`（撞名判定的真源，返回
+`(batch_id, created)`；`create_batch` 转调它 —— `POST /api/upload` 据此回 409，
+不再静默合并）· `get_batches` (828) · `get_batch_by_name` (846) ·
 `get_batch_completion_status` (913) · `mark_batch_completed` (956) ·
 `list_callback_due` (983) · `mark_callback_attempt` (1005) ·
 `reset_callback_for_retry` (1067)

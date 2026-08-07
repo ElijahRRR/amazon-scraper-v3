@@ -41,6 +41,11 @@
 
 3. **router 光秃**：`APIRouter()`，不带 `tags=` / `prefix=` /
    `include_in_schema`。`/openapi.json` 是黄金基线的一步、逐字节钉死。
+   ⚠ 因此 `Query(...)` 的**每一个约束参数都是对外契约的一部分**：
+   `le=` 会渲染成 schema 里的 `maximum`。本轮把 `le=200` 改成
+   `le=MAX_PAGE_LIMIT`（1000），黄金基线的 `openapi_schema` 那一步
+   因此有一处**有意的** diff（`maximum: 200 -> 1000`），已重录。
+   改这个参数 = 改契约，不是改实现细节。
 
 4. **函数名 / docstring / 路径一个字不改** —— 它们被编码进 `operationId` /
    `summary` / `description` / `Body_api_delete_by_file_*` schema 名。
@@ -78,10 +83,75 @@ router = APIRouter()
 
 # ==================== API: 结果查询 ====================
 
+#: 单页行数上限。**这个数字有出处，改之前先看下面这段。**
+#:
+#: 上一版是 ``le=200``，来自旧 erpAPI（「单页上限 200 是服务端硬约束，调大无效」），
+#: 移植时原样抄了过来、一行注释都没有。它在**旧库**上或许成立，在这套库上不成立：
+#: 2026-08-07 用 15 万行 asin_data / 15 万 batch_asins / 30 万 asin_changes /
+#: 15 万 screenshots 的 bench 库重测（列宽照真实采集填满：long_description 1755B、
+#: bullet_points 1049B、image_urls 594B，整行 JSON 化 5675 B/行），
+#: limit = 50/200/500/1000/2000/5000 逐档量翻页 SQL、count SQL、响应体字节：
+#:
+#:   PG，EXPLAIN (ANALYZE,BUFFERS) 的 Execution Time 中位数
+#:     翻页 SQL（无筛选）   0.05 / 0.10 / 0.21 / 0.44 / 1.33 / 2.70 ms
+#:     翻页 SQL（price_stock）0.22 / 0.69 / 1.79 / 3.46 / 6.96 / 18.52 ms
+#:     count SQL（无筛选）  15.3 / 14.6 / 14.9 / 16.6 / 16.2 / 15.2 ms
+#:     count SQL（price_stock）79.4 / 77.4 / 73.5 / 106.1 / 67.6 / 74.8 ms
+#:   响应体（两个后端逐字节同量级）0.27 / 1.06 / 2.65 / 5.31 / 10.6 / 26.5 MB
+#:
+#: 三条结论，都不是 SQL 说了算：
+#:
+#: 1. **count 与 limit 无关**。它是每个请求都要付的**固定**成本（Phase 1 之后
+#:    无筛选 ~15ms、change_filter 路径 ~70-105ms、SQLite 侧 change_filter ~120ms），
+#:    翻多少行都一样。所以它是**支持**调大 limit 的论据，不是限制：
+#:    拉 1 万行时，limit=200 要付 50 次 count，limit=1000 只付 10 次。
+#:    实测端到端（HTTP 全栈）拉满 1 万行：
+#:      change_filter 路径  limit=200 6315ms -> 500 3774ms -> 1000 3129ms -> 2000 2516ms
+#:      无筛选              limit=200 3405ms -> 500 2928ms -> 1000 2466ms -> 2000 2508ms
+#:    收益到 1000 就基本吃完，再往上换来的是更大的单次响应体，不是更高的吞吐。
+#: 2. **翻页 SQL 根本不是瓶颈**。5000 行也只有 2.7ms（无筛选）/ 18.5ms（有筛选），
+#:    比同一个请求里那条 count 还便宜一个数量级。Phase 1 已经把这条路径从
+#:    1007ms 打到了亚毫秒，limit 在这上面没有拐点，**任何档位都没有 SQL 悬崖**。
+#: 3. **真正的约束是响应体与序列化**，而且它是**线性**的、与 limit 无关：
+#:    本端点 ``return result`` 没有 response_model，FastAPI 走
+#:    ``jsonable_encoder`` -> ``json.dumps`` 的通用路径，纯 Python 逐字段递归。
+#:    limit=2000 那一档拆开是 db.get_results 80.7ms / jsonable_encoder 227.9ms /
+#:    json.dumps 153.0ms —— **82% 的账在 Python 序列化上**，每行约 230-250 µs，
+#:    每档都一样。所以调大 limit 既不会变快也不会变慢（每行成本恒定），
+#:    它只决定**一次请求要吐多大一坨**。
+#:
+#: 于是 1000 这个数是这么定的（三条都是"响应体/内存"口径，不是"SQL 耗时"口径）：
+#:   * 响应体 5.3 MB/页。2000 就是 10.6 MB、5000 是 26.5 MB —— 一个 JSON 响应
+#:     大到那个份上，中间的反代/网关默认体积限制就开始成为不可见的失败源。
+#:   * 单请求 Python 峰值内存 37.5 MB（tracemalloc，limit=2000 是 74.9 MB、
+#:     5000 是 187 MB）。PG_POOL_MAX 默认 10，1000 这一档满并发峰值约 375 MB，
+#:     2000 就是 750 MB —— 这才是会把进程打死的那条线。
+#:   * 与本仓库另外两个分页端点对齐：``server/api/export_incremental.py`` 与
+#:     ``server/api/sync.py`` 的 MAX_LIMIT 都是 1000，而 /api/export/incremental
+#:     的 1000 是**契约 v1**、沃尔玛侧已按它实现（R1，不许单方面改）。
+#:     三个端点同一个天花板，调用方少记一个数。
+#:
+#: ⚠ **与旧 erpAPI 的语义差别，调用方必须知道**：旧系统是「调大无效」（听起来像
+#:   静默截断）；这里是 ``le=``，FastAPI 对超限**直接 422 拒绝**，不截断。
+#:   静默截断更危险 —— 消费者会把「只回了 N 条」读成「只有 N 条」——
+#:   但它要求调用方**自己分页**而不是「传个大数看它给多少」。
+#:   钉在 tests/test_results_cursor_liveness.py::test_page_size_ceiling_rejects_not_truncates。
+#:
+#: 什么时候该重估：
+#:   * asin_data 平均行宽显著变化（新增宽列、或 long_description 的量级变了）
+#:     —— 上面每一档的 MB 数直接按 5675 B/行 线性缩放；
+#:   * 本端点加上 response_model 或换掉 ORJSONResponse 之类的序列化路径
+#:     —— 那 82% 的账会塌下去，天花板可以再往上抬；
+#:   * PG_POOL_MAX 或部署的内存配额变了 —— 上面第二条按 峰值内存 × 并发 重算。
+#:   重测脚本的做法见本轮报告；口径要三样一起看：EXPLAIN 的 Execution Time、
+#:   HTTP 全栈墙钟、响应体字节数。**只看 SQL 会得出「随便调多大都行」的错误结论。**
+MAX_PAGE_LIMIT = 1000
+
+
 @router.get("/api/results")
 async def api_results(batch_id: int = None,
                       cursor: int = None,
-                      limit: int = Query(50, le=200),
+                      limit: int = Query(50, le=MAX_PAGE_LIMIT),
                       search: str = None,
                       change_filter: str = "all",
                       direction: str = "next"):

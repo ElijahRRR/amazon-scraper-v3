@@ -114,9 +114,24 @@ def run(rec: Recorder) -> None:
               "needs_screenshot": "false", "external_id": "ext-golden-a"},
     )
 
-    # 同名批次重传：审计发现这是静默 no-op（INSERT OR IGNORE），必须钉住这个行为
+    # 同名批次重传 -> **409 Conflict**（有意的行为改动，基线已随之重录）。
+    #
+    # 这一步的注释以前写着「静默 no-op（INSERT OR IGNORE）」——**那是错的**，
+    # Phase 4.7 已经证明撞名不是 no-op：create_batch 返回既有批次 id，
+    # create_tasks 把本次的新 ASIN 悄悄并进上一个批次，而第二次的
+    # external_id / callback_url 被整行丢弃（响应回显的却是请求里的值）。
+    # 本轮把它改成 409：响应体带既有批次的 batch_id / batch_name / status_url，
+    # 调用方直接接着轮询即可。
+    #
+    # ⚠ 这一步的**副作用**跟着变了，基线里能看见两处连带位移，都是这个改动的
+    #   直接后果，不是新 bug：
+    #     * 撞名不再走 create_tasks，于是不再烧掉 3 个 task id ——
+    #       golden_batch_b 的两个任务从 id 7/8 变成 4/5，落在 pull_tasks 与
+    #       pull_tasks_round2 两步上（合计 3 个值），此外无连带位移；
+    #     * 批次的自增号**照样烧**（INSERT 照发、只是被 IGNORE），
+    #       所以 golden_batch_b 仍然是 batch id 3，没有位移。
     rec.call(
-        "upload_batch_a_duplicate", "POST", "/api/upload", expect=200,
+        "upload_batch_a_duplicate", "POST", "/api/upload", expect=409,
         files={"file": ("golden_a.xlsx", xlsx_a,
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         data={"batch_name": BATCH_A, "zip_code": "10001", "needs_screenshot": "false"},
@@ -297,7 +312,7 @@ def run(rec: Recorder) -> None:
 
     # ---------------- 错误路径（Phase 2.4 追加） ----------------
     # **必须留在文件末尾、`results_final` 之后。** 批次/任务的自增 id
-    # （batch id 3、task id 1/3/7/8）被前面的步骤逐值钉死，插在中间会让后面
+    # （batch id 3、task id 1/3/4/5）被前面的步骤逐值钉死，插在中间会让后面
     # 每一步全漂，diff 从「纯追加」变成几百处差异。
     #
     # 选步的硬筛：新增步骤在两个后端必须逐字节相同。下面每一步都是
@@ -314,6 +329,31 @@ def run(rec: Recorder) -> None:
              files={"file": ("golden_cb.txt", "\n".join(ASINS_A).encode(), "text/plain")},
              data={"batch_name": "golden_batch_cb", "needs_screenshot": "false",
                    "callback_url": "ftp://example.com/hook"})
+
+    # 撞名 + **不同的 callback_url**：钉住「第二次的 callback_url 不会被静默丢弃」。
+    #
+    # 旧行为下这一发会拿到 200，响应里回显着这个 callback_url，而库里存的仍是
+    # 批次 A 原来的值（None）—— 调用方以为回调注册好了，回调永远不触发。
+    # 现在是 409，响应体里根本没有 callback_url 这个字段，不存在"回显撒谎"。
+    #
+    # 「确实没写进去」由**下面第 6 步**的 callback_retry_without_callback_url 兜住：
+    # 它对同一个批次 A 打 callback/retry，靠的就是「批次 A 没有 callback_url」
+    # 才回 400。这一发若真把 callback_url 写进去了，那一步会变成 200，基线当场红。
+    #
+    # 放在文件末尾的错误路径节里，是为了不扰动前面被逐值钉死的自增 id：
+    # 它唯一的副作用是烧掉一个 batch 自增号，而这之后没有任何一步再读批次 id。
+    # callback_url 用**公网 IP 字面量**：_is_safe_callback_url 对 IP 字面量不做
+    # DNS 解析，所以这一步不碰网络、两个后端逐字节相同。
+    # （文档保留段 192.0.2/198.51.100/203.0.113 在 Python 里 is_private=True，
+    #   会被 SSRF 校验挡成 400，用不了。）
+    # 这个 URL 永远不会被真的请求：409 意味着它压根没入库，而黄金夹具还把
+    # _callback_dispatcher 整个 no-op 掉了 —— 两道，缺一道也不会往外发包。
+    rec.call("upload_duplicate_name_new_callback", "POST", "/api/upload", expect=409,
+             files={"file": ("golden_dup_cb.txt", "\n".join(ASINS_A).encode(),
+                             "text/plain")},
+             data={"batch_name": BATCH_A, "needs_screenshot": "false",
+                   "callback_url": "http://8.8.8.8/golden-hook",
+                   "external_id": "ext-golden-a-second"})
 
     # 批次不存在：四个端点各写各的 raise，所以要各录一步
     rec.call("screenshots_progress_missing_batch", "GET",

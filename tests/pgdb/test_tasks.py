@@ -45,7 +45,12 @@ async def _batch(db, name="b1"):
 async def test_create_tasks_returns_actually_inserted_and_burns_ids(pgdb):
     """自增烧号必须与 SQLite AUTOINCREMENT + INSERT OR IGNORE 逐字一致。
 
-    基线钉死的形状：3 条插入 → 同名重传 3 条全冲突（烧掉 4,5,6）→ 再插 2 条 = 7,8。
+    形状：3 条插入 → 同名重传 3 条全冲突（烧掉 4,5,6）→ 再插 2 条 = 7,8。
+
+    ⚠ 这曾经也被黄金基线覆盖（旧的 upload_batch_a_duplicate 会重跑一次
+      create_tasks），撞名改成 409 之后**不再是**：基线里的 task id 现在是
+      1,3,4,5。也就是说 create_tasks 的烧号从"两道网"变成"只剩这一道"，
+      改这条用例之前先想清楚没有别的东西在替它兜底。
     """
     bid = await _batch(pgdb)
     assert await pgdb.create_tasks(bid, ["X1", "X2", "X3"]) == 3

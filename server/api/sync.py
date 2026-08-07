@@ -88,8 +88,12 @@ logger = logging.getLogger(__name__)
 #: 但对外是 **int**（sync_meta 存的是 text）。
 CONTRACT_VERSION = 1
 
-#: /records 的 limit 上限。**独立于** /api/results 的 le=200 —— 计划 §5.1
-#: 明确要求不去动那个既有端点的上限。
+#: /records 的 limit 上限。原本是**独立于** /api/results 的（计划 §5.1 要求
+#: 不去动那个既有端点的上限，当时它是 le=200）。现在两者同为 1000 ——
+#: /api/results 的上限已按新库实测重定，出处见
+#: server/api/results.py:MAX_PAGE_LIMIT 那段注释。**仍然是两个独立常量**：
+#: 这里的 1000 是事件流契约的，那边的 1000 是响应体/内存口径推出来的，
+#: 只是恰好落在同一个数上，别把其中一个改成引用另一个。
 MAX_LIMIT = 1000
 DEFAULT_LIMIT = 200
 
@@ -127,6 +131,12 @@ VALID_OUTCOMES = ("ok", "not_found", "blocked", "parse_failed", "stale")
 #: 文档里出现的码 ⊆ 本集合（**单向**，理由见该文件头）。
 ERROR_CODES = frozenset({
     "ack_ahead_of_stream",
+    # `POST /api/upload` 撞名 -> 409。走 HTTPException 而非 `_err`（它不属于
+    # catalog_sync 契约，形状是 FastAPI 的 {"detail": {...}}），所以 AST 扫描
+    # 扫不到调用点 —— 与 `internal_error` 同例，由 tests/test_error_codes.py 里
+    # 一条显式断言看守。登记在这里是为了让「错误码封闭集」名副其实：
+    # 一个对外发出去的机器读码不在册，这个集合就只是半个真源。
+    "batch_name_conflict",
     "cursor_ahead_of_stream",
     "cursor_below_retention",
     "event_stream_unavailable",

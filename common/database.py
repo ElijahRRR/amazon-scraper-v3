@@ -608,11 +608,74 @@ class Database:
         callback_url: 采集完成时 POST 通知到此 URL。空表示不通知。
         expand_variants: 开启后，本批第一轮采完会把已采 ASIN 的同族变体（variation_asins）
             自动入队进【同一批次】继续采，直到无新增（正常 2 轮收敛）。默认关。
+
+        ⚠ **撞名时返回的是既有批次的 id，本方法分辨不出「新建」还是「命中已有」。**
+        需要分辨的调用方（``POST /api/upload`` 要据此回 409）用
+        ``create_batch_if_absent``——那才是真源，本方法只是丢掉第二个返回值的薄壳。
+        签名与返回类型一字未动：自动调度器（``_auto_scrape_scheduler`` /
+        ``/api/schedules/{name}/run``）那两条路径不该被这次改动波及。
+        """
+        batch_id, _created = await self.create_batch_if_absent(
+            name, needs_screenshot, is_auto,
+            external_id=external_id, callback_url=callback_url,
+            expand_variants=expand_variants,
+        )
+        return batch_id
+
+    async def create_batch_if_absent(self, name: str, needs_screenshot: bool = False,
+                                     is_auto: bool = False,
+                                     external_id: Optional[str] = None,
+                                     callback_url: Optional[str] = None,
+                                     expand_variants: bool = False) -> Tuple[int, bool]:
+        """建批次，返回 ``(batch_id, created)``。``created=False`` = 这个名字已经有批次了。
+
+        ------------------------------------------------------------------
+        为什么要有这个方法（旧坑 b + c 的共同根因）
+        ------------------------------------------------------------------
+        ``create_batch`` 是 ``INSERT OR IGNORE`` + 事后 ``SELECT id``，撞名时
+        返回既有批次的 id，**和新建时的返回形状完全一样**。Phase 4.7 已经写明
+        「撞名不是 no-op」，但当时只把结论写进注释，调用方仍然分辨不出来。
+        实测的后果（同名批次第二次上传）：
+
+          * 两次 ``create_batch`` 返回同一个 id；
+          * ``create_tasks`` 靠 ``UNIQUE(batch_id, asin)`` 吃掉重复，于是
+            ``inserted`` 是 0 还是非 0 取决于「这次的清单里有几个新 ASIN」——
+            部分重叠时返回非零，看起来像是成功新建了一个批次（旧坑 c）；
+          * **第二次的 external_id / callback_url 被静默丢弃**（``INSERT OR
+            IGNORE`` 整行不插，既有行一个字段都不更新），而 HTTP 响应回显的是
+            **请求**里的值 —— 调用方以为回调注册好了，回调永远不会触发。
+
+        ``created`` 这一位就是让 ``POST /api/upload`` 能回 409 的那一位。
+        409 之后：200 恒等于「新建了一个批次」，``inserted`` 的歧义消失（旧坑 c），
+        调用方也不再需要毫秒精度的批次名去躲开合并（旧坑 b）。
+
+        ------------------------------------------------------------------
+        为什么是新方法，而不是给 create_batch 加参数
+        ------------------------------------------------------------------
+        加参数（比如 ``return_created=True``）会让**返回类型随参数变**，
+        而 ``create_batch`` 的返回值今天被两处生产调用方（``app.py:831`` 的
+        自动调度器、``app.py:1820`` 的 ``/api/schedules/{name}/run``）直接当
+        int 用，测试里更多；更要紧的是
+        ``tests/pgdb/test_skeleton.py::test_signatures_match_sqlite`` 只比签名、
+        比不到「返回形状」，一个随参数变形的返回值在两个后端漂了也不会有人红。
+        新方法则是：SQL 只有一份（``create_batch`` 转调它），返回类型恒定，
+        两侧签名各自静态可比。代价是 ``PUBLIC_API`` 多一个名字——值。
+
+        ------------------------------------------------------------------
+        两条必须保持的既有性质
+        ------------------------------------------------------------------
+        1. **撞名照样烧号**：INSERT 照发（只是被 IGNORE 掉），自增序列照样 +1。
+           这是两个后端实测一致的现状，黄金基线的 ``golden_batch_b`` 是 id 3
+           不是 2 就是这么来的。**绝不允许**改成「先 SELECT 再决定插不插」。
+        2. ``name=None``（NOT NULL 冲突）→ ``(0, False)``：插不进去、SELECT 也
+           查不到。``created`` 为 False 是对的——确实没建出来。
         """
         callback_status = "pending" if callback_url else None
         async with self._write_lock:
             await self._db.execute("BEGIN")
-            await self._db.execute(
+            # rowcount：INSERT OR IGNORE 真插进去是 1，被 IGNORE 掉是 0。
+            # 这一位必须在 COMMIT **之前**读——之后 cursor 上的计数不再对应这条语句。
+            cur = await self._db.execute(
                 "INSERT OR IGNORE INTO batches "
                 "(name, needs_screenshot, is_auto, status, external_id, "
                 " callback_url, callback_status, expand_variants) "
@@ -621,10 +684,13 @@ class Database:
                  external_id, callback_url, callback_status,
                  1 if expand_variants else 0)
             )
+            created = cur.rowcount > 0
             await self._db.execute("COMMIT")
             async with self._db.execute("SELECT id FROM batches WHERE name = ?", (name,)) as c:
                 row = await c.fetchone()
-                return row[0] if row else 0
+                batch_id = row[0] if row else 0
+        # 没拿到 id 就谈不上"新建"（name=None 那条路）。
+        return batch_id, (created and batch_id > 0)
 
     async def get_batches(self) -> List[Dict]:
         """获取所有批次及其统计"""

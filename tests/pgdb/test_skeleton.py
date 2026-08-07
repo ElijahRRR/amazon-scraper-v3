@@ -276,9 +276,16 @@ async def test_timestamp_default_format_and_types(pgdb):
 
 @pytest.mark.asyncio
 async def test_identity_burns_ids_like_sqlite_autoincrement(pgdb):
-    """基线钉死了自增空洞：golden_batch_b 是 id 3 不是 2，task id 是 1,3,7,8。
+    """基线钉死了 batches 的自增空洞：golden_batch_b 是 id 3 不是 2。
 
     任何"先查再插 / WHERE NOT EXISTS"的预过滤都会改变烧号，进而挪动下游所有 id。
+    撞名 -> 409 之后这一条**更要紧**了：409 响应体里那个 batch_id 就是撞名时
+    SELECT 回来的既有 id，预过滤会让它变成 0。
+
+    ⚠ tasks 那边的空洞已经**不再被黄金覆盖**：撞名现在 409 掉，不再走
+      create_tasks，基线里的 task id 是 1,3,4,5（没有重复上传烧掉的 4,5,6）。
+      create_tasks 的烧号今天只由 tests/pgdb/test_tasks.py::
+      test_create_tasks_returns_actually_inserted_and_burns_ids 单独看守。
     """
     conn = pgdb._write_conn
     for names in (("a", "b", "c"), ("a", "b", "c"), ("d", "e")):

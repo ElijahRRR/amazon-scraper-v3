@@ -7,7 +7,7 @@
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_create_batch_duplicate_is_noop(pgdb):
+    async def test_create_batch_duplicate_reuses_the_id(pgdb):
         first = await pgdb.create_batch("b1")
         again = await pgdb.create_batch("b1")
         assert again == first          # 同名重传返回已有 id，不是 0、不是新 id

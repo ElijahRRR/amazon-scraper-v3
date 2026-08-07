@@ -905,7 +905,7 @@
             },
             "/api/batches/{batch_name}/errors": {
               "get": {
-                "description": "获取批次错误详情",
+                "description": "获取批次错误详情（**旧接口，请改用 `/api/batches/{batch_id}/failures`**）。\n\n本端点有两条硬限制，都是设计如此、调大参数也没用：\n\n- `failed_tasks` **最多 200 条**，超出的部分直接看不见；\n- 排序是 `updated_at DESC, id DESC` —— 一次批量提交里的失败任务共享同一个\n  秒级 `updated_at`，所以「最近 200 条」在同一批内部并不是一个有业务含义的切片。\n\n需要**完整**失败明细请用 `GET /api/batches/{batch_id}/failures`：按 batch_id\n取（不依赖批次名）、`limit` 上限 100000、不截断到 200 条，还支持\n`error_type` 过滤。\n\n保留本端点只是为了不打断已在使用它的调用方，不再接受新接入。",
                 "operationId": "api_batch_errors_api_batches__batch_name__errors_get",
                 "parameters": [
                   {
@@ -1408,7 +1408,7 @@
                     "required": false,
                     "schema": {
                       "default": 50,
-                      "maximum": 200,
+                      "maximum": 1000,
                       "title": "Limit",
                       "type": "integer"
                     }
@@ -2080,7 +2080,7 @@
             },
             "/api/upload": {
               "post": {
-                "description": "上传 ASIN 文件创建批次。\n\n支持 xlsx / csv / txt 三种格式：\n- **xlsx / csv**：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的采集邮编（5 位数字）\n  B 列为空 → 用本次上传指定的 batch zip（或服务端默认）\n- **txt**：每行一个 ASIN（无邮编列）\n\n可选 callback：\n- `callback_url`：批次完成时（含截图）POST 到此 URL 通知调用方\n- `external_id`：调用方自己的批次 ID，原样回传，便于追踪",
+                "description": "上传 ASIN 文件创建批次。\n\n支持 xlsx / csv / txt 三种格式：\n- **xlsx / csv**：A 列 = ASIN，B 列（可选）= 该 ASIN 单独的采集邮编（5 位数字）\n  B 列为空 → 用本次上传指定的 batch zip（或服务端默认）\n- **txt**：每行一个 ASIN（无邮编列）\n\n可选 callback：\n- `callback_url`：批次完成时（含截图）POST 到此 URL 通知调用方\n- `external_id`：调用方自己的批次 ID，原样回传，便于追踪\n\n批次名冲突 → **409 Conflict**，绝不静默合并进已有批次。409 的响应体里带\n`detail.batch_id` / `detail.batch_name` / `detail.status_url`，调用方可以\n直接拿去接着轮询。\n\n由此得到的三条性质（调用方可以依赖）：\n- **本端点可以安全重试**：网络超时后重发，若上一次其实成功了，拿到的是\n  409 + 那个既有 batch_id，而不是又建一个批次、也不会悄悄并进去。\n- 批次名不需要毫秒精度去躲开合并。\n- **200 恒等于「新建了一个批次」**，`inserted` 因此不再有歧义。\n\n200 响应里的 `external_id` / `callback_url` 回显的是**批次实际存下来的**值\n（读回后再回显），不是请求里的值。",
                 "operationId": "api_upload_api_upload_post",
                 "requestBody": {
                   "content": {
@@ -2404,18 +2404,16 @@
       },
       "response": {
         "body": {
-          "batch_id": 1,
-          "batch_name": "golden_batch_a",
-          "callback_url": null,
-          "external_id": null,
-          "inserted": 0,
-          "invalid_zip_rows": 0,
-          "per_asin_zip_count": 2,
-          "status_url": "http://testserver/api/batches/golden_batch_a/status",
-          "total_asins": 3
+          "detail": {
+            "batch_id": 1,
+            "batch_name": "golden_batch_a",
+            "error": "batch_name_conflict",
+            "message": "批次名已存在: golden_batch_a（未合并，也未改动既有批次）",
+            "status_url": "http://testserver/api/batches/golden_batch_a/status"
+          }
         },
         "content_type": "application/json",
-        "status": 200
+        "status": 409
       }
     },
     {
@@ -2735,7 +2733,7 @@
               "batch_id": 3,
               "batch_name": "golden_batch_b",
               "discover_mode": null,
-              "id": 7,
+              "id": 4,
               "lease_epoch": 0,
               "needs_screenshot": false,
               "priority": 0,
@@ -2749,7 +2747,7 @@
               "batch_id": 3,
               "batch_name": "golden_batch_b",
               "discover_mode": null,
-              "id": 8,
+              "id": 5,
               "lease_epoch": 0,
               "needs_screenshot": false,
               "priority": 0,
@@ -2927,7 +2925,7 @@
               "stock_count": "42",
               "stock_status": "In Stock",
               "success": true,
-              "task_id": 7,
+              "task_id": 4,
               "title": "Golden Test Product B0GOLDEN03",
               "upc_list": "012345678905",
               "variant_attributes": "Color:Red",
@@ -2963,7 +2961,7 @@
           "error_type": "TIMEOUT",
           "lease_epoch": 0,
           "success": false,
-          "task_id": 8,
+          "task_id": 5,
           "worker_id": "w-golden-01"
         },
         "method": "POST",
@@ -4396,7 +4394,7 @@
               "batch_id": 3,
               "batch_name": "golden_batch_b",
               "discover_mode": null,
-              "id": 8,
+              "id": 5,
               "lease_epoch": 1,
               "needs_screenshot": false,
               "priority": 0,
@@ -4460,7 +4458,7 @@
               "stock_count": "7",
               "stock_status": "In Stock",
               "success": true,
-              "task_id": 8,
+              "task_id": 5,
               "title": "Golden Test Product B0GOLDEN04 v2",
               "upc_list": "012345678905",
               "variant_attributes": "Color:Red",
@@ -5384,7 +5382,7 @@
           "__html__": {
             "has_jinja_error": false,
             "has_traceback": false,
-            "size_bucket": 30
+            "size_bucket": 31
           }
         },
         "content_type": "text/html",
@@ -5801,6 +5799,37 @@
         },
         "content_type": "application/json",
         "status": 400
+      }
+    },
+    {
+      "name": "upload_duplicate_name_new_callback",
+      "request": {
+        "data": {
+          "batch_name": "golden_batch_a",
+          "callback_url": "http://8.8.8.8/golden-hook",
+          "external_id": "ext-golden-a-second",
+          "needs_screenshot": "false"
+        },
+        "files": [
+          "file"
+        ],
+        "json": null,
+        "method": "POST",
+        "params": null,
+        "path": "/api/upload"
+      },
+      "response": {
+        "body": {
+          "detail": {
+            "batch_id": 1,
+            "batch_name": "golden_batch_a",
+            "error": "batch_name_conflict",
+            "message": "批次名已存在: golden_batch_a（未合并，也未改动既有批次）",
+            "status_url": "http://testserver/api/batches/golden_batch_a/status"
+          }
+        },
+        "content_type": "application/json",
+        "status": 409
       }
     },
     {

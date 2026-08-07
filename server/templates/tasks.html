@@ -228,7 +228,11 @@ document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             resultDiv.style.display = 'block';
             const alertDiv = document.createElement('div');
             alertDiv.className = 'alert alert-danger';
-            alertDiv.textContent = '❌ ' + (data.detail || '上传失败');
+            // 409（批次名冲突）的 detail 是个对象；其余 4xx 是字符串。
+            // 不分辨的话这里会显示成 "[object Object]"。
+            const d = data.detail;
+            alertDiv.textContent = '❌ ' + ((d && typeof d === 'object')
+                ? (d.message || d.error || '上传失败') : (d || '上传失败'));
             resultDiv.innerHTML = '';
             resultDiv.appendChild(alertDiv);
         }

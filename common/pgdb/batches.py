@@ -1,7 +1,8 @@
 """common/pgdb/batches.py —— 批次 + 回调机制。
 
-OWNS（8 个方法，对应 common/database.py 的同名实现）:
+OWNS（9 个方法，对应 common/database.py 的同名实现）:
     create_batch                 database.py:799
+    create_batch_if_absent       database.py:812   ← 撞名判定的真源，create_batch 转调它
     get_batches                  database.py:828
     get_batch_by_name            database.py:846
     get_batch_completion_status  database.py:913
@@ -23,9 +24,14 @@ OWNS（8 个方法，对应 common/database.py 的同名实现）:
     ``except IntegrityConstraintViolationError: pass`` 补齐 —— 不补的话
     ``create_batch(None)`` 会从 SQLite 的返回 0 变成 PG 抛 NotNullViolationError。
   **不要**改写成 ``ON CONFLICT DO NOTHING RETURNING id``：冲突时它不返回行，
-  create_batch 就会从"返回已存在的 id"变成返回 0，基线 step
-  ``upload_batch_a_duplicate``（inserted=0 且复用原 batch）直接炸。
-  同名重传静默 no-op 是被钉死的行为。
+  create_batch 就会从"返回已存在的 id"变成返回 0 —— 而撞名分支查回来的那个 id
+  正是 ``POST /api/upload`` 409 响应体里的 ``batch_id``（调用方接着拿它轮询），
+  必须查得到。
+  ⚠ 这段以前写的是"同名重传静默 no-op 是被钉死的行为"，**那句已作废**：
+  Phase 4.7 证明撞名不是 no-op（新 ASIN 被并进上一批、第二次的
+  external_id/callback_url 被静默丢弃），本轮把它改成 409。
+  基线 step ``upload_batch_a_duplicate`` 现在录的是 409，不再是 inserted=0 的 200。
+  「撞名返回既有 id」这条**仍然钉死**，只是它现在服务的是 409 的响应体。
   SELECT 要在事务提交**之后**发（SQLite 版就是 COMMIT 后的自动提交读）。
   另外：冲突时 identity 序列**照样烧号**（实测 PG 与 SQLite 完全一致），
   基线里 golden_batch_b 的 id 是 3 不是 2 就是这么来的 —— 绝不允许
@@ -89,7 +95,7 @@ OWNS（8 个方法，对应 common/database.py 的同名实现）:
 from __future__ import annotations
 
 from common.core.timeutil import now_ts
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # 只借异常类型，不建连接（硬规矩 3 禁的是自己建连接）。
 from asyncpg.exceptions import IntegrityConstraintViolationError
@@ -115,9 +121,39 @@ class BatchesMixin:
         callback_url: 采集完成时 POST 通知到此 URL。空表示不通知。
         expand_variants: 开启后，本批第一轮采完会把已采 ASIN 的同族变体（variation_asins）
             自动入队进【同一批次】继续采，直到无新增（正常 2 轮收敛）。默认关。
+
+        ⚠ 撞名时返回既有批次的 id，分辨不出「新建 vs 命中已有」。要分辨的用
+        ``create_batch_if_absent``（真源，本方法只是丢掉第二个返回值的薄壳）。
+        与 SQLite 侧逐字同构。
+        """
+        batch_id, _created = await self.create_batch_if_absent(
+            name, needs_screenshot, is_auto,
+            external_id=external_id, callback_url=callback_url,
+            expand_variants=expand_variants,
+        )
+        return batch_id
+
+    async def create_batch_if_absent(self, name: str, needs_screenshot: bool = False,
+                                     is_auto: bool = False,
+                                     external_id: Optional[str] = None,
+                                     callback_url: Optional[str] = None,
+                                     expand_variants: bool = False) -> Tuple[int, bool]:
+        """建批次，返回 ``(batch_id, created)``。语义与理由见 SQLite 侧同名方法。
+
+        PG 侧的 ``created`` 从**命令标签**来：``ON CONFLICT DO NOTHING`` 命中冲突
+        时标签是 ``INSERT 0 0``，真插进去是 ``INSERT 0 1``，``pool.Cursor.rowcount``
+        已经把它解析成 int（``rowcount_from_tag``）。所以这一位与 SQLite 的
+        ``cursor.rowcount`` 是同一个东西，不需要额外往返。
+
+        ⚠ **不要**改写成 ``ON CONFLICT DO NOTHING RETURNING id`` 来"顺手把 id 也拿了"：
+        冲突时它不返回行，``create_batch`` 就会从"返回已存在的 id"变成返回 0 ——
+        撞名分支恰恰是 409 响应体里那个 ``batch_id`` 的来源，必须查得到。
+        ``IntegrityConstraintViolationError``（NOT NULL / CHECK / FK）的补差
+        照旧，``created`` 在那条路上是 False。
         """
         callback_status = "pending" if callback_url else None
         name_p = text_affinity(name)
+        created = False
         async with self._write_lock:
             # ON CONFLICT DO NOTHING 只吞**唯一/排他**冲突，而 SQLite 的
             # INSERT OR IGNORE 吞的是**所有**约束冲突——NOT NULL / CHECK / FK 也算。
@@ -132,7 +168,7 @@ class BatchesMixin:
                     # INSERT OR IGNORE → ON CONFLICT DO NOTHING（裸的、不写冲突目标）。
                     # 冲突时**不返回行**，所以 id 必须由下面那条独立 SELECT 取回 ——
                     # 这正是"同名重传返回已有 id"的来源，基线钉死了它。
-                    await self._db.execute(
+                    cur = await self._db.execute(
                         "INSERT INTO batches "
                         "(name, needs_screenshot, is_auto, status, external_id, "
                         " callback_url, callback_status, expand_variants) "
@@ -143,13 +179,16 @@ class BatchesMixin:
                          callback_status,
                          1 if expand_variants else 0)
                     )
+                    # 'INSERT 0 1' -> 1（真插了）/ 'INSERT 0 0' -> 0（撞名被吞）
+                    created = cur.rowcount > 0
             except IntegrityConstraintViolationError:
-                pass
+                created = False
             # 提交之后再读（SQLite 版就是 COMMIT 后的自动提交读），仍在写锁内
             async with self._db.execute(
                     "SELECT id FROM batches WHERE name = ?", (name_p,)) as c:
                 row = await c.fetchone()
-                return row[0] if row else 0
+                batch_id = row[0] if row else 0
+        return batch_id, (created and batch_id > 0)
 
     async def get_batches(self) -> List[Dict]:
         """获取所有批次及其统计"""

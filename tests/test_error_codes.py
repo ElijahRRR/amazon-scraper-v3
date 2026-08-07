@@ -144,6 +144,19 @@ class ErrorCodeRegistryTests(unittest.TestCase):
         """全局 500 处理器（`server/app.py`）用的码，不经过 `_err`，容易被漏掉。"""
         self.assertIn("internal_error", ERROR_CODES)
 
+    def test_batch_name_conflict_is_registered(self):
+        """`POST /api/upload` 撞名 409 用的码，同样不经过 `_err`。
+
+        它是 `HTTPException(409, {...})`，形状是 FastAPI 的
+        `{"detail": {"error": ..., ...}}`，与 `_err` 的扁平体不同，所以文件头
+        第 1 条那道 AST 扫描对它是**结构性**盲区。这条断言是它唯一的注册守卫：
+        直接比对 `server/app.py` 里那个常量的**取值**，而不是重抄一遍字面量，
+        免得两边各改各的还双双绿着。
+        """
+        from server.app import _BATCH_NAME_CONFLICT_CODE
+
+        self.assertIn(_BATCH_NAME_CONFLICT_CODE, ERROR_CODES)
+
     def test_extra_cannot_clobber_the_reserved_keys(self):
         """`_err` 的 `extra` 撞上保留键时被**剔除**，不是覆盖、也不是抛。
 

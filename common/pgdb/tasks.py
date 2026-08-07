@@ -26,7 +26,8 @@ create_tasks
     实测：3 行输入全部冲突 → 标签 ``INSERT 0 0``；4 行输入 2 行冲突 →
     ``INSERT 0 2``，与 SQLite 的 total_changes 差值逐字一致。
   * ⚠ 插入**次数**必须与 SQLite 完全一致，因为 identity 的**烧号**被基线钉死
-    （task id 是 1,3,7,8——2,4,5,6 被重复上传烧掉）。实测 unnest 形式的
+    （tests/pgdb/test_tasks.py 里那条 1,2,3,7,8；黄金基线自撞名改 409 后
+    不再重复上传，所以它那边的 task id 是 1,3,4,5）。实测 unnest 形式的
     INSERT ... ON CONFLICT DO NOTHING 对每一条源行都会取一次 nextval，
     冲突行照样烧号，与 SQLite AUTOINCREMENT + INSERT OR IGNORE 完全一致。
     任何"先查已存在再插"的预过滤都会把下游所有 id 挪位。

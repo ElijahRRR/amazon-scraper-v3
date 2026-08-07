@@ -9,8 +9,14 @@ Phase 4.5-4.8 审计的变异 M3 实测：把 `_batch_name` 改回分钟精度�
 而它要防的缺陷是**真的**（审计实测复现）：
     create_batch('dup_name') 连调两次 -> 两次都返回 id=1
     两次 create_tasks 各插 1 条     -> 该批次任务总数 = 2，batches 总行数 = 1
-即撞名时新 ASIN 被**并进上一个批次**，接口照样回 200 和那个既有的 batch_id。
+即撞名时新 ASIN 被**并进上一个批次**，没有任何一侧报错。
 所以「同一分钟内自动触发 + 手动触发 = 什么都不做」只在 ASIN 清单没变时成立。
+
+⚠ `POST /api/upload` 已经把这条路堵死了（撞名 -> 409，走 `create_batch_if_absent`），
+但 `_auto_scrape_scheduler` 与 `/api/schedules/{name}/run` **仍然**走
+`create_batch`，静默合并照旧 —— 它们是内部触发、没有调用方接得住 409。
+`_batch_name` 的五个调用点里正是这两个当年是分钟精度，所以本文件守的东西
+一点没变轻：秒精度现在是那两条路径**唯一**的防线。
 
 写成 unittest.TestCase 是为了让四道 runner 门（pytest × 2 列、
 unittest discover × 2 列）都盖得到 —— 裸 test_ 函数会在 unittest 那两列被静默跳过。

@@ -453,6 +453,72 @@ class TasksMixin:
             logger.info(f"自动重试 {retried} 个失败任务 (delay={delay_minutes}min, max_cycles={max_auto_cycles})")
         return retried
 
+    async def retry_failed_tasks(self, batch_id: int,
+                                 exclude_error_types=()) -> dict:
+        """把一个批次里的 failed 任务重新入队（``POST /api/batches/{name}/retry`` 的库侧动作）。
+
+        exclude_error_types: 不重试的 error_type 清单（调用方给，通常是
+            ``sorted(NO_AUTO_RETRY_ERROR_TYPES)``）。空清单 = 全部重试。
+            **调用方自己传**而不是在这里读全局常量：这条策略是 handler 的语义
+            （"始终跳过 variant_offset"），响应体里还要原样回显它。
+
+        Returns: ``{"retried": n, "skipped": m}``
+            retried —— 真被改成 pending 的行数；
+            skipped —— 因命中 exclude 清单而**没**被重试的 failed 行数（供前端展示）。
+
+        与 ``auto_retry_failed_tasks`` 的区别：这是**运维手动**触发，不看
+        ``auto_retry_count`` / ``updated_at`` 冷却，也不 bump ``lease_epoch``。
+        两者刻意不合并 —— 合并要么给自动重试加上手动的旁路，要么给手动加上
+        自动的节流，哪个方向都是行为变更。
+
+        统计与更新必须在**同一个事务**里，否则 skipped 与 retried 可能来自
+        两个不同的快照，加起来对不上那一刻的 failed 总数。
+
+        PG 侧与 SQLite 侧逐字同形（``?`` 由 ``pool.translate_sql`` 改写），
+        只有 ``int(batch_id)`` 是 PG 特有的：asyncpg 按参数的 Python 类型
+        推断，路由传进来的是 str 就会 DataError。
+        """
+        excl = list(exclude_error_types or ())
+        placeholders = ",".join("?" * len(excl))
+
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
+                skipped = 0
+                if excl:
+                    async with self._db.execute(
+                        f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
+                        f"AND COALESCE(error_type, '') IN ({placeholders})",
+                        [int(batch_id)] + excl
+                    ) as c:
+                        row = await c.fetchone()
+                        skipped = row[0] if row else 0
+
+                # 实际重试 SQL：始终排除 excl 清单。
+                if not excl:
+                    cursor = await self._db.execute(
+                        "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                        "WHERE batch_id=? AND status='failed'",
+                        (int(batch_id),)
+                    )
+                else:
+                    cursor = await self._db.execute(
+                        f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                        f"WHERE batch_id=? AND status='failed' "
+                        f"AND COALESCE(error_type, '') NOT IN ({placeholders})",
+                        [int(batch_id)] + excl
+                    )
+                retried = cursor.rowcount
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
+        return {"retried": retried, "skipped": skipped}
+
     async def fail_task(self, task_id: int, worker_id: str, lease_epoch: int,
                         error_type: str = "", error_detail: str = "") -> dict:
         """标记任务失败（校验 worker_id + lease_epoch）

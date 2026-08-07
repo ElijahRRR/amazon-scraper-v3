@@ -17,6 +17,14 @@
 * ``_fail_cap`` / ``NO_AUTO_RETRY_ERROR_TYPES`` / ``LIMITED_RETRY_ERROR_TYPES`` ——
   重试上限策略，app.py:1239 直接 import。
 * ``_parse_price_float`` 等四个比较器 —— 变动检测；app.py:1807 直接 import 第一个。
+* ``ASIN_DELETE_CHUNK`` / ``ASIN_DELETE_TABLES`` —— ``delete_asins`` 的分块大小
+  与表清单。分块边界分叉 = 两个后端发出的语句序列不同，出事时对不上号。
+* ``search_like_pattern`` —— ``%term%``，**不转义**。读路径（``get_results``）
+  与删除路径（``find_asins_by_search``）必须用同一个，否则同一个 search
+  在 GET 和 DELETE 下选中不同的行（D-16 记的就是这个事故）。
+* ``CLEAR_TABLES`` —— ``clear_all_data`` 的删除清单。两侧各有一份实现
+  （SQLite 删 ``sqlite_sequence``、PG 做 identity RESTART），但**删哪些表**
+  必须是同一份，否则两个后端「清空」之后剩下的东西悄悄不同。
 
 导入 common.database 的代价：它 import aiosqlite（venv 里已装），无副作用、不建连接。
 
@@ -53,6 +61,12 @@ from common.database import (
     # ---- asin_data 列清单 ----
     ASIN_DATA_FIELDS,
     _ASIN_DATA_COLUMN_SET,
+    # ---- 清库的表清单（DELETE /api/database）----
+    CLEAR_TABLES,
+    # ---- 按 ASIN 删除 / 模糊搜索（DELETE /api/results）----
+    ASIN_DELETE_CHUNK,
+    ASIN_DELETE_TABLES,
+    search_like_pattern,
 )
 
 __all__ = [
@@ -79,4 +93,8 @@ __all__ = [
     "_compute_title_bullets_hash",
     "ASIN_DATA_FIELDS",
     "_ASIN_DATA_COLUMN_SET",
+    "CLEAR_TABLES",
+    "ASIN_DELETE_CHUNK",
+    "ASIN_DELETE_TABLES",
+    "search_like_pattern",
 ]

@@ -293,6 +293,39 @@ ASIN_DATA_FIELDS = [
 # 防止调用方传入的列名拼进 SQL 造成注入或引用不存在的列。
 _ASIN_DATA_COLUMN_SET = frozenset(ASIN_DATA_FIELDS) | {"id", "updated_at", "created_at"}
 
+# `DELETE /api/database` 清库的删除顺序（Database.clear_all_data 用）。
+# 子表在前、父表在后 —— PG 侧有真外键，顺序在那边是正确性问题；SQLite 侧
+# 顺序无所谓。两个后端**共用这一份**（pgdb 经 common/pgdb/_shared.py 再导出），
+# 分叉 = 两个后端「清空」之后剩下的东西悄悄不同。
+CLEAR_TABLES = ("asin_changes", "asin_data", "batch_asins", "tasks",
+                "screenshots", "batches")
+
+# 按 ASIN 删除时的分块大小。SQLite 的 SQLITE_MAX_VARIABLE_NUMBER 默认 999，
+# 一条 `IN (?,?,...)` 不能超过它；500 是安全值。PG 没有这个限制，但**必须
+# 用同一个值**：分块边界不同 = 两个后端发出的语句序列不同，一旦某一块中途
+# 失败（两侧都在一个事务里，所以只会整体回滚），排障时对不上号。
+ASIN_DELETE_CHUNK = 500
+
+# 按 ASIN 删除要清的四张表（顺序：子表在前）。asin_data 最后 —— PG 侧
+# asin_changes / screenshots / batch_asins 都可能引用它。
+ASIN_DELETE_TABLES = ("asin_changes", "screenshots", "batch_asins", "asin_data")
+
+# 一个 search term 的三列 OR 谓词（SQLite 侧原文；PG 侧见
+# common/pgdb/results_read.py 的 _TERM_OR —— 那边必须写成
+# ascii_lower(col) LIKE ascii_lower(?) ESCAPE ''，见 OWNERSHIP.md D-5 / D-16）。
+SEARCH_TERM_OR = "(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)"
+
+
+def search_like_pattern(t: str) -> str:
+    """``%term%``，**不做任何转义**。
+
+    SQLite 的 LIKE 没有转义字符，所以模式原样传下去；PG 侧靠 SQL 里的
+    ``ESCAPE ''`` 关掉默认的反斜杠转义来对齐（决策 D-16）。
+    ``%`` 与 ``_`` 故意不转义：用户输入里的通配符今天就是生效的
+    （``Gol%rand`` 是模糊匹配），两个引擎的元字符一样，这个行为免费保留。
+    """
+    return "%" + str(t) + "%"
+
 
 class Database:
     """异步 SQLite 数据库管理器 v3"""
@@ -1370,6 +1403,68 @@ class Database:
             logger.info(f"自动重试 {retried} 个失败任务 (delay={delay_minutes}min, max_cycles={max_auto_cycles})")
         return retried
 
+    async def retry_failed_tasks(self, batch_id: int,
+                                 exclude_error_types=()) -> dict:
+        """把一个批次里的 failed 任务重新入队（``POST /api/batches/{name}/retry`` 的库侧动作）。
+
+        exclude_error_types: 不重试的 error_type 清单（调用方给，通常是
+            ``sorted(NO_AUTO_RETRY_ERROR_TYPES)``）。空清单 = 全部重试。
+            **调用方自己传**而不是在这里读全局常量：这条策略是 handler 的语义
+            （"始终跳过 variant_offset"），响应体里还要原样回显它。
+
+        Returns: ``{"retried": n, "skipped": m}``
+            retried —— 真被改成 pending 的行数；
+            skipped —— 因命中 exclude 清单而**没**被重试的 failed 行数（供前端展示）。
+
+        与 ``auto_retry_failed_tasks`` 的区别：这是**运维手动**触发，不看
+        ``auto_retry_count`` / ``updated_at`` 冷却，也不 bump ``lease_epoch``。
+        两者刻意不合并 —— 合并要么给自动重试加上手动的旁路，要么给手动加上
+        自动的节流，哪个方向都是行为变更。
+
+        统计与更新必须在**同一个事务**里，否则 skipped 与 retried 可能来自
+        两个不同的快照，加起来对不上那一刻的 failed 总数。
+        """
+        excl = list(exclude_error_types or ())
+        placeholders = ",".join("?" * len(excl))
+
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
+                skipped = 0
+                if excl:
+                    async with self._db.execute(
+                        f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
+                        f"AND COALESCE(error_type, '') IN ({placeholders})",
+                        [batch_id] + excl
+                    ) as c:
+                        row = await c.fetchone()
+                        skipped = row[0] if row else 0
+
+                # 实际重试 SQL：始终排除 excl 清单。
+                if not excl:
+                    cursor = await self._db.execute(
+                        "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                        "WHERE batch_id=? AND status='failed'",
+                        (batch_id,)
+                    )
+                else:
+                    cursor = await self._db.execute(
+                        f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
+                        f"WHERE batch_id=? AND status='failed' "
+                        f"AND COALESCE(error_type, '') NOT IN ({placeholders})",
+                        [batch_id] + excl
+                    )
+                retried = cursor.rowcount
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
+        return {"retried": retried, "skipped": skipped}
+
     async def fail_task(self, task_id: int, worker_id: str, lease_epoch: int,
                         error_type: str = "", error_detail: str = "") -> dict:
         """标记任务失败（校验 worker_id + lease_epoch）
@@ -1460,6 +1555,56 @@ class Database:
                 (priority, batch_id)
             )
             await self._db.execute("COMMIT")
+
+    async def delete_batches(self, batch_ids) -> List[str]:
+        """删除若干批次及其全部关联数据，返回**待删除的截图物理文件路径**。
+
+        ``DELETE /api/batches/{name}`` 与 ``POST /api/batches/delete-bulk``
+        的库侧动作（Phase 3.8 批 (2) 把两处收成一处）。
+
+        **文件不在这里删**：返回路径清单，由 handler 调 ``_remove_screenshot_files``。
+        库方法删文件意味着一个失败的 unlink 能污染一次数据库操作，而且
+        测试再也不能在不碰磁盘的前提下验它。
+
+        入参去重 / 上限（bulk 端点的 500 上限）属于**请求校验**，留在 handler。
+        这里只做 ``int()`` 归一 —— asyncpg 按 Python 类型推参数，路由给的
+        str id 会 DataError。
+
+        路径清单在写锁**外**、事务**前**取：截图行马上就要被删掉，取晚了就空了。
+        收口前单条删除走的是 ``db._db``（写连接），bulk 走的是 ``db.read()``
+        （读池）；这里统一成读池 —— 两者读的都是已提交数据，但读池不占写连接，
+        也就不会跟正在跑的写事务抢那一条连接。
+
+        删除顺序：先四张子表、最后 batches。PG 侧有真外键，顺序即正确性。
+        """
+        ids = [int(b) for b in batch_ids]
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+
+        # 先收集截图物理文件路径（只读连接，不占写锁）
+        async with self.read() as rc, rc.execute(
+            f"SELECT file_path FROM screenshots WHERE batch_id IN ({ph})"
+            f" AND file_path IS NOT NULL", ids
+        ) as c:
+            screenshot_files = [row["file_path"] for row in await c.fetchall()]
+
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                for tbl in ("tasks", "batch_asins", "screenshots", "asin_changes"):
+                    await self._db.execute(
+                        f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", ids)
+                await self._db.execute(
+                    f"DELETE FROM batches WHERE id IN ({ph})", ids)
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
+        return screenshot_files
 
     async def get_progress(self, batch_id: int = None) -> Dict:
         """获取任务进度"""
@@ -2306,6 +2451,109 @@ class Database:
             "total": total,
         }
 
+    async def get_batch_asin_set(self, batch_id) -> set:
+        """一个批次里的 ASIN 集合（``DELETE /api/results`` 的 batch_id 分支）。
+
+        ``batch_asins`` 记的是"这一批采过哪些 ASIN"，与 ``tasks`` 不同：
+        任务可以失败、可以重试，这张表只管入过队的 ASIN。删除端点用它来
+        「删掉这一批的全部结果」以及与 asins/search 取交集。
+
+        与 ``get_all_asins`` 的区别是后者读 ``asin_data``（全库已采 ASIN），
+        两者不可互换。
+        """
+        async with self.read() as rc, rc.execute(
+            "SELECT asin FROM batch_asins WHERE batch_id = ?", (batch_id,)
+        ) as c:
+            return {row["asin"] for row in await c.fetchall()}
+
+    async def find_asins_by_search(self, terms) -> set:
+        """按模糊搜索词选中 ASIN 集合（``DELETE /api/results`` 的 search 分支）。
+
+        terms: 已经切好、去空、限过长的关键词列表（切词与限长是 handler 的
+            请求校验，不在这里做）。词之间是 **OR**。
+
+        谓词与 ``get_results`` 的搜索分支**慢路径**使用同一份文本
+        （SEARCH_TERM_OR），这正是 Phase 3.8 批 (3) 的收益：
+        在这之前删除路径是 handler 里自己拼的 f-string，PG 侧靠
+        ``pool._LIKE_QMARK_RE`` **按字面文本**把它改写成带 ``ESCAPE ''`` 的形式
+        才跟读路径对齐 —— 把 ``LIKE ?`` 换个写法、三段 OR 拆开、甚至多一个空格，
+        正则就不再命中，PG 当场换语义而两边都不报错（D-16）。现在两条路径引用
+        的是同一个常量，改不歪。
+        
+        ⚠ SQLite 的 ``get_results`` 在 term ≥ 3 字符时走的是 **FTS5 trigram**
+        子查询（快路径），文本形态与这里不同、行集相同（
+        ``tests/test_search_like_escape_parity.py`` 逐条比对读/删两条路径的选中
+        行集，正是钉这一条）。删除路径不套 FTS5：它一次全表选完就走，
+        没有分页，加索引路径只会多一层「索引与主表不同步」的失败模式。
+
+        走只读连接：这里只是选行，真正的删除在 ``delete_asins`` 里另开事务。
+        """
+        terms = [t for t in terms if t]
+        if not terms:
+            return set()
+        or_clauses = []
+        params = []
+        for term in terms:
+            or_clauses.append(SEARCH_TERM_OR)
+            pat = search_like_pattern(term)
+            params.extend([pat, pat, pat])
+        where = " OR ".join(or_clauses)
+        sql = f"SELECT d.asin FROM asin_data d WHERE {where}"
+        async with self.read() as rc, rc.execute(sql, params) as c:
+            return {row["asin"] for row in await c.fetchall()}
+
+    async def delete_asins(self, asins) -> List[str]:
+        """按 ASIN 删除结果及其关联行，返回**待删除的截图物理文件路径**。
+
+        ``DELETE /api/results`` 与 ``POST /api/results/delete-by-file``
+        的库侧动作（Phase 3.8 批 (3) 把两处收成一处）。
+
+        **文件不在这里删**：返回路径清单，由 handler 调
+        ``_remove_screenshot_files``（同 ``delete_batches``）。
+
+        入参顺序原样保留、**不排序**：两个后端必须发出同样的分块序列。
+        分块大小 ``ASIN_DELETE_CHUNK`` 两侧共用 —— SQLite 的
+        SQLITE_MAX_VARIABLE_NUMBER 默认 999，PG 没这个限制，但边界不同
+        就没法拿一边的日志去查另一边。
+
+        整个删除在**一个事务**里（所有分块），与收口前逐字一致：
+        中途失败就整体回滚，不会留下删了一半的 ASIN。
+        """
+        asin_list = list(asins)
+        if not asin_list:
+            return []
+
+        def _chunks():
+            for i in range(0, len(asin_list), ASIN_DELETE_CHUNK):
+                chunk = asin_list[i:i + ASIN_DELETE_CHUNK]
+                yield chunk, ",".join("?" * len(chunk))
+
+        # 先收集截图物理文件路径（只读连接，不占写锁）
+        screenshot_files: List[str] = []
+        for chunk, placeholders in _chunks():
+            async with self.read() as rc, rc.execute(
+                f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders})"
+                f" AND file_path IS NOT NULL", chunk
+            ) as c:
+                screenshot_files.extend(row["file_path"] for row in await c.fetchall())
+
+        # 分批删除
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                for chunk, placeholders in _chunks():
+                    for tbl in ASIN_DELETE_TABLES:
+                        await self._db.execute(
+                            f"DELETE FROM {tbl} WHERE asin IN ({placeholders})", chunk)
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
+        return screenshot_files
+
     async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
         # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁
         async with self.read() as rc, rc.execute("SELECT * FROM asin_data WHERE asin = ?", (asin,)) as c:
@@ -2516,3 +2764,38 @@ class Database:
             async for row in c:
                 stats[row["change_type"]] = row["cnt"]
         return stats
+
+    # ==================== 管理（清库）====================
+
+    async def clear_all_data(self) -> None:
+        """清空全部业务数据，并把自增 id 归位（``DELETE /api/database`` 的库侧动作）。
+
+        **只管库，不碰截图文件** —— 文件清理留在 handler 里
+        （``server/api/debug.py`` 的 ``api_clear_database``），
+        因为它跟 ``common.config.SCREENSHOT_DIR`` 绑定，不是数据库的事。
+
+        SQLite 侧「把自增归位」= 删掉 ``sqlite_sequence`` 里的行；PG 侧是
+        ``ALTER TABLE ... ALTER COLUMN id RESTART WITH 1``（见
+        ``common/pgdb/admin.py`` 的同名方法）。Phase 3.8 批 (1) 之前这条差异
+        由 ``common/pgdb/pool.py`` 的 ``_STATEMENT_OVERRIDES`` 做整句文本替换，
+        代价是 handler 里那句 SQL 改一个字符就静默失配。现在差异落在各自的
+        实现里，改不坏。
+
+        失败必须回滚：这段是裸 ``BEGIN`` 块，PG 下事务粘在那条唯一的写连接上，
+        不回滚就会让之后每一次 BEGIN 都撞上「嵌套 BEGIN」守卫
+        （与 ``server/app.py`` 的 ``_rollback_quietly`` 同一个理由）。
+        捕 ``BaseException`` 是因为 handler 被客户端断开时会吃到 CancelledError。
+        """
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                for table in CLEAR_TABLES:
+                    await self._db.execute(f"DELETE FROM {table}")
+                await self._db.execute("DELETE FROM sqlite_sequence")
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise

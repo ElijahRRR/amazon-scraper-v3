@@ -310,16 +310,39 @@ async def test_shim_cursor_protocol_and_rowcount(pgdb):
 
 
 @pytest.mark.asyncio
-async def test_delete_from_sqlite_sequence_resets_identity(pgdb):
-    """server/app.py:2654 的 SQLite 专有语句由垫片翻译成 identity RESTART。"""
+async def test_clear_all_data_resets_identity(pgdb):
+    """``clear_all_data()`` 清干净 + 把自增归位。
+
+    Phase 3.8 批 (1) 之前这条验的是垫片：``DELETE FROM sqlite_sequence``
+    这句 SQLite 专有语句由 ``pool._STATEMENT_OVERRIDES`` 整句换成 5 条
+    ``ALTER ... RESTART``。那张表已经退休（唯一的键就是这句），
+    identity RESTART 现在写在 ``common/pgdb/admin.py:clear_all_data`` 里。
+
+    验的行为一个字没变：清空之后下一个 id 必须回到 1。
+    """
     conn = pgdb._write_conn
     await conn.execute("INSERT INTO batches (name) VALUES ('one')")
-    await pgdb._db.execute("BEGIN")
-    await pgdb._db.execute("DELETE FROM batches")
-    await pgdb._db.execute("DELETE FROM sqlite_sequence")
-    await pgdb._db.execute("COMMIT")
+    await pgdb.clear_all_data()
+    assert await conn.fetchval("SELECT COUNT(*) FROM batches") == 0
     await conn.execute("INSERT INTO batches (name) VALUES ('two')")
     assert await conn.fetchval("SELECT id FROM batches") == 1
+
+
+@pytest.mark.asyncio
+async def test_statement_overrides_shim_is_gone(pgdb):
+    """反向守卫：那张按 SQL 文本匹配的整句替换表不许复活。
+
+    它存在的唯一理由是 handler 里的字面量 SQL；Phase 3.8 收口之后再加回来，
+    等于把"改一个字符就静默失配"这个雷重新埋一遍。
+    """
+    from common.pgdb import pool as _pool
+    assert not hasattr(_pool, "_STATEMENT_OVERRIDES"), (
+        "_STATEMENT_OVERRIDES 又回来了：SQLite 专有语句应该在 "
+        "common/database.py + common/pgdb/ 各写一半，而不是按 SQL 文本翻译")
+    with pytest.raises(Exception):
+        # 垫片没了，这句 SQLite 专有 SQL 现在应该原样打到 PG 上并报错，
+        # 而不是被静默翻译成别的东西。
+        await pgdb._db.execute("DELETE FROM sqlite_sequence")
 
 
 @pytest.mark.asyncio

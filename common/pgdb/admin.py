@@ -36,6 +36,8 @@ import asyncio
 import logging
 from typing import Optional
 
+from common.pgdb._shared import CLEAR_TABLES
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,3 +130,35 @@ class AdminMixin:
             维护协程，PG 侧的 maintenance_loop 根本不调用它）
         """
         return None
+
+    # ==================== 管理（清库）====================
+
+    #: SQLite 侧 5 张带 AUTOINCREMENT 的表。``batch_asins`` / ``seller_discoveries``
+    #: 是复合主键，没有序列，不在这里。
+    #: （Phase 3.8 批 (1) 之前这份清单写在 ``pool.py`` 的 ``_STATEMENT_OVERRIDES``
+    #:  里，靠匹配 handler 那句 ``DELETE FROM sqlite_sequence`` 的字面量触发。）
+    RESTART_IDENTITY_TABLES = ("batches", "asin_data", "asin_changes",
+                               "tasks", "screenshots")
+
+    async def clear_all_data(self) -> None:
+        """清空全部业务数据，并把自增 id 归位。与 SQLite 版语义逐字等价。
+
+        SQLite 版删 ``sqlite_sequence`` 里的行让下一个 id 回到 1；PG 的 identity
+        必须显式 RESTART。删哪些表、按什么顺序删，两侧共用 ``_shared.CLEAR_TABLES``
+        （子表在前、父表在后）—— PG 有真外键，顺序在这边是正确性问题。
+
+        ``_tx()`` 已经带 BaseException 回滚，所以这里不再自己写回滚；
+        ``_write_lock`` 不带 caller 名（即 ``other``），与收口前 handler 里那句
+        ``async with db._write_lock:`` 一致，``/api/_debug/lock-stats`` 的
+        caller key 不变。
+
+        ``ALTER TABLE`` 不含 ``?``，``translate_sql`` 原样透传（``pool.py:378``），
+        走 ``_db`` 而不是裸连接是为了同样过 ``_op_lock`` 与事务状态位。
+        """
+        async with self._write_lock:
+            async with self._tx() as conn:
+                for table in CLEAR_TABLES:
+                    await conn.execute(f"DELETE FROM {table}")
+                for table in self.RESTART_IDENTITY_TABLES:
+                    await conn.execute(
+                        f"ALTER TABLE {table} ALTER COLUMN id RESTART WITH 1")

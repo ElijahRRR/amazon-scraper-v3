@@ -224,24 +224,20 @@ async def scenario(db) -> Rec:
         ) as c:
             r.append((f"like.{term}", tuple(x[0] for x in await c.fetchall())))
 
-    # ---------- 8) app.py:1248-1277 —— 批次重试（锁外读 rowcount）----------
-    no_retry = ("not_found", "gone_404")
-    ph = ",".join("?" * len(no_retry))
-    async with db._db.execute(
-        f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed'"
-        f" AND COALESCE(error_type,'') IN ({ph})", (1, *no_retry)
-    ) as c:
-        r.append(("retry.skipped_no_retry", (await c.fetchone())[0]))
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        cursor = await db._db.execute(
-            f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL"
-            f" WHERE batch_id=? AND status='failed'"
-            f" AND COALESCE(error_type,'') NOT IN ({ph})", (1, *no_retry))
-        await db._db.execute("COMMIT")
-    r.append(("retry.rowcount_after_lock", cursor.rowcount))   # app.py:1510 的写法
+    # ---------- 8) 批次重试 —— db.retry_failed_tasks() ----------
+    # Phase 3.8 批 (4)：原来是 server/app.py 里的裸事务（统计 + UPDATE），
+    # 现在两侧各有一份实现。这条用例改成直接打那个方法，键名保持不变，
+    # 所以历史差分表逐行可比。
+    no_retry = ["not_found", "gone_404"]
+    res = await db.retry_failed_tasks(1, no_retry)
+    r.append(("retry.skipped_no_retry", res["skipped"]))
+    r.append(("retry.rowcount_after_lock", res["retried"]))
     r.append(("retry.statuses", tuple(x["status"] for x in await _rows(
         db, "SELECT status FROM tasks WHERE batch_id=1 ORDER BY id"))))
+    # ⚠ 这一步之后的所有步骤都看得见它改过的 tasks 行。要给
+    #   retry_failed_tasks 加覆盖，请加到文件末尾的独立用例里，**不要**往
+    #   scenario() 里塞 —— 它的输出序列是 tests/pgdb/sqlite_snapshot.py 录下的
+    #   裁判快照，多一步 / 多改一行状态都会让快照整份失效。
 
     # ---------- 9) app.py:1497-1511 —— legacy release ----------
     ids = [4, 5, 999]
@@ -316,35 +312,27 @@ async def scenario(db) -> Rec:
         db, "SELECT COUNT(*) FROM batches WHERE name=?", ("adm_rollback",))))
     r.append(("rollback.conn_usable", await _scalar(db, "SELECT COUNT(*) FROM batches")))
 
-    # ---------- 12) app.py:2227-2242 / 2306-2321 —— 按 ASIN 删除 ----------
-    asins = ["B0ADMIN004", "B0NOPE"]
-    ph4 = ",".join("?" * len(asins))
-    async with db._db.execute(
-        f"SELECT file_path FROM screenshots WHERE asin IN ({ph4})"
-        f" AND file_path IS NOT NULL", asins
-    ) as c:
-        r.append(("delasin.files", tuple(x["file_path"] for x in await c.fetchall())))
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        for tbl in ("asin_changes", "screenshots", "batch_asins", "asin_data"):
-            await db._db.execute(f"DELETE FROM {tbl} WHERE asin IN ({ph4})", asins)
-        await db._db.execute("COMMIT")
+    # ---------- 12) 按 ASIN 删除 —— db.delete_asins() ----------
+    # Phase 3.8 批 (3)：原来是 server/api/results.py 里两处逐字相同的裸事务
+    # （收集截图路径 + 分块删四张表），现在两侧各有一份实现。
+    # 键名与取值形状一个字没动，所以 sqlite_snapshot 那份裁判快照仍然逐行可比 ——
+    # 这一步从"抄一份 app.py 的 SQL 来验垫片"变成"验真正会被 handler 调用的代码"。
+    r.append(("delasin.files", tuple(await db.delete_asins(["B0ADMIN004", "B0NOPE"]))))
     r.append(("delasin.counts", tuple(sorted((await _counts(db)).items()))))
 
-    # ---------- 13) app.py:2650-2655 —— DELETE /api/database ----------
+    # ---------- 13) DELETE /api/database —— db.clear_all_data() ----------
+    # Phase 3.8 批 (1)：这段原来是 server/api/debug.py 里的裸事务，PG 侧靠
+    # pool.py 的 _STATEMENT_OVERRIDES 把 `DELETE FROM sqlite_sequence` 整句
+    # 换成 5 条 ALTER ... RESTART。现在两侧各自实现 clear_all_data()，
+    # 这条用例改成直接打那个方法 —— 验的东西没变（清干净 + 自增归位），
+    # 但验的是**真正会被 handler 调用的代码**，而不是一段抄写的副本。
     # 重新灌一点数据，确保清空是真的在干活
     await _seed(db)
     r.append(("clear.before", tuple(sorted((await _counts(db)).items()))))
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        for table in ["asin_changes", "asin_data", "batch_asins", "tasks",
-                      "screenshots", "batches"]:
-            await db._db.execute(f"DELETE FROM {table}")
-        await db._db.execute("DELETE FROM sqlite_sequence")
-        await db._db.execute("COMMIT")
+    await db.clear_all_data()
     r.append(("clear.after", tuple(sorted((await _counts(db)).items()))))
 
-    # 清空后自增必须从 1 重新开始（sqlite_sequence 行被删 == identity RESTART）
+    # 清空后自增必须从 1 重新开始（SQLite 删 sqlite_sequence 行 == PG identity RESTART）
     async with db._write_lock:
         await db._db.execute("BEGIN")
         await db._db.execute("INSERT INTO batches (name) VALUES (?)", ("after_clear",))
@@ -502,6 +490,132 @@ async def test_close_is_idempotent_and_cancels_maintenance():
         else:
             os.environ["PG_DSN"] = prev
         await drop_scratch(name)
+
+
+# ============================================================
+# retry_failed_tasks 的边角分支（Phase 3.8 批 (4)）
+# ============================================================
+# 刻意**不放进 scenario()**：那个函数的输出序列是
+# tests/pgdb/sqlite_snapshot.py 录下的裁判快照，往里加步骤 / 改动它写过的行
+# 会让整份快照失效。这里自己起库、自己跑两个后端、自己比。
+
+async def _retry_branches(db) -> Rec:
+    """空排除清单（走没有 NOT IN 的那条 SQL）+ 不存在的批次。"""
+    r: Rec = []
+    await _seed(db)
+    # 空清单：batch 1 的两条 failed 全部重试，skipped 恒为 0
+    r.append(("empty_excl", tuple(sorted((await db.retry_failed_tasks(1, [])).items()))))
+    r.append(("empty_excl.statuses", tuple(x["status"] for x in await _rows(
+        db, "SELECT status FROM tasks WHERE batch_id=1 ORDER BY id"))))
+    # 幂等：已经没有 failed 了，第二次是 0/0
+    r.append(("empty_excl.again", tuple(sorted((await db.retry_failed_tasks(1, [])).items()))))
+    # 不存在的批次：0/0，不抛
+    r.append(("missing_batch", tuple(sorted(
+        (await db.retry_failed_tasks(999999, ["not_found"])).items()))))
+    # 全部 error_type 都在排除清单里：retried=0，skipped 数得对
+    r.append(("all_excluded", tuple(sorted(
+        (await db.retry_failed_tasks(2, ["parse_error"])).items()))))
+    return r
+
+
+async def _delete_batches(db) -> Rec:
+    """delete_batches：返回的截图路径清单 + 关联表的清理面。"""
+    r: Rec = []
+    await _seed(db)
+    # 空清单：不碰库，返回 []
+    r.append(("empty", tuple(await db.delete_batches([]))))
+    r.append(("empty.counts", tuple(sorted((await _counts(db)).items()))))
+    # 单个批次（DELETE /api/batches/{name} 走的这条）
+    r.append(("one.files", tuple(sorted(await db.delete_batches([1])))))
+    r.append(("one.counts", tuple(sorted((await _counts(db)).items()))))
+    r.append(("one.left_batches", tuple(x["id"] for x in await _rows(
+        db, "SELECT id FROM batches ORDER BY id"))))
+    # 幂等：再删一次，路径清单空，计数不变
+    r.append(("one.again", tuple(sorted(await db.delete_batches([1])))))
+    r.append(("one.again_counts", tuple(sorted((await _counts(db)).items()))))
+    # 多个 + 一个不存在的 id（delete-bulk 走的这条）
+    r.append(("bulk.files", tuple(sorted(await db.delete_batches([2, 3, 999999])))))
+    r.append(("bulk.counts", tuple(sorted((await _counts(db)).items()))))
+    # asin_data 不按 batch_id 删（它没有 batch_id 列），必须还在
+    r.append(("bulk.asin_data_kept", await _scalar(db, "SELECT COUNT(*) FROM asin_data")))
+    # str 形状的 id 也要能吃（路由参数是 str；PG 侧靠 int() 归一）
+    await _seed(db)
+    r.append(("str_ids.files", tuple(sorted(await db.delete_batches(["4", "5"])))))
+    r.append(("str_ids.left", tuple(x["id"] for x in await _rows(
+        db, "SELECT id FROM batches ORDER BY id"))))
+    return r
+
+
+@pytest.mark.asyncio
+async def test_delete_batches_matches():
+    from common.database import Database as SqliteDatabase
+    from tests.pgdb.helpers import scratch_database
+
+    try:
+        async with scratch_database("delbatches") as pdb:
+            pg = await _delete_batches(pdb)
+    except Exception as e:  # noqa: BLE001
+        if "asyncpg" in type(e).__module__ or "Connect" in type(e).__name__:
+            pytest.skip(f"PostgreSQL 不可达: {type(e).__name__}: {e}")
+        raise
+
+    tmp = tempfile.mkdtemp(prefix="delbatches_sqlite_")
+    try:
+        sdb = SqliteDatabase(os.path.join(tmp, "data", "scraper.db"))
+        await sdb.connect()
+        try:
+            sq = await _delete_batches(sdb)
+        finally:
+            await sdb.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    problems = diff(sq, pg)
+    assert not problems, "SQLite ↔ PG 差异:\n  " + "\n  ".join(problems)
+    d = dict(sq)
+    # 只回 file_path 非空的行（batch 1 里 B0ADMIN002 那条是 NULL）
+    assert d["one.files"] == ("/ss/1.png",)
+    assert d["one.left_batches"] == (2, 3)
+    assert d["one.again"] == ()
+    assert d["bulk.files"] == ("/ss/4.png",)
+    assert dict(d["bulk.counts"])["batches"] == 0
+    assert d["bulk.asin_data_kept"] == 3
+    assert d["str_ids.left"] == (6,)
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_tasks_branches_match():
+    from common.database import Database as SqliteDatabase
+    from tests.pgdb.helpers import scratch_database
+
+    try:
+        async with scratch_database("retrybranch") as pdb:
+            pg = await _retry_branches(pdb)
+    except Exception as e:  # noqa: BLE001
+        if "asyncpg" in type(e).__module__ or "Connect" in type(e).__name__:
+            pytest.skip(f"PostgreSQL 不可达: {type(e).__name__}: {e}")
+        raise
+
+    tmp = tempfile.mkdtemp(prefix="retrybranch_sqlite_")
+    try:
+        sdb = SqliteDatabase(os.path.join(tmp, "data", "scraper.db"))
+        await sdb.connect()
+        try:
+            sq = await _retry_branches(sdb)
+        finally:
+            await sdb.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    problems = diff(sq, pg)
+    assert not problems, "SQLite ↔ PG 差异:\n  " + "\n  ".join(problems)
+    # 行为本身也钉一遍，免得两边一起错
+    d = dict(sq)
+    assert d["empty_excl"] == (("retried", 2), ("skipped", 0))
+    assert d["empty_excl.statuses"] == ("done", "pending", "pending")
+    assert d["empty_excl.again"] == (("retried", 0), ("skipped", 0))
+    assert d["missing_batch"] == (("retried", 0), ("skipped", 0))
+    assert d["all_excluded"] == (("retried", 0), ("skipped", 0))
 
 
 # ============================================================

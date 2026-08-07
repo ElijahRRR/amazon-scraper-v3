@@ -131,7 +131,8 @@ def _remove_screenshot_files(file_paths: list):
 async def _rollback_quietly(conn):
     """裸 ``BEGIN`` 块失败后回滚，两个后端共用（不按后端分叉，见 OWNERSHIP.md D-4）。
 
-    本文件里有 7 个 ``async with db._write_lock: BEGIN ... COMMIT`` 块。原来其中 6 个
+    本文件（及 Phase 3.5-3.7 从它拆出的 server/api/*.py）里曾有 7 个
+    ``async with db._write_lock: BEGIN ... COMMIT`` 块。原来其中 6 个
     没有回滚路径——SQLite 下这些语句基本不会失败，失败了也只是把那一条连接留在事务里。
     PostgreSQL 下 ``db._db`` 同样是**一条**专用写连接，但事务是粘在连接上的状态：
     任何一条语句报错，事务立刻 abort，写锁随异常释放，而垫片的事务槽还是满的，
@@ -144,6 +145,10 @@ async def _rollback_quietly(conn):
     - 捕获 ``BaseException`` 而不是 ``Exception``：这些块全都在 HTTP handler 里，
       客户端断开会让 Starlette 取消请求协程，``CancelledError`` 同样必须回滚，
       否则连接照样带着事务泄漏出去（common/pgdb/batches.py 的 ``_tx()`` 已经是这个口径）。
+
+    **Phase 3.8 之后调用点只剩一个**：``server/api/worker_queue.py`` 的
+    legacy ``/api/tasks/release``（批 (5)，计划 §X.1 说那条分支该删而不是收口）。
+    其余 6 处随着裸 SQL 一起收进了 db 方法，那些方法各自带同样口径的回滚。
     """
     try:
         await conn.execute("ROLLBACK")
@@ -1230,46 +1235,16 @@ async def api_retry_batch(batch_name: str, force: bool = False):
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
 
+    # 排除清单在**这里**算好再传下去：它是本端点的策略（"始终跳过
+    # variant_offset"），而且要原样回显在响应体里。db 层只负责按清单执行。
     no_retry_list = sorted(NO_AUTO_RETRY_ERROR_TYPES)
-    no_retry_placeholders = ",".join("?" * len(no_retry_list))
 
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            # 先统计：本次将跳过的"不可重试"任务数（供前端展示）
-            skipped = 0
-            if no_retry_list:
-                async with db._db.execute(
-                    f"SELECT COUNT(*) FROM tasks WHERE batch_id=? AND status='failed' "
-                    f"AND COALESCE(error_type, '') IN ({no_retry_placeholders})",
-                    [batch_id] + no_retry_list
-                ) as c:
-                    row = await c.fetchone()
-                    skipped = row[0] if row else 0
-
-            # 实际重试 SQL：始终排除 NO_RETRY；force 参数保留兼容旧调用，但不覆盖 variant_offset。
-            if not no_retry_list:
-                cursor = await db._db.execute(
-                    "UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
-                    "WHERE batch_id=? AND status='failed'",
-                    (batch_id,)
-                )
-            else:
-                cursor = await db._db.execute(
-                    f"UPDATE tasks SET status='pending', retry_count=0, worker_id=NULL "
-                    f"WHERE batch_id=? AND status='failed' "
-                    f"AND COALESCE(error_type, '') NOT IN ({no_retry_placeholders})",
-                    [batch_id] + no_retry_list
-                )
-            retried = cursor.rowcount
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _rollback_quietly(db._db)
-            raise
+    # force 参数保留兼容旧调用，但不覆盖 NO_AUTO_RETRY_ERROR_TYPES。
+    res = await db.retry_failed_tasks(batch_id, no_retry_list)
     return {
         "ok": True,
-        "retried": retried,
-        "skipped_no_retry": skipped,
+        "retried": res["retried"],
+        "skipped_no_retry": res["skipped"],
         "no_retry_types": no_retry_list,
         "forced": force,
     }
@@ -1282,25 +1257,7 @@ async def api_delete_batch(batch_name: str):
     if not batch:
         raise HTTPException(404, f"批次不存在: {batch_name}")
     batch_id = batch["id"]
-    # 先收集截图物理文件路径
-    screenshot_files = []
-    async with db._db.execute(
-        "SELECT file_path FROM screenshots WHERE batch_id=? AND file_path IS NOT NULL", (batch_id,)
-    ) as c:
-        screenshot_files = [row["file_path"] for row in await c.fetchall()]
-
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            await db._db.execute("DELETE FROM tasks WHERE batch_id=?", (batch_id,))
-            await db._db.execute("DELETE FROM batch_asins WHERE batch_id=?", (batch_id,))
-            await db._db.execute("DELETE FROM screenshots WHERE batch_id=?", (batch_id,))
-            await db._db.execute("DELETE FROM asin_changes WHERE batch_id=?", (batch_id,))
-            await db._db.execute("DELETE FROM batches WHERE id=?", (batch_id,))
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _rollback_quietly(db._db)
-            raise
+    screenshot_files = await db.delete_batches([batch_id])
 
     # 删除物理截图文件
     _remove_screenshot_files(screenshot_files)
@@ -1330,24 +1287,7 @@ async def api_delete_batches_bulk(request: Request):
     if not batch_ids:
         raise HTTPException(400, "batch_ids 为空或无效")
 
-    ph = ",".join("?" * len(batch_ids))
-    # 先收集截图物理文件路径（只读连接，不占写锁）
-    async with db.read() as rc, rc.execute(
-        f"SELECT file_path FROM screenshots WHERE batch_id IN ({ph}) AND file_path IS NOT NULL",
-        batch_ids
-    ) as c:
-        screenshot_files = [row["file_path"] for row in await c.fetchall()]
-
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            for tbl in ("tasks", "batch_asins", "screenshots", "asin_changes"):
-                await db._db.execute(f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", batch_ids)
-            await db._db.execute(f"DELETE FROM batches WHERE id IN ({ph})", batch_ids)
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _rollback_quietly(db._db)
-            raise
+    screenshot_files = await db.delete_batches(batch_ids)
 
     _remove_screenshot_files(screenshot_files)
     logger.info(f"批量删除批次: {len(batch_ids)} 个 (ids={batch_ids[:20]}{'...' if len(batch_ids) > 20 else ''})")
@@ -1448,11 +1388,13 @@ app.include_router(_worker_queue_api.router)
 # GET /api/results/{asin}、GET /api/changes/stats，外加两条删除
 # —— POST /api/results/delete-by-file 与 DELETE /api/results，
 # 它们原本待在下面「诊断 / 侦查」节头之后，节头骗人，按域属于结果面。
-# router 光秃，不带 tags/prefix。db / MAX_UPLOAD_BYTES / _rollback_quietly /
-# _remove_screenshot_files 仍留在本文件，results.py 一律走 _srv()。
-# 两条删除里的裸 db._db / db._write_lock 与自拼的 f-string LIKE 原文照搬 ——
-# 那段 LIKE 的 PG 语义靠 common/pgdb/pool.py 的 _LIKE_QMARK_RE 按字面文本改写
-# 撑着（D-16），收进 db 方法是 3.8 批 (3) 的事，不在搬运这一步顺手做。
+# router 光秃，不带 tags/prefix。db / MAX_UPLOAD_BYTES / _remove_screenshot_files
+# 仍留在本文件，results.py 一律走 _srv()。
+# Phase 3.8 批 (3) 之后 results.py 里一条 SQL 都没有了：三段裸 SQL 收进了
+# db.find_asins_by_search / db.get_batch_asin_set / db.delete_asins。
+# 那段自拼的 f-string LIKE 曾经靠 common/pgdb/pool.py 的 _LIKE_QMARK_RE 按字面
+# 文本改写撑着 PG 语义（D-16）；现在删除路径与读路径引用同一个谓词常量，
+# 守卫是 tests/test_search_like_escape_parity.py（读/删选中同一批行，跑两列）。
 # 路由匹配不变：GET /api/results/{asin} 与 POST /api/results/delete-by-file
 # 方法不同，GET/DELETE /api/results 同理，两者相对顺序也与拆分前一致。
 from server.api import results as _results_api  # noqa: E402

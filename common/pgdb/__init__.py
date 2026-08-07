@@ -51,7 +51,7 @@ class Database(PoolMixin, SchemaMixin, BatchesMixin, TasksMixin,
 # 公开面自检：导入即执行，实现者写错了立刻炸，而不是等黄金校验才发现
 # ------------------------------------------------------------------
 
-#: common/database.py Database 的 50 个公开属性。
+#: common/database.py Database 的公开属性。
 #: 这份清单是契约，改动它 = 改动 API。
 PUBLIC_API = (
     # 生命周期 / 基础设施
@@ -61,11 +61,11 @@ PUBLIC_API = (
     # 批次
     "create_batch", "get_batches", "get_batch_by_name", "expand_batch_variants",
     "get_batch_completion_status", "mark_batch_completed", "list_callback_due",
-    "mark_callback_attempt", "reset_callback_for_retry",
+    "mark_callback_attempt", "reset_callback_for_retry", "delete_batches",
     # 任务
     "create_tasks", "pull_tasks", "reclaim_dead_worker_tasks",
-    "auto_retry_failed_tasks", "fail_task", "release_tasks", "prioritize_batch",
-    "get_progress",
+    "auto_retry_failed_tasks", "retry_failed_tasks", "fail_task", "release_tasks",
+    "prioritize_batch", "get_progress",
     # 卖家（F-009）
     "create_seller_batch", "accept_seller_discovery_result",
     "get_seller_batch_progress",
@@ -77,11 +77,13 @@ PUBLIC_API = (
     "_hydrate_screenshot_paths",
     # 结果读取
     "get_batch_failures", "get_results", "get_result_by_asin", "get_asin_changes",
-    "iter_results",
+    "iter_results", "find_asins_by_search", "get_batch_asin_set",
     # 截图
     "get_pending_screenshots", "update_screenshot_status", "get_screenshot_progress",
     # 统计
     "get_total_asins", "get_all_asins", "get_change_stats",
+    # 管理（Phase 3.8 收口）
+    "clear_all_data", "delete_asins",
 )
 
 _MIXINS = (PoolMixin, SchemaMixin, BatchesMixin, TasksMixin, ResultsWriteMixin,

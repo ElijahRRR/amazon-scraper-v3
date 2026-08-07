@@ -69,7 +69,7 @@ import os
 import re
 import sqlite3
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 import asyncpg
 
@@ -280,23 +280,18 @@ _LIKE_QMARK_RE = re.compile(
 # 逐字一致。**每一处 LIKE 都必须带上它**，否则读路径和删除路径又会不一致。
 LIKE_NO_ESCAPE = " ESCAPE ''"
 
-# SQLite 独有、无法机械翻译的整条语句 -> PG 等价语句序列。
-# key 是"压平空白后转小写"的语句文本。
-_STATEMENT_OVERRIDES: Dict[str, List[str]] = {
-    # server/api/debug.py:148 `api_clear_database`，DELETE /api/database 的收尾。
-    # （Phase 3.2 之前它在 server/app.py 里；键按"压平空白后转小写"匹配，
-    #   改 SQL 文本一个字符就静默失配 —— identity 不重启，响应仍是 {"ok": true}。）
-    # SQLite 里删掉 sqlite_sequence 行 = 下一个 id 回到 1；PG 要显式重启 identity。
-    # 只重启 SQLite 那 5 张有 AUTOINCREMENT 的表（batch_asins / seller_discoveries
-    # 是复合主键，没有序列）。响应体仍然只是 {"ok": true}。
-    "delete from sqlite_sequence": [
-        "ALTER TABLE batches       ALTER COLUMN id RESTART WITH 1",
-        "ALTER TABLE asin_data     ALTER COLUMN id RESTART WITH 1",
-        "ALTER TABLE asin_changes  ALTER COLUMN id RESTART WITH 1",
-        "ALTER TABLE tasks         ALTER COLUMN id RESTART WITH 1",
-        "ALTER TABLE screenshots   ALTER COLUMN id RESTART WITH 1",
-    ],
-}
+# 这里曾有一张 `_STATEMENT_OVERRIDES`：SQLite 独有、无法机械翻译的**整条语句**
+# -> PG 等价语句序列，按"压平空白后转小写"的语句文本做键。
+# 它只有过一个条目 —— `DELETE FROM sqlite_sequence`，服务于 `DELETE /api/database`
+# 那段写在 handler 里的字面量 SQL。这套机制的代价是：handler 里的 SQL 改一个
+# 字符就静默失配，PG 上 identity 不再重启，而响应仍然是 {"ok": true}，两侧都不报错。
+#
+# Phase 3.8 批 (1) 把那段裸事务收进了 `db.clear_all_data()`，两个后端各自实现
+# 各自那半句（SQLite 删 sqlite_sequence 行 / PG 做 ALTER ... RESTART WITH 1），
+# 于是这张表没有任何键了，连同 `_run_unlocked` 里的整句替换分支一起删掉。
+# **不要因为"下一条 SQLite 专有语句"再把它加回来** —— 正确的做法是像 (1) 那样
+# 在 `common/database.py` + `common/pgdb/` 各写一半，让差异待在有类型、有测试、
+# 有 PUBLIC_API 守卫的地方，而不是待在一张按 SQL 文本匹配的字典里。
 
 _WS_RE = re.compile(r"\s+")
 
@@ -612,13 +607,8 @@ class ConnProxy:
             await self._exec_tx_control(norm)
             return Cursor((), -1, sql)
 
-        # (b) SQLite 专有语句的整句替换
-        override = _STATEMENT_OVERRIDES.get(norm)
-        if override is not None:
-            total = 0
-            for stmt in override:
-                total += max(rowcount_from_tag(await self._conn.execute(stmt)), 0)
-            return Cursor((), total, sql)
+        # (b) 这里曾是"SQLite 专有语句整句替换"的分支，见本文件上方
+        #     `_STATEMENT_OVERRIDES` 退休的说明（Phase 3.8 批 (1)）。
 
         stmt = translate_sql(sql)
         args = tuple(params or ())

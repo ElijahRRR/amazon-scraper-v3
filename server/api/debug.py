@@ -19,17 +19,21 @@
 2. **函数名 / docstring / 路径一个字不改**（含 `_pct` / `_summary` 这类私有助手
    的行为）：前三者被编码进 `operationId` / `summary` / `description`。
 
-3. **`api_clear_database` 的裸事务原文照搬，一个字符都不许动。**
-   其中 `DELETE FROM sqlite_sequence` 是 `common/pgdb/pool.py` 的
-   `_STATEMENT_OVERRIDES` **字典键**（按"压平空白后转小写"匹配）：改一个字符
-   就静默失配 —— PG 上那五张表的 identity 不再重启，而响应仍然是
-   `{"ok": true}`，两侧都不报错。
+3. **`api_clear_database` 只剩文件清理。** 库侧那段裸事务已经在 Phase 3.8
+   批 (1) 收进 `db.clear_all_data()`（`common/database.py` + `common/pgdb/admin.py`
+   各一份实现，删表清单共用 `_shared.CLEAR_TABLES`）。
+   收口之前它是这么脆的：那句 `DELETE FROM sqlite_sequence` 是
+   `common/pgdb/pool.py` 的 `_STATEMENT_OVERRIDES` **字典键**（按"压平空白后
+   转小写"匹配），改一个字符就静默失配 —— PG 上那五张表的 identity 不再重启，
+   而响应仍然是 `{"ok": true}`，两侧都不报错。那套垫片已随本批一起删掉。
+   截图目录的清理**留在这里**：它绑 `common.config.SCREENSHOT_DIR`，不是数据库的事。
 
 4. **模块级可变全局一个都不搬**：`db` / `_worker_registry` / `_settings_version`
    留在 `server/app.py`，这里一律 `_srv().xxx`。
    `_settings_version` 是 **int**，`from server.app import _settings_version`
    会把当时的值快照下来，之后永远不变（黄金夹具还会把它重置成 0）。
-   `_rollback_quietly` 同理留在 `app.py`（另外 6 个调用点在那边）。
+   `_rollback_quietly` 同理留在 `app.py`（批 (1) 收口后本模块一处也不用了；
+   全仓库只剩 `worker_queue.py` 的 legacy release 一个调用点）。
 """
 
 import os
@@ -149,16 +153,7 @@ async def api_clear_database():
     """清空所有数据 + 截图文件"""
     import shutil
     db = _srv().db
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            for table in ["asin_changes", "asin_data", "batch_asins", "tasks", "screenshots", "batches"]:
-                await db._db.execute(f"DELETE FROM {table}")
-            await db._db.execute("DELETE FROM sqlite_sequence")
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _srv()._rollback_quietly(db._db)
-            raise
+    await db.clear_all_data()
 
     # 清理截图文件
     ss_dir = config.SCREENSHOT_DIR

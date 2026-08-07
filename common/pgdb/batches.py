@@ -326,6 +326,56 @@ class BatchesMixin:
                     final = "pending"
                 return {"final_status": final, "attempts": attempts}
 
+    async def delete_batches(self, batch_ids) -> List[str]:
+        """删除若干批次及其全部关联数据，返回**待删除的截图物理文件路径**。
+
+        ``DELETE /api/batches/{name}`` 与 ``POST /api/batches/delete-bulk``
+        的库侧动作（Phase 3.8 批 (2) 把两处收成一处）。
+
+        **文件不在这里删**：返回路径清单，由 handler 调 ``_remove_screenshot_files``。
+        库方法删文件意味着一个失败的 unlink 能污染一次数据库操作，而且
+        测试再也不能在不碰磁盘的前提下验它。
+
+        入参去重 / 上限（bulk 端点的 500 上限）属于**请求校验**，留在 handler。
+        这里只做 ``int()`` 归一 —— asyncpg 按 Python 类型推参数，路由给的
+        str id 会 DataError。
+
+        路径清单在写锁**外**、事务**前**取：截图行马上就要被删掉，取晚了就空了。
+        收口前单条删除走的是 ``db._db``（写连接），bulk 走的是 ``db.read()``
+        （读池）；这里统一成读池 —— 两者读的都是已提交数据，但读池不占写连接，
+        也就不会跟正在跑的写事务抢那一条连接。
+
+        删除顺序：先四张子表、最后 batches。PG 侧有真外键，顺序即正确性。
+        """
+        ids = [int(b) for b in batch_ids]
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+
+        # 先收集截图物理文件路径（只读连接，不占写锁）
+        async with self.read() as rc, rc.execute(
+            f"SELECT file_path FROM screenshots WHERE batch_id IN ({ph})"
+            f" AND file_path IS NOT NULL", ids
+        ) as c:
+            screenshot_files = [row["file_path"] for row in await c.fetchall()]
+
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                for tbl in ("tasks", "batch_asins", "screenshots", "asin_changes"):
+                    await self._db.execute(
+                        f"DELETE FROM {tbl} WHERE batch_id IN ({ph})", ids)
+                await self._db.execute(
+                    f"DELETE FROM batches WHERE id IN ({ph})", ids)
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
+        return screenshot_files
+
     async def reset_callback_for_retry(self, batch_id: int) -> bool:
         """运维手动触发：把已经 failed 或 sent 的回调重置回 pending 立即重试。"""
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')

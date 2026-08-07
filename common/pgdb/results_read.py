@@ -108,6 +108,7 @@ from common.pgdb._shared import (  # noqa: F401
     ASIN_DATA_FIELDS,
     _ASIN_DATA_COLUMN_SET,
     _normalize_screenshot_path,
+    search_like_pattern,
 )
 from common.pgdb.pool import LIKE_NO_ESCAPE, as_int, text_affinity
 
@@ -120,21 +121,13 @@ _TERM_OR = ("(ascii_lower(d.asin) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE +
             " OR ascii_lower(d.brand) LIKE ascii_lower(?)" + LIKE_NO_ESCAPE + ")")
 
 
-def _like_pattern(t: str) -> str:
-    """``%term%``，原样，不做任何转义处理。
-
-    SQLite 的 LIKE **没有**转义字符。这里以前靠"把反斜杠加倍"去抵消 PG 的默认
-    转义，结果读路径（这里，加倍了）和删除路径（server/app.py:2277 的 f-string，
-    没加倍）语义不一致：同一个 ``search=back\\slash``，GET 命中 ``back\\slash``
-    那行，DELETE 却删掉 ``backslash`` 那行。
-
-    现在两条路径统一由 SQL 侧的 ``ESCAPE ''`` 关掉转义机制（pool.LIKE_NO_ESCAPE
-    / pool._LIKE_QMARK_RE，决策 D-16），所以模式本身必须**原样**传下去——再加倍
-    就等于把用户输入里的反斜杠变成两个。
-    ``%`` 和 ``_`` 故意**不**转义：用户输入里的通配符今天就是生效的
-    （``Gol%rand`` 是模糊匹配），两个引擎的元字符一样，这个行为免费保留。
-    """
-    return "%" + str(t) + "%"
+# ``%term%``，不转义。**唯一真源在 common/database.py**（经 _shared 再导出）——
+# 读路径与删除路径共用它。这里以前有一份独立实现，注释里论证的正是 D-16：
+# 曾经靠"把反斜杠加倍"去抵消 PG 的默认转义，结果读路径加倍了、删除路径
+# （handler 里的 f-string）没加倍，同一个 search=back\\slash，GET 命中
+# back\\slash 那行、DELETE 却删掉 backslash 那行。现在两条路径都走
+# SQL 侧的 ``ESCAPE ''``（LIKE_NO_ESCAPE / _LIKE_QMARK_RE），模式原样传。
+_like_pattern = search_like_pattern
 
 
 class ResultsReadMixin:
@@ -295,6 +288,54 @@ class ResultsReadMixin:
             "prev_cursor": prev_cursor,
             "total": total,
         }
+
+    async def get_batch_asin_set(self, batch_id) -> set:
+        """一个批次里的 ASIN 集合（``DELETE /api/results`` 的 batch_id 分支）。
+
+        ``batch_asins`` 记的是"这一批采过哪些 ASIN"，与 ``tasks`` 不同：
+        任务可以失败、可以重试，这张表只管入过队的 ASIN。删除端点用它来
+        「删掉这一批的全部结果」以及与 asins/search 取交集。
+
+        与 ``get_all_asins`` 的区别是后者读 ``asin_data``（全库已采 ASIN），
+        两者不可互换。
+        """
+        async with self.read() as rc, rc.execute(
+            "SELECT asin FROM batch_asins WHERE batch_id = ?", (int(batch_id),)
+        ) as c:
+            return {row["asin"] for row in await c.fetchall()}
+
+    async def find_asins_by_search(self, terms) -> set:
+        """按模糊搜索词选中 ASIN 集合（``DELETE /api/results`` 的 search 分支）。
+
+        terms: 已经切好、去空、限过长的关键词列表（切词与限长是 handler 的
+            请求校验，不在这里做）。词之间是 **OR**。
+
+        谓词与 ``get_results`` 的搜索分支使用同一份文本
+        （_TERM_OR），这正是 Phase 3.8 批 (3) 的收益：
+        在这之前删除路径是 handler 里自己拼的 f-string，PG 侧靠
+        ``pool._LIKE_QMARK_RE`` **按字面文本**把它改写成带 ``ESCAPE ''`` 的形式
+        才跟读路径对齐 —— 把 ``LIKE ?`` 换个写法、三段 OR 拆开、甚至多一个空格，
+        正则就不再命中，PG 当场换语义而两边都不报错（D-16）。现在两条路径引用
+        的是同一个常量，改不歪。
+        
+        ``_TERM_OR`` 带 ``ascii_lower(...)``：SQLite 的 LIKE 折 ASCII 大小写，
+        PG 的不折（D-5）。
+
+        走只读连接：这里只是选行，真正的删除在 ``delete_asins`` 里另开事务。
+        """
+        terms = [t for t in terms if t]
+        if not terms:
+            return set()
+        or_clauses = []
+        params = []
+        for term in terms:
+            or_clauses.append(_TERM_OR)
+            pat = _like_pattern(term)
+            params.extend([pat, pat, pat])
+        where = " OR ".join(or_clauses)
+        sql = f"SELECT d.asin FROM asin_data d WHERE {where}"
+        async with self.read() as rc, rc.execute(sql, params) as c:
+            return {row["asin"] for row in await c.fetchall()}
 
     async def get_result_by_asin(self, asin: str) -> Optional[Dict]:
         # 注意：先释放读连接再 _hydrate（其内部还要借读连接），避免池内嵌套借用导致死锁

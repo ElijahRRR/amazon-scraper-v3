@@ -15,20 +15,29 @@
    （`tests/pgdb/test_sync_api.py:38`、`test_retention.py`、
    `test_export_retention_window.py`）用 `monkeypatch.setattr(srv, "db", pgdb)`
    整体换掉这个属性，快照下来就补丁打空。
-   `MAX_UPLOAD_BYTES` / `_rollback_quietly` / `_remove_screenshot_files`
-   同理留在 `app.py`，这里走 `_srv().xxx`（后两个另有 6+ 个调用点）。
+   `MAX_UPLOAD_BYTES` / `_remove_screenshot_files` 同理留在 `app.py`，
+   这里走 `_srv().xxx`。
 
-2. **SQL 一字不动，包括自己拼的 f-string LIKE。**
-   `api_delete_results` 里那段
+2. **本模块一条 SQL 都没有了**（Phase 3.8 批 (3)）。三段裸 SQL 收进了
+   `db.find_asins_by_search(terms)` / `db.get_batch_asin_set(batch_id)` /
+   `db.delete_asins(asins)`，两个后端各一份实现，名字都在
+   `common/pgdb/__init__.py` 的 `PUBLIC_API` 里（导入期守卫）。
+
+   收口之前这里是这么脆的：`api_delete_results` 里那段
    `"(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)"` + `f"%{term}%"`
-   在 PG 侧的语义**不是** psycopg 原生的：它靠 `common/pgdb/pool.py` 的
-   `_LIKE_QMARK_RE` 把 `LIKE ?` 改写成带 `ESCAPE ''` 的形式
+   在 PG 侧的语义**不是** psycopg 原生的 —— 它靠 `common/pgdb/pool.py` 的
+   `_LIKE_QMARK_RE` **按字面文本**把 `LIKE ?` 改写成带 `ESCAPE ''` 的形式
    （`LIKE_NO_ESCAPE`），才让反斜杠在两个后端表现一致（D-16）。
-   改写是**按字面文本**匹配的 —— 把 `LIKE ?` 换个写法、把三段 OR 拆开、
-   甚至只是多一个空格，都可能让正则不再命中，PG 侧当场换语义而两边都不报错。
-   所以本步这段（连同 `CHUNK = 500` 的分块边界、裸 `db._db` 读、
-   两个裸 `db._write_lock` 事务）**原文照搬**。收进 db 方法是 3.8 批 (3)
-   的事，它自带「反斜杠 / 百分号 / 下划线双后端用例」的前置条件。
+   把 `LIKE ?` 换个写法、把三段 OR 拆开、甚至只是多一个空格，正则就不再命中，
+   PG 侧当场换语义而两边都不报错。现在删除路径与读路径引用**同一个常量**
+   （SQLite 侧 `common/database.py:SEARCH_TERM_OR`、PG 侧
+   `common/pgdb/results_read.py:_TERM_OR`，模式函数共用
+   `_shared.search_like_pattern`），那条正则不再是删除路径的承重件。
+
+   ⚠ **这条不一致今天是死的，别把它弄活**：
+   `tests/test_search_like_escape_parity.py` 逐条比对「同一个 `search` 在
+   GET /api/results 读出来的行集」与「DELETE /api/results 删掉的行集」，
+   跟着 `DB_BACKEND` 走两列。实测把 `LIKE_NO_ESCAPE` 置空会让其中 3 条当场红。
 
 3. **router 光秃**：`APIRouter()`，不带 `tags=` / `prefix=` /
    `include_in_schema`。`/openapi.json` 是黄金基线的一步、逐字节钉死。
@@ -41,10 +50,14 @@
    路径记 PARTIAL 后继续找 FULL），`GET /api/results` 与
    `DELETE /api/results` 同理；两者在本文件里的先后顺序仍与拆分前一致。
 
-6. **本步的两个删除端点今天没有黄金网**（78 步一步没有，2.4 的错误路径扩容
-   也没覆盖它们 —— 它们不是错误路径）。替代网是
-   `tests/test_results_delete_api.py`（普通 pytest，写成 `unittest.TestCase`
-   子类，否则门禁里 `unittest discover` 那两列收不到），两个后端都跑。
+6. **本模块的两个删除端点今天没有黄金网**（78 步一步没有，2.4 的错误路径扩容
+   也没覆盖它们 —— 它们不是错误路径）。替代网是两份 `unittest.TestCase`
+   （写成 TestCase 而非裸 `def test_*`，否则门禁里 `unittest discover`
+   那两列会静默跳过），两个后端都跑：
+     * `tests/test_results_delete_api.py` —— 端点行为（三个上传分派分支、
+       三条筛选路径、两条 4xx、`deleted` 计的是请求里的 ASIN 数）。
+     * `tests/test_search_like_escape_parity.py` —— 读路径与删除路径的
+       LIKE 语义必须选中同一批行（批 (3) 的前置条件）。
 """
 
 import csv
@@ -146,32 +159,7 @@ async def api_delete_by_file(file: UploadFile = File(...)):
     if not asin_list:
         raise HTTPException(400, "文件中未找到有效 ASIN")
 
-    CHUNK = 500
-    # 收集截图文件
-    screenshot_files = []
-    for i in range(0, len(asin_list), CHUNK):
-        chunk = asin_list[i:i+CHUNK]
-        placeholders = ",".join("?" * len(chunk))
-        async with db._db.execute(
-            f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", chunk
-        ) as c:
-            screenshot_files.extend(row["file_path"] for row in await c.fetchall())
-
-    # 分批删除
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            for i in range(0, len(asin_list), CHUNK):
-                chunk = asin_list[i:i+CHUNK]
-                placeholders = ",".join("?" * len(chunk))
-                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _s._rollback_quietly(db._db)
-            raise
+    screenshot_files = await db.delete_asins(asin_list)
 
     _s._remove_screenshot_files(screenshot_files)
     return {"ok": True, "deleted": len(asin_list), "asin_count": len(asin_list)}
@@ -202,61 +190,20 @@ async def api_delete_results(request: Request):
         search = str(search)[:500]
         terms = [t.strip()[:100] for t in search.split(",") if t.strip()][:10]
         if terms:
-            or_clauses = []
-            params = []
-            for term in terms:
-                or_clauses.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
-                params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
-            where = " OR ".join(or_clauses)
-            sql = f"SELECT d.asin FROM asin_data d WHERE {where}"
-            async with db._db.execute(sql, params) as c:
-                rows = await c.fetchall()
-                for row in rows:
-                    target_asins.add(row["asin"])
+            target_asins.update(await db.find_asins_by_search(terms))
 
     # 纯 batch_id（无 asins/search）→ 删除该批次所有 ASIN
     if batch_id and not has_explicit_filter:
-        sql = "SELECT asin FROM batch_asins WHERE batch_id = ?"
-        async with db._db.execute(sql, (batch_id,)) as c:
-            target_asins = {row["asin"] for row in await c.fetchall()}
+        target_asins = set(await db.get_batch_asin_set(batch_id))
     # batch_id + 其他条件 → 取交集
     elif batch_id and target_asins:
-        sql = "SELECT asin FROM batch_asins WHERE batch_id = ?"
-        async with db._db.execute(sql, (batch_id,)) as c:
-            batch_asins = {row["asin"] for row in await c.fetchall()}
-        target_asins &= batch_asins
+        target_asins &= set(await db.get_batch_asin_set(batch_id))
 
     if not target_asins:
         return {"ok": True, "deleted": 0}
 
     asin_list = list(target_asins)
-    CHUNK = 500  # SQLite 变量数上限安全值
-
-    # 先收集截图物理文件路径
-    screenshot_files = []
-    for i in range(0, len(asin_list), CHUNK):
-        chunk = asin_list[i:i+CHUNK]
-        placeholders = ",".join("?" * len(chunk))
-        async with db._db.execute(
-            f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders}) AND file_path IS NOT NULL", chunk
-        ) as c:
-            screenshot_files.extend(row["file_path"] for row in await c.fetchall())
-
-    # 分批删除
-    async with db._write_lock:
-        await db._db.execute("BEGIN")
-        try:
-            for i in range(0, len(asin_list), CHUNK):
-                chunk = asin_list[i:i+CHUNK]
-                placeholders = ",".join("?" * len(chunk))
-                await db._db.execute(f"DELETE FROM asin_changes WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM screenshots WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM batch_asins WHERE asin IN ({placeholders})", chunk)
-                await db._db.execute(f"DELETE FROM asin_data WHERE asin IN ({placeholders})", chunk)
-            await db._db.execute("COMMIT")
-        except BaseException:
-            await _s._rollback_quietly(db._db)
-            raise
+    screenshot_files = await db.delete_asins(asin_list)
 
     # 删除物理截图文件
     _s._remove_screenshot_files(screenshot_files)

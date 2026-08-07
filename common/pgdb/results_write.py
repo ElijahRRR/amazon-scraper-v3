@@ -139,6 +139,8 @@ from typing import List
 
 from common.pgdb._shared import (  # noqa: F401
     ASIN_DATA_FIELDS,
+    ASIN_DELETE_CHUNK,
+    ASIN_DELETE_TABLES,
     _ASIN_DATA_COLUMN_SET,
     _compare_price,
     _compare_stock_qty,
@@ -786,6 +788,58 @@ class ResultsWriteMixin:
                 except Exception:
                     pass
                 raise
+
+    async def delete_asins(self, asins) -> List[str]:
+        """按 ASIN 删除结果及其关联行，返回**待删除的截图物理文件路径**。
+
+        ``DELETE /api/results`` 与 ``POST /api/results/delete-by-file``
+        的库侧动作（Phase 3.8 批 (3) 把两处收成一处）。
+
+        **文件不在这里删**：返回路径清单，由 handler 调
+        ``_remove_screenshot_files``（同 ``delete_batches``）。
+
+        入参顺序原样保留、**不排序**：两个后端必须发出同样的分块序列。
+        分块大小 ``ASIN_DELETE_CHUNK`` 两侧共用 —— SQLite 的
+        SQLITE_MAX_VARIABLE_NUMBER 默认 999，PG 没这个限制，但边界不同
+        就没法拿一边的日志去查另一边。
+
+        整个删除在**一个事务**里（所有分块），与收口前逐字一致：
+        中途失败就整体回滚，不会留下删了一半的 ASIN。
+        """
+        asin_list = list(asins)
+        if not asin_list:
+            return []
+
+        def _chunks():
+            for i in range(0, len(asin_list), ASIN_DELETE_CHUNK):
+                chunk = asin_list[i:i + ASIN_DELETE_CHUNK]
+                yield chunk, ",".join("?" * len(chunk))
+
+        # 先收集截图物理文件路径（只读连接，不占写锁）
+        screenshot_files: List[str] = []
+        for chunk, placeholders in _chunks():
+            async with self.read() as rc, rc.execute(
+                f"SELECT file_path FROM screenshots WHERE asin IN ({placeholders})"
+                f" AND file_path IS NOT NULL", chunk
+            ) as c:
+                screenshot_files.extend(row["file_path"] for row in await c.fetchall())
+
+        # 分批删除
+        async with self._write_lock:
+            await self._db.execute("BEGIN")
+            try:
+                for chunk, placeholders in _chunks():
+                    for tbl in ASIN_DELETE_TABLES:
+                        await self._db.execute(
+                            f"DELETE FROM {tbl} WHERE asin IN ({placeholders})", chunk)
+                await self._db.execute("COMMIT")
+            except BaseException:
+                try:
+                    await self._db.execute("ROLLBACK")
+                except BaseException:
+                    pass
+                raise
+        return screenshot_files
 
     async def save_results_batch(self, results: List[dict], batch_id: int = None) -> int:
         """批量保存结果"""

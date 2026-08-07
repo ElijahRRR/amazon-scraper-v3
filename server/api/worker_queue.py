@@ -47,7 +47,6 @@
 """
 
 import os
-import re
 import time
 from common.core.timeutil import now_ts
 from typing import Optional
@@ -94,10 +93,32 @@ async def api_pull_tasks(request: Request,
         if not _s._worker_registry[worker_id].get("enable_screenshot", True):
             ns = False
 
-    # prefer_zip 校验（防注入）：只接受 5 位数字
-    pz = None
-    if prefer_zip and re.match(r'^\d{5}$', prefer_zip):
-        pz = prefer_zip
+    # prefer_zip 校验（防注入）+ 归一化。
+    #
+    # P4.6：原先这里是**内联的第二份**规则（一条只认整 5 位数字的正则），
+    # 与 `server/app.py:_normalize_zip` 分叉，后果是一次**静默降级**：
+    # worker 传 ``prefer_zip="1001"``（整数往返丢掉前导零，relay 侧的
+    # ``normalize_zip`` 正是为这个形状而写）时，`_normalize_zip` 会 zfill 成
+    # ``"01001"`` 接受，而这里直接判 None 丢弃 —— 任务分配悄悄退回
+    # 「不挑邮编」，worker 每个任务都要切一次 session，没有任何一侧会报错。
+    #
+    # 顺带堵掉「正则用 ``$`` 收尾」允许**尾随换行**这个小口子
+    # （Python 的 ``$`` 在末尾一个 ``\n`` 处也匹配）：`_normalize_zip` 先
+    # ``.strip()`` 再用 ``\Z`` 收尾，防注入强度不降反升。
+    #
+    # ⚠ **受理面还拓宽了三种形状，一并声明**（Phase 4.5-4.8 审计发现原注释漏了）：
+    #   "90001.0"     HEAD 丢弃 -> 现在 '90001'  （Excel 把邮编读成浮点的老毛病）
+    #   "10001-1234"  HEAD 丢弃 -> 现在 '10001'  （ZIP+4，取前段）
+    #   "1"           HEAD 丢弃 -> 现在 '00001'  （单个数字也补成合法邮编）
+    # 这三种是「换成 _normalize_zip」的必然副产物，不是额外加的逻辑。
+    # 方向上说得通：它们最终都要过 `_US_ZIP_RE` 校验，实测放行值恒为
+    # **恰好 5 位数字或 None**，所以防注入强度不降反升。
+    # 但它们是行为改动，所以钉在 tests/test_prefer_zip_normalization.py 里，
+    # 不靠这段注释自证。
+    #
+    # 走 ``_s._normalize_zip``（属性访问）而不是 from-import：本模块承重约束 1/3，
+    # 名字必须留在 `server.app` 上，夹具按名字打补丁。
+    pz = _s._normalize_zip(prefer_zip)
 
     tasks = await _s.db.pull_tasks(worker_id, count, ns, prefer_zip=pz)
     if worker_id in _s._worker_registry:

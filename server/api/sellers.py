@@ -134,7 +134,9 @@ async def api_upload_sellers(request: Request,
         raise HTTPException(400, "未识别到任何 seller ID（支持裸 ID、含 me=/seller= 的 URL）")
 
     if not batch_name:
-        batch_name = f"sellers_{_srv()._cn_now().strftime('%Y%m%d_%H%M%S')}"
+        # P4.7：批次名的唯一构造点在 server/app.py:_batch_name（精度不变，本来就是秒）。
+        # 走 _srv() 属性访问，与 _cn_now / MAX_UPLOAD_BYTES 同约定（本模块承重约束）。
+        batch_name = _srv()._batch_name("sellers")
 
     zc = zip_code or _srv()._runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
     batch_id, inserted = await _srv().db.create_seller_batch(

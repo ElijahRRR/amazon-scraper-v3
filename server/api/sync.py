@@ -75,6 +75,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Body, Query
 from fastapi.responses import JSONResponse
 
+from common.core import completeness as _completeness
 from common.core.timeutil import iso_utc, now_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -146,8 +147,12 @@ _ERR_RESERVED_KEYS = frozenset({"error", "detail", "server_time_utc"})
 #: ``completeness_ok`` 因此是 **合取**：既要「测过」，又要「三块齐全」。
 #: Phase 4 落地之前这个值恒为 false —— 契约文档里必须写死这一点，
 #: 否则沃尔玛侧的 catalog.products 会一直是空的而没人知道为什么。
-COMPLETENESS_MEASURED_BIT = 8
-COMPLETENESS_REQUIRED_MASK = 7
+#:
+#: P4.5：数值与判据的唯一真源都是 ``common/core/completeness.py``。
+#: 下面两个名字是**保留的别名**（tests/pgdb/test_phase4_fields.py:617 与
+#: server/api/export_incremental.py 都按它们 import，外部可见面一字不变）。
+COMPLETENESS_MEASURED_BIT = _completeness.MEASURED
+COMPLETENESS_REQUIRED_MASK = _completeness.REQUIRED_MASK
 
 #: 鉴权留口。**空列表是刻意的**（用户已决定暂不加鉴权）。
 #: 加的时候只改这一行，不要去动 include_router，也不要加全局中间件。
@@ -363,10 +368,15 @@ def _window(min_seq: Optional[int], max_seq: Optional[int],
     return int(min_seq), max(int(max_seq or 0), ever)
 
 
-def _completeness_ok(value: Optional[int]) -> bool:
-    """§4.3 的 ``completeness_ok``，合取式，见 COMPLETENESS_* 常量的说明。"""
-    v = int(value or 0)
-    return bool(v & COMPLETENESS_MEASURED_BIT) and (v & COMPLETENESS_REQUIRED_MASK) == COMPLETENESS_REQUIRED_MASK
+#: §4.3 的 ``completeness_ok``，合取式，见 COMPLETENESS_* 常量的说明。
+#:
+#: P4.5：实现搬进 ``common/core/completeness.py``，这里只留别名。
+#: ``server/api/export_incremental.py:_to_record`` 此前是**手工重算**同一个
+#: 合取式的第二份实现 —— 判据改一次要改两处，漏一处就是
+#: ``/api/v1/sync/records.completeness_ok`` 与
+#: ``/api/export/incremental.completeness_ok`` 对同一行给出不同答案。
+#: 现在两个端点走同一个函数对象（``_completeness_ok is completeness_ok`` 为真）。
+_completeness_ok = _completeness.completeness_ok
 
 
 def _forced_prune_log(raw: Optional[str]) -> List[Any]:

@@ -62,10 +62,21 @@ def _utc_now_str() -> str:
 # 「区块在但里面是空的」和「区块被整块删掉」解析值完全一样（都是 ""/"N/A"），
 # 而后者正是软降级页的特征。category 只有面包屑一个数据源，好页→降级页→好页
 # 于是就是两次哈希翻转、两次误复审 —— §6.5 那道合取门要拦的就是这个。
-COMPLETENESS_BREADCRUMB = 1     # bit0 面包屑区块存在
-COMPLETENESS_DETAIL_TABLE = 2   # bit1 详情表存在
-COMPLETENESS_MAIN_IMAGE = 4     # bit2 主图集存在
-COMPLETENESS_MEASURED = 8       # bit3 这次采集**真的测量过**上面三项
+#
+# P4.5：**四个位的数值不再定义在这里**，唯一真源是 common/core/completeness.py
+# （schema.py 的 EVENT_COMPLETENESS_* 与 sync.py 的 COMPLETENESS_* 也都从那里来）。
+# 本文件对外可见的名字**一个不变**：tests/test_parser_quality.py 与
+# tests/pgdb/test_phase4_fields.py 都按下面这四个别名 import。
+# ⚠ 只换来源，**不换任何数值、不换任何逻辑**：解析产出逐字节不变（C3 / D-27），
+#   已实测（固定输入过解析器，改前改后 sha256 相同）。
+# common/core/completeness.py 零依赖（连标准库都不 import），
+# 不会把 aiosqlite / asyncpg 拖进 worker 进程 —— 与上面 _ASIN_RE 那条边同理。
+from common.core.completeness import (  # noqa: E402  —— 位常量的唯一真源
+    BREADCRUMB as COMPLETENESS_BREADCRUMB,   # bit0 面包屑区块存在
+    DETAIL as COMPLETENESS_DETAIL_TABLE,     # bit1 详情表存在
+    IMAGE as COMPLETENESS_MAIN_IMAGE,        # bit2 主图集存在
+    MEASURED as COMPLETENESS_MEASURED,       # bit3 这次采集**真的测量过**上面三项
+)
 
 #: 面包屑区块。**只认 `_parse_categories` 真正会去读的那一个 id**：位的意义是
 #: 「category 这个信号的唯一数据源在不在」，多认一个别名就会出现「位说在、
@@ -1769,7 +1780,19 @@ class AmazonParser:
 
     @staticmethod
     def _norm_zip(z: Any) -> Optional[str]:
-        """邮编归一化到 5 位字符串；无法归一化返回 None。"""
+        """邮编归一化到 5 位字符串；无法归一化返回 None。
+
+        ⚠ P4.6：这是仓库里四份邮编归一化之一，**刻意不与另外三份合并**
+        （``server/app.py:_normalize_zip``、``common/pgdb/relay.py`` 的
+        ``normalize_zip`` / ``normalize_zip_observed``）。本函数是**串内抽取**：
+        补零规则不适用时它还会 ``_ZIP5_RE.search(s)`` 从任意串里捞一个 5 位数，
+        另外三份都不这么干。完整的取舍写在 ``common/core/zipcode.py`` 的
+        docstring 里，那里也是「补零」这一小步的唯一真源。
+
+        本函数的数字分支写的是 ``0 < len(head) <= 5``，比真源多允许 ``== 5``，
+        而 ``"12345".zfill(5) == "12345"`` ⇒ **结果完全一致**。没有改写成调用
+        真源，是因为那要动 worker 侧的解析逻辑（C3 / D-27），4.6 不做。
+        """
         s = str(z).strip() if z is not None else ""
         if not s:
             return None

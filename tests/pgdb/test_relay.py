@@ -852,7 +852,17 @@ async def test_relay_steps_down_if_someone_else_took_the_lock_meanwhile(
     other = Database()
     await other.connect()
     try:
-        pid = await pgdb._ev()["relay_conn"].fetchval("SELECT pg_backend_pid()")
+        # ⚠ 走 `_relay_backend_pid`（从**旁路**连接查），不要伸手到
+        #   `pgdb._ev()["relay_conn"]` 上发查询 —— 那条连接归 relay 循环所有，
+        #   本用例把 tick 压到 20ms，asyncpg 不允许一条连接上有两个操作在飞。
+        #   实测这一处正是一条 flake：独占连跑 8 遍 2 红，失败恒为
+        #   `InterfaceError: cannot perform operation: another operation is in progress`，
+        #   且在本轮改造之前的基点上同样复现（1/8）—— 是**测试** flake，产品无问题。
+        #   `_relay_backend_pid` 的 docstring 早就写明了这条禁令、兄弟用例
+        #   `test_relay_recovers_after_pg_terminate_backend` 也一直照做，
+        #   只有这一处漏改。
+        pid = await _relay_backend_pid(pgconn)
+        assert pid is not None, "relay 没持有单例锁，杀谁都没意义"
         await pgconn.fetchval("SELECT pg_terminate_backend($1)", pid)
         assert await _wait_for(lambda: _holders_are(pgconn, 0))
         assert await other.start_event_relay() is True        # 别人接管了

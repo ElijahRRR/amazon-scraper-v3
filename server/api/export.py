@@ -232,7 +232,10 @@ async def api_export_fields():
 @router.get("/api/export/all")
 async def api_export_all(format: str = "xlsx", change_filter: str = "all", fields: str = None):
     selected = _parse_selected_fields(fields)
-    name = f"all_{_srv()._cn_now().strftime('%Y%m%d_%H%M%S')}"
+    # P4.7：批次名的唯一构造点在 server/app.py:_batch_name（精度不变，本来就是秒）。
+    # 这里的 name 只喂 Content-Disposition 的 filename，不落库、不进响应体
+    # —— 黄金的 Recorder 不记 header，所以这一处对基线不可见。
+    name = _srv()._batch_name("all")
     if format == "csv":
         return await _export_csv_streaming(name, batch_id=None, change_filter=change_filter, selected_fields=selected)
     else:

@@ -71,6 +71,18 @@ class AsinData:
     crawl_time: str = ""
     screenshot_path: str = ""
     content_hash: str = ""
+    # P4.8：这一行以前**不存在**，而 `common/core/asindata.py:ASIN_DATA_FIELDS`
+    # 和两份 DDL（`common/database.py` / `common/pgdb/schema.py`）都有它。
+    # 后果是下面 `_INTERNAL_FIELDS` 里的 "title_bullets_hash" 在排除一个**根本
+    # 不存在的 dataclass 字段** —— 一条看上去在干活、实际是死字符串的排除项。
+    # 补它是安全的（已实测，不是推断）：`AsinData` 除本文件外**零引用**
+    # （`grep -rn AsinData --include=*.py` 只有 class 定义与下面那行推导），
+    # 唯一用途就是推导 `EXPORTABLE_FIELDS`，而它已经在 `_INTERNAL_FIELDS` 里
+    # 被排除 -> `/api/export/fields` 与所有导出列**一字不变**
+    # （改动前后 EXPORTABLE_FIELDS 的 sha256 相同：43 项，
+    #  9bed0d6465699a82a718cf88e17c654b3e9a64a17426d214a9e0fe964eceb419）。
+    # 位置也照 DDL 放在 content_hash 之后，别挪。
+    title_bullets_hash: str = ""
     # 评分 + 卖家信息（v3 后期新增）
     rating: str = ""
     review_count: str = ""

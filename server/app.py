@@ -26,6 +26,7 @@ import openpyxl
 
 from common import config
 from common.core.idents import ASIN_RE as _ASIN_RE
+from common.core.zipcode import _zfill_short_numeric
 from common.core.timeutil import now_ts, ts_from, utc_now
 from common.database import Database
 from common.dbfactory import create_database
@@ -357,6 +358,50 @@ def _cn_now():
     Phase 4.3 因此**刻意不动这个函数**。
     """
     return datetime.utcnow() + _CN_TZ_OFFSET
+
+
+def _batch_name(prefix: str) -> str:
+    """批次名的唯一构造点：``<prefix>_YYYYMMDD_HHMMSS``（中国时间）。
+
+    ------------------------------------------------------------------
+    P4.7 —— 为什么要收一份，以及为什么统一到**秒**精度
+    ------------------------------------------------------------------
+    收口之前有五处各写各的 f-string，其中 ``auto_*`` 那两处
+    （``_auto_scrape_scheduler`` 与 ``/api/schedules/{name}/run``）
+    是**分钟**精度，另外三处是秒。
+
+    「同名批次不过是个 no-op」这个直觉是**错的**，这是本条真正要修的东西：
+    ``common/database.py:create_batch`` 是 ``INSERT OR IGNORE`` 之后
+    ``SELECT id FROM batches WHERE name=?``，撞名时返回的是**既有批次的 id**；
+    随后 ``create_tasks`` 才靠 tasks 上的 ``INSERT OR IGNORE`` 吃掉重复 ASIN。
+
+    于是「同一分钟内自动触发 + 手动触发同一个定时任务 = 什么都不做」
+    **只在 ASIN 清单没变时成立**。清单变了（文件加了行、或者走全库而库里
+    新增了 ASIN），新 ASIN 会被**悄悄塞进上一个批次**——批次的语义
+    「一次采集」就此破掉，而且没有任何一侧会报错：
+    接口照样回 200、照样回那个既有的 batch_id。
+
+    **有意的行为改动，已声明**：``auto_*`` 两处从分钟精度升到秒精度。
+    同一分钟内的第二次触发从此建**新批次**，而不是往上一个里塞。
+
+    黄金基线不受影响（已自行复核，不是照抄结论）：
+      * ``tests/golden/harness.py`` 的 Recorder 只记 status / content_type /
+        body，**不记任何 header** —— ``/api/export/all`` 的批次名只出现在
+        ``Content-Disposition`` 里，body 里没有；
+      * 基线的 ``export_all_csv`` body 实测不含任何批次名；
+      * 场景里三次 ``/api/upload`` 全部显式传 ``batch_name``
+        （``BATCH_A`` / ``BATCH_B`` / ``golden_batch_*``），走不到默认分支；
+      * 场景不打 ``/api/upload-sellers``，也不打
+        ``/api/schedules/{name}/run``；自动调度是后台协程，夹具已 no-op。
+
+    ⚠ 用 ``_cn_now()``（UTC+8）而不是 ``common.core.timeutil.now_ts()``：
+    批次名是**展示与调度**口径。理由见 ``_cn_now()`` 的 docstring。
+    ⚠ 时间戳在**调用时**现取。调用方手里就算已经有一个 ``now``，也不要
+    把它传进来 —— 那会让「批次名」和「调度判定」耦合成一个参数，
+    而 4.7 之后 ``_cn_now()`` 的调用点从 2 处涨到 5 处这件事本身已经登记在案
+    （``_cn_now()`` 在非 UTC 主机上的口径问题是 4.3 §6 的未决项，本轮不动）。
+    """
+    return f"{prefix}_{_cn_now():%Y%m%d_%H%M%S}"
 
 
 # ==================== 后台任务 ====================
@@ -769,7 +814,11 @@ async def _auto_scrape_scheduler():
                     continue
 
                 sched_name = sched.get("name", "task")
-                batch_name = f"auto_{sched_name}_{now:%Y%m%d_%H%M}"
+                # P4.7：**分钟 -> 秒**（有意的行为改动，见 _batch_name 的 docstring）。
+                # 分钟精度下「同一分钟内自动 + 手动触发同一个定时任务」会撞名，
+                # 而撞名不是 no-op：create_batch 返回既有批次 id，新 ASIN 被
+                # 悄悄塞进上一个批次。
+                batch_name = _batch_name(f"auto_{sched_name}")
                 zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
                 ns = sched.get("needs_screenshot", False)
                 batch_id = await db.create_batch(batch_name, ns, is_auto=True)
@@ -928,7 +977,12 @@ async def _is_safe_callback_url(url: str) -> tuple[bool, str]:
 # 那份真源与 worker/parser.py 共用；`.strip().upper()` 的归一留在下面
 # `_normalize_asin` 里 —— 正则自己不做大小写归一。
 # 美国邮编：5 位数字（兼容 ZIP+4，前 5 位）
-_US_ZIP_RE = re.compile(r'^\d{5}$')
+#
+# P4.6：``\Z`` 而不是 ``$``。Python 的 ``$`` 在**末尾恰好一个换行**处也匹配，
+# 于是 ``'10001\n'`` 能通过一条看起来是「只接受 5 位数字」的校验。
+# 本函数在这里之前已经 ``.strip()`` 过，所以这一改**对任何输入都不改变结果**
+# （已实测），它守的是「将来有人把 strip 挪走 / 复制这条正则去别处用」。
+_US_ZIP_RE = re.compile(r'^\d{5}\Z')
 
 
 def _normalize_asin(val) -> Optional[str]:
@@ -953,8 +1007,12 @@ def _normalize_zip(val) -> Optional[str]:
     # 前 5 位（兼容 "10001-1234"）
     head = s.split("-", 1)[0].strip()
     # 数字邮编位数补 0（Excel 把 "01234" 存为 1234）
-    if head.isdigit() and len(head) <= 5:
-        head = head.zfill(5)
+    # P4.6：补零规则的唯一真源是 common/core/zipcode.py —— 本函数归一出来的值
+    # 会去和 relay 归一出来的 zip_requested 比对，两边一边补零一边不补，
+    # 就是凭空造出的 mismatch。原先这里写的是 ``len(head) <= 5``，
+    # 而 ``"12345".zfill(5) == "12345"``，所以 ``or head`` 这一支覆盖的
+    # 「5 位数字」情形结果完全一致（已实测）。
+    head = _zfill_short_numeric(head) or head
     return head if _US_ZIP_RE.match(head) else None
 
 
@@ -1067,7 +1125,7 @@ async def api_upload(request: Request,
             seen.add(a)
 
     if not batch_name:
-        batch_name = f"batch_{_cn_now().strftime('%Y%m%d_%H%M%S')}"
+        batch_name = _batch_name("batch")     # P4.7：精度不变（本来就是秒）
 
     # callback_url 校验（防 SSRF + 格式）
     cb_url = (callback_url or "").strip() or None
@@ -1662,8 +1720,10 @@ async def api_run_schedule_now(sched_id: str):
     if not asin_list:
         raise HTTPException(400, "ASIN 文件为空或不存在")
 
-    now = _cn_now()  # 批次名与 last_run 用中国时间
-    batch_name = f"auto_{target.get('name', 'task')}_{now:%Y%m%d_%H%M}"
+    now = _cn_now()  # last_run 用中国时间
+    # P4.7：**分钟 -> 秒**（有意的行为改动，见 _batch_name 的 docstring）。
+    # 这一处和 _auto_scrape_scheduler 那一处正是会互相撞名的两个。
+    batch_name = _batch_name(f"auto_{target.get('name', 'task')}")
     zc = _runtime_settings.get("zip_code", config.DEFAULT_ZIP_CODE)
     ns = target.get("needs_screenshot", False)
     batch_id = await db.create_batch(batch_name, ns, is_auto=True)

@@ -129,6 +129,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import asyncpg
 
 from common import config
+from common.core.zipcode import _zfill_short_numeric
 from common.pgdb.pool import translate_sql
 from common.pgdb.schema import (
     EVENT_COMPLETENESS_MAX,
@@ -384,8 +385,9 @@ def normalize_zip(value: Any) -> Tuple[str, bool]:
     if value is None:
         return "", False
     s = str(value).strip()
-    if s.isdigit() and 0 < len(s) < 5:
-        return s.zfill(5), True
+    z = _zfill_short_numeric(s)          # P4.6：补零规则的唯一真源
+    if z is not None:
+        return z, True
     return s, False
 
 
@@ -418,6 +420,12 @@ def normalize_zip_observed(value: Any) -> Tuple[Optional[str], bool]:
     补零规则与 ``normalize_zip`` **必须一致**：这两个值会被
     ``reconcile_zip_verify`` 直接比较，一边补零一边不补，就会凭空造出
     ``mismatch``（'01001' vs '1001'）。
+
+    P4.6：这条「必须一致」以前**只写在这段注释里**，两个函数各抄了一遍
+    ``s.isdigit() and 0 < len(s) < 5``，谁改一边都不会有任何东西响。
+    现在两边调同一个 ``_zfill_short_numeric``，注释变成可执行的。
+    **外层语义仍然是两份**（本函数的 ``None`` 合法、还要拦 bool/list/dict），
+    那部分刻意不合并，理由见 common/core/zipcode.py 的 docstring。
     """
     if value is None:
         return None, False
@@ -428,8 +436,9 @@ def normalize_zip_observed(value: Any) -> Tuple[Optional[str], bool]:
     s = str(value).strip()
     if not s:
         return None, False
-    if s.isdigit() and 0 < len(s) < 5:
-        return s.zfill(5), True
+    z = _zfill_short_numeric(s)          # P4.6：与 normalize_zip 同一条规则
+    if z is not None:
+        return z, True
     return s, False
 
 

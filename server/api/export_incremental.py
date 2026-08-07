@@ -68,6 +68,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 
+from common.core.completeness import completeness_ok
 from common.slowhash import split_multivalue
 from server.api import sync as _sync
 
@@ -251,10 +252,12 @@ def _to_record(row: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:                 # noqa: BLE001
             payload = {}
 
-    completeness = row.get("completeness") or 0
-    measured = bool(completeness & _sync.COMPLETENESS_MEASURED_BIT)
-    complete = measured and (completeness & _sync.COMPLETENESS_REQUIRED_MASK
-                             ) == _sync.COMPLETENESS_REQUIRED_MASK
+    # P4.5：此前这里是契约 §4.3 判据的**第二份手工实现**（重算同一个合取式）。
+    # 判据改一次要改两处，漏一处就是 /api/export/incremental.completeness_ok 与
+    # /api/v1/sync/records.completeness_ok **对同一行给出不同答案** ——
+    # 两个消费者、两个结论，而且没有任何一侧会报错。现在两处走同一个函数对象
+    # （server/api/sync.py:_completeness_ok is completeness_ok 为真）。
+    complete = completeness_ok(row.get("completeness"))
 
     return {
         # ---- 契约必填 ----

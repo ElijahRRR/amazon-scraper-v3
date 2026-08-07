@@ -486,12 +486,25 @@ EVENT_ZIP_VERIFY_DEFAULT = "unverified"
 EVENT_PARSE_ENGINES = ("selectolax", "lxml")
 
 #: ``completeness`` 位图（契约 §6.4，位定义已对外公布，**不许改**）。
-EVENT_COMPLETENESS_BREADCRUMB = 1     # bit0 面包屑区块存在
-EVENT_COMPLETENESS_DETAIL = 2         # bit1 详情表存在
-EVENT_COMPLETENESS_IMAGE = 4          # bit2 主图集存在
-EVENT_COMPLETENESS_MEASURED = 8       # bit3 这次采集真的测量过上面三项
-EVENT_COMPLETENESS_MAX = 15
+#:
+#: P4.5：**数值不再定义在这里**，唯一真源是 ``common/core/completeness.py``
+#: （worker/parser.py 的 ``COMPLETENESS_*`` 与 server/api/sync.py 的
+#: ``COMPLETENESS_MEASURED_BIT`` / ``COMPLETENESS_REQUIRED_MASK`` 同源）。
+#: ``EVENT_`` 前缀的别名**一个不改**：common/pgdb/relay.py:134-135 与
+#: tests/pgdb/test_phase4_fields.py 都按这些名字 import，那层不用动一个字节。
+#: 真源模块零依赖（不 import 任何东西），所以这条 pgdb -> core 的边不会
+#: 把任何驱动拖进来，也**不会**产生反向的 core -> pgdb 依赖
+#: —— 后者正是「位常量不能放在本文件」的原因（worker 也要用它，见 R4）。
+from common.core.completeness import (  # noqa: E402  —— 位常量的唯一真源
+    BREADCRUMB as EVENT_COMPLETENESS_BREADCRUMB,   # bit0 面包屑区块存在
+    DETAIL as EVENT_COMPLETENESS_DETAIL,           # bit1 详情表存在
+    IMAGE as EVENT_COMPLETENESS_IMAGE,             # bit2 主图集存在
+    MEASURED as EVENT_COMPLETENESS_MEASURED,       # bit3 这次采集真的测量过上面三项
+    MAX as EVENT_COMPLETENESS_MAX,
+)
 #: 0 = **未测量**，不是「三项都缺」。契约 §6.4 用整段写明了这个区别。
+#: 它**不是**一个位，是「位图缺席」这件事本身，所以刻意留在本文件、
+#: 没有搬进 common/core/completeness.py 的位常量清单。
 EVENT_COMPLETENESS_UNMEASURED = 0
 
 #: worker 在提交体里放的 `_` 前缀采集元数据键（worker/engine.py 的 META_*）。

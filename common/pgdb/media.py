@@ -81,7 +81,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from common.core.timeutil import now_ts
 from typing import Any, Dict, List, Optional, Tuple
 
 from common import config
@@ -241,7 +241,7 @@ class MediaMixin:
 
         Returns: {"accepted":bool,"stale":bool,"discovered":int,"new_asins":int,"detail_tasks_created":int}
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         tid = self.as_int(task_id)
         wid = self.text_affinity(worker_id)
         epoch = self.as_int(lease_epoch)
@@ -503,7 +503,7 @@ class MediaMixin:
     async def update_screenshot_status(self, asin: str, batch_id: int, status: str,
                                        file_path: str = None,
                                        error: str = None) -> bool:
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         updated = False
         asin_p = self.text_affinity(asin)
         bid = self.as_int(batch_id)

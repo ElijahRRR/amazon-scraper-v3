@@ -49,7 +49,7 @@
 import os
 import re
 import time
-from datetime import datetime
+from common.core.timeutil import now_ts
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
@@ -116,7 +116,7 @@ async def api_release_tasks(request: Request):
     if not tasks and "task_ids" in body:
         task_ids = body["task_ids"]
         if task_ids:
-            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            now = now_ts()
             placeholders = ",".join("?" * len(task_ids))
             async with db._write_lock:
                 await db._db.execute("BEGIN")

@@ -134,7 +134,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
+from common.core.timeutil import now_ts
 from typing import List
 
 from common.pgdb._shared import (  # noqa: F401
@@ -255,7 +255,7 @@ class ResultsWriteMixin:
                 cursor = await self._db.execute(
                     "UPDATE tasks SET status='done', updated_at=? "
                     "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
-                    (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                    (now_ts(),
                      tid, wid, epoch)
                 )
                 if cursor.rowcount == 0:
@@ -331,7 +331,7 @@ class ResultsWriteMixin:
         accepted = 0
         stale = 0
         failed = 0
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
 
         async with self._write_lock("accept_results_batch"):
             # SQLite 版用 BEGIN IMMEDIATE 显式抢写锁；PG 没有这个概念，
@@ -531,7 +531,7 @@ class ResultsWriteMixin:
         # 只有绑到 bigint 列时才强转。
         bid = self.as_int(batch_id)
 
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
 
         # P4-3：这一次提交是不是「商品不存在」。判据与事件流**完全同源**
         # （relay.payload_says_not_found：`_outcome == 'not_found'` 或哨兵标题），

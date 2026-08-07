@@ -533,7 +533,7 @@ def test_legacy_hashes_are_untouched():
     """asin_changes 依赖 content_hash / title_bullets_hash，Phase 1 等价性要求逐字不变。"""
     import hashlib
 
-    from common.database import (
+    from common.core import (
         _HASH_FIELDS,
         _TITLE_BULLETS_FIELDS,
         _compute_content_hash,

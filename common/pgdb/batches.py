@@ -88,7 +88,7 @@ OWNS（8 个方法，对应 common/database.py 的同名实现）:
 """
 from __future__ import annotations
 
-from datetime import datetime
+from common.core.timeutil import now_ts
 from typing import Any, Dict, List, Optional
 
 # 只借异常类型，不建连接（硬规矩 3 禁的是自己建连接）。
@@ -227,7 +227,7 @@ class BatchesMixin:
         返回 True 表示本次确实做了状态转移，调用方可以触发回调入队。
         False 表示批次已经是 completed/failed/其他状态，不重复处理。
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         async with self._write_lock:
             # BEGIN IMMEDIATE → 普通事务（PG 的行锁是惰性获取的，没有 SQLite
             # 那个"升级死锁"要绕，IMMEDIATE 在 PG 里还是语法错误）。
@@ -277,7 +277,7 @@ class BatchesMixin:
         success=False: attempts+1；若达到 max_attempts 则 status='failed'，
                        否则更新 next_retry_at 等下次扫描
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         bid = as_int(batch_id)
         async with self._write_lock:
             async with self._tx():
@@ -378,7 +378,7 @@ class BatchesMixin:
 
     async def reset_callback_for_retry(self, batch_id: int) -> bool:
         """运维手动触发：把已经 failed 或 sent 的回调重置回 pending 立即重试。"""
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         async with self._write_lock:
             async with self._tx():
                 cursor = await self._db.execute(

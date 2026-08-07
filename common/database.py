@@ -7,324 +7,77 @@ Amazon ASIN 采集系统 v3 - 数据库模块
 - 合理的复合索引
 """
 import os
-import re
 import json
 import time
-import hashlib
 import aiosqlite
 import asyncio
 import logging
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from common import config
+from common.core.timeutil import now_ts, ts_from, utc_now
+
+# ============================================================
+# 与 PG 后端共享的纯 Python 符号 —— 定义在 common/core/（Phase 4.1）。
+#
+# 这里**逐名再导出**，让 `from common.database import LOCK_STATS` 等既有写法
+# 一字不用改，且与 common/pgdb/_shared.py 指向**同一批对象**
+# （tests/pgdb/test_skeleton.py:85 的 `is` 断言就是钉这个的）。
+#
+# 不要写成 `from common.core import *`。理由见 common/core/__init__.py 的
+# 模块 docstring —— 注意那里订正过一次：因为 common.core 定义了 __all__，
+# 星号导入今天其实能用，「下划线名被跳过」只在没有 __all__ 时才发生。
+# 逐名写法要的是「导出面是显式的、评审 diff 能看见」，不是「会当场炸」。
+# ============================================================
+from common.core import (  # noqa: F401  —— 全部是有意的再导出
+    # ---- 重试策略 ----
+    LIMITED_RETRY_ERROR_TYPES,
+    NO_AUTO_RETRY_ERROR_TYPES,
+    NO_RETRY_ERROR_TYPES,
+    _fail_cap,
+    # ---- 锁仪表（必须与 PG 实现共用同一个全局容器）----
+    LOCK_STATS,
+    TimedLock,
+    _NamedLockCtx,
+    _record_wait,
+    _record_hold,
+    record_stage,
+    # ---- 解析失败 / 截图路径归一 ----
+    _NA_VALUES,
+    _normalize_screenshot_path,
+    _is_parse_failure,
+    # ---- 变动比较器 ----
+    _parse_price_float,
+    _compare_price,
+    _compare_stock_qty,
+    _compare_stock_status,
+    # ---- hash ----
+    _HASH_FIELDS,
+    _TITLE_BULLETS_FIELDS,
+    _compute_content_hash,
+    _compute_title_bullets_hash,
+    # ---- asin_data 列清单 ----
+    ASIN_DATA_FIELDS,
+    _ASIN_DATA_COLUMN_SET,
+    # ---- 清库的表清单（DELETE /api/database）----
+    CLEAR_TABLES,
+    # ---- 按 ASIN 删除 / 模糊搜索（DELETE /api/results）----
+    ASIN_DELETE_CHUNK,
+    ASIN_DELETE_TABLES,
+    search_like_pattern,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# error_type → 失败次数上限映射
-# 用于 fail_task / accept_results_batch
-#
-# 当任务的 retry_count >= cap 时直接 status='failed' 终态。
-# 不在 dict 中的 error_type 默认用 config.MAX_RETRIES（=3）。
-#
-# - variant_offset: 不重试（cap=1）
-#   理由：这是 Amazon 返回了兄弟 variant 页面，继续重试容易浪费配额并污染队列。
-# ============================================================
-LIMITED_RETRY_ERROR_TYPES = {
-    "variant_offset": 1,   # 首次失败即终态，不回 pending
-}
-
-# ============================================================
-# 不进入"循环类"重试的 error_type 集合
-# 用于 auto_retry_failed_tasks / api_retry_batch（默认）
-#
-# 进入此集合的失败不会被 server 周期任务或用户默认手动按钮重新激活。
-# 批次手动重试也会跳过这些类型。
-# ============================================================
-NO_AUTO_RETRY_ERROR_TYPES = frozenset({"variant_offset"})
-
-# 向后兼容：之前一些地方引用了 NO_RETRY_ERROR_TYPES
-NO_RETRY_ERROR_TYPES = NO_AUTO_RETRY_ERROR_TYPES
-
-
-def _fail_cap(error_type: str) -> int:
-    """返回该 error_type 的失败上限（达到即终态，不回 pending）。"""
-    return LIMITED_RETRY_ERROR_TYPES.get(error_type or "", config.MAX_RETRIES)
-
-
-# ============================================================
-# 锁竞争 / 阶段耗时 侦查仪表（recon 阶段使用，可随时删除）
-#
-# 使用方式：
-#   - async with self._write_lock:                  -> caller="other"
-#   - async with self._write_lock("accept_results_batch"):  -> caller="accept_results_batch"
-#
-# 统计指标：每个 caller 的 acquire 等待时长 + 持锁时长
-# 暴露接口：server/app.py 的 /api/_debug/lock-stats
-# ============================================================
-
-# 全局统计容器
-LOCK_STATS: Dict[str, Any] = {
-    "waits": defaultdict(list),       # caller -> [wait_ms, ...]
-    "holds": defaultdict(list),       # caller -> [hold_ms, ...]
-    "slow_holds": [],                 # [(ts, caller, hold_ms), ...]  仅 >200ms
-    "stage_timings": defaultdict(list),  # stage_name -> [ms, ...]   内部分阶段
-}
-
-_MAX_SAMPLES = 10000   # 每个 caller 最多保留样本数（满了滚动）
-_SLOW_HOLD_THRESHOLD_MS = 200
-
-
-def _record_wait(caller: str, ms: float):
-    arr = LOCK_STATS["waits"][caller]
-    arr.append(ms)
-    if len(arr) > _MAX_SAMPLES:
-        del arr[: _MAX_SAMPLES // 2]
-
-
-def _record_hold(caller: str, ms: float):
-    arr = LOCK_STATS["holds"][caller]
-    arr.append(ms)
-    if len(arr) > _MAX_SAMPLES:
-        del arr[: _MAX_SAMPLES // 2]
-    if ms > _SLOW_HOLD_THRESHOLD_MS:
-        sh = LOCK_STATS["slow_holds"]
-        sh.append((time.time(), caller, round(ms, 2)))
-        if len(sh) > 500:
-            del sh[:250]
-
-
-def record_stage(stage: str, ms: float):
-    """供锁内分阶段计时用（如 accept_results_batch 内部）"""
-    arr = LOCK_STATS["stage_timings"][stage]
-    arr.append(ms)
-    if len(arr) > _MAX_SAMPLES:
-        del arr[: _MAX_SAMPLES // 2]
-
-
-class _NamedLockCtx:
-    """显式命名的 async context manager"""
-    __slots__ = ("_parent", "_caller")
-
-    def __init__(self, parent, caller: str):
-        self._parent = parent
-        self._caller = caller
-
-    async def __aenter__(self):
-        await self._parent._do_enter(self._caller)
-        return self
-
-    async def __aexit__(self, *args):
-        await self._parent._do_exit()
-
-
-class TimedLock:
-    """asyncio.Lock 包装，自动按 caller 记录 wait/hold 时长。
-
-    - `async with timed_lock:`          -> caller='other'（默认）
-    - `async with timed_lock('name'):`  -> caller='name'（显式）
-    """
-
-    def __init__(self):
-        self._lock = asyncio.Lock()
-        self._current_caller = "other"
-        self._hold_t0 = 0.0
-
-    # 显式命名：`async with self._write_lock("accept_results_batch"):`
-    def __call__(self, caller: str = "other"):
-        return _NamedLockCtx(self, caller)
-
-    # 兼容旧调用：`async with self._write_lock:` -> caller='other'
-    async def __aenter__(self):
-        await self._do_enter("other")
-        return self
-
-    async def __aexit__(self, *args):
-        await self._do_exit()
-
-    async def _do_enter(self, caller: str):
-        t0 = time.monotonic()
-        await self._lock.acquire()
-        wait_ms = (time.monotonic() - t0) * 1000
-        _record_wait(caller, wait_ms)
-        # 一旦拿到锁，此时无其他 coroutine 在临界区，写 self 不会 race
-        self._current_caller = caller
-        self._hold_t0 = time.monotonic()
-
-    async def _do_exit(self):
-        hold_ms = (time.monotonic() - self._hold_t0) * 1000
-        _record_hold(self._current_caller, hold_ms)
-        self._lock.release()
-
-
-# ============================================================
-
-# ==================== 变动对比辅助函数 ====================
-
-_NA_VALUES = {"", "N/A", "n/a", "None", "none", None}
-
-
-def _normalize_screenshot_path(path: Any) -> Optional[str]:
-    """将无效占位值统一视为缺失截图路径。"""
-    if path is None:
-        return None
-    value = str(path).strip()
-    if not value or value.lower() in {"none", "null"}:
-        return None
-    return value
-
-
-def _is_parse_failure(data: dict) -> bool:
-    """检测采集结果是否为解析失败（真正的空壳数据才算失败）
-    v3: 如果有有效标题和品牌，即使价格为N/A也不算失败（可能是变体/NFO页面）
-    """
-    # 有有效标题和品牌的数据不是解析失败
-    title = data.get("title", "")
-    brand = data.get("brand", "")
-    has_valid_info = (title and title not in _NA_VALUES and not title.startswith("[")
-                      and brand and brand not in _NA_VALUES)
-    if has_valid_info:
-        return False
-
-    key_fields = ["current_price", "buybox_price", "stock_count", "stock_status", "brand"]
-    all_empty = all(data.get(f) in _NA_VALUES for f in key_fields)
-    return all_empty
-
-
-def _parse_price_float(s) -> Optional[float]:
-    if not s:
-        return None
-    s = str(s).strip().replace(",", "")
-    s = re.sub(r'^[^\d.-]+', '', s)
-    try:
-        return float(s)
-    except (ValueError, TypeError):
-        return None
-
-
-def _compare_price(old_str, new_str) -> Optional[str]:
-    old_val = _parse_price_float(old_str)
-    new_val = _parse_price_float(new_str)
-    if old_val is None or new_val is None:
-        return None
-    if new_val > old_val:
-        return "up"
-    elif new_val < old_val:
-        return "down"
-    return None
-
-
-def _compare_stock_qty(old_str, new_str) -> Optional[str]:
-    def parse_int(s):
-        if not s:
-            return None
-        s = str(s).strip().replace(",", "")
-        m = re.search(r'(\d+)', s)
-        return int(m.group(1)) if m else None
-    old_val = parse_int(old_str)
-    new_val = parse_int(new_str)
-    if old_val is None or new_val is None:
-        return None
-    if new_val > old_val:
-        return "up"
-    elif new_val < old_val:
-        return "down"
-    return None
-
-
-def _compare_stock_status(old_str, new_str) -> Optional[str]:
-    def normalize(s):
-        v = str(s or "").strip().lower()
-        return None if v in ("", "n/a", "none") else v
-    old_n = normalize(old_str)
-    new_n = normalize(new_str)
-    if old_n is None or new_n is None:
-        return None
-    return "changed" if old_n != new_n else None
-
-
-# 内容 hash 字段（排除价格/库存等高波动字段）
-_HASH_FIELDS = [
-    "title", "brand", "product_type", "manufacturer", "model_number",
-    "part_number", "country_of_origin", "is_customized", "best_sellers_rank",
-    "bullet_points", "long_description", "image_urls",
-    "upc_list", "ean_list", "parent_asin", "variation_asins",
-    "root_category_id", "category_ids", "category_tree",
-    "first_available_date", "package_dimensions", "package_weight",
-    "item_dimensions", "item_weight",
-]
-
-# 标题/五点描述 hash 字段
-_TITLE_BULLETS_FIELDS = ["title", "bullet_points"]
-
-
-def _compute_content_hash(data: dict) -> str:
-    parts = [str(data.get(f, "") or "") for f in _HASH_FIELDS]
-    return hashlib.md5("|".join(parts).encode()).hexdigest()
-
-
-def _compute_title_bullets_hash(data: dict) -> str:
-    parts = [str(data.get(f, "") or "") for f in _TITLE_BULLETS_FIELDS]
-    return hashlib.md5("|".join(parts).encode()).hexdigest()
-
-
-# ASIN 数据字段列表（对应 asin_data 表列）
-ASIN_DATA_FIELDS = [
-    "asin", "title", "brand", "product_type", "manufacturer", "model_number",
-    "part_number", "country_of_origin", "is_customized", "best_sellers_rank",
-    "original_price", "current_price", "buybox_price", "buybox_shipping",
-    "is_fba", "stock_count", "stock_status", "delivery_date", "delivery_time",
-    "image_urls", "bullet_points", "long_description", "upc_list", "ean_list",
-    "parent_asin", "variation_asins", "variant_attributes",
-    "root_category_id", "category_ids",
-    "category_tree", "first_available_date", "package_dimensions",
-    "package_weight", "item_dimensions", "item_weight", "product_url",
-    "site", "zip_code", "crawl_time", "screenshot_path",
-    "content_hash", "title_bullets_hash",
-    # 评分 + 卖家信息（v3 后期新增）
-    "rating", "review_count", "seller_id", "seller_name",
-]
-
-# asin_data 合法列名集合（含内部列）：iter_results 收窄投影时用作白名单，
-# 防止调用方传入的列名拼进 SQL 造成注入或引用不存在的列。
-_ASIN_DATA_COLUMN_SET = frozenset(ASIN_DATA_FIELDS) | {"id", "updated_at", "created_at"}
-
-# `DELETE /api/database` 清库的删除顺序（Database.clear_all_data 用）。
-# 子表在前、父表在后 —— PG 侧有真外键，顺序在那边是正确性问题；SQLite 侧
-# 顺序无所谓。两个后端**共用这一份**（pgdb 经 common/pgdb/_shared.py 再导出），
-# 分叉 = 两个后端「清空」之后剩下的东西悄悄不同。
-CLEAR_TABLES = ("asin_changes", "asin_data", "batch_asins", "tasks",
-                "screenshots", "batches")
-
-# 按 ASIN 删除时的分块大小。SQLite 的 SQLITE_MAX_VARIABLE_NUMBER 默认 999，
-# 一条 `IN (?,?,...)` 不能超过它；500 是安全值。PG 没有这个限制，但**必须
-# 用同一个值**：分块边界不同 = 两个后端发出的语句序列不同，一旦某一块中途
-# 失败（两侧都在一个事务里，所以只会整体回滚），排障时对不上号。
-ASIN_DELETE_CHUNK = 500
-
-# 按 ASIN 删除要清的四张表（顺序：子表在前）。asin_data 最后 —— PG 侧
-# asin_changes / screenshots / batch_asins 都可能引用它。
-ASIN_DELETE_TABLES = ("asin_changes", "screenshots", "batch_asins", "asin_data")
-
 # 一个 search term 的三列 OR 谓词（SQLite 侧原文；PG 侧见
 # common/pgdb/results_read.py 的 _TERM_OR —— 那边必须写成
 # ascii_lower(col) LIKE ascii_lower(?) ESCAPE ''，见 OWNERSHIP.md D-5 / D-16）。
+# 带 `?` 占位符 = 方言相关，所以它**不进** common/core。
 SEARCH_TERM_OR = "(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)"
-
-
-def search_like_pattern(t: str) -> str:
-    """``%term%``，**不做任何转义**。
-
-    SQLite 的 LIKE 没有转义字符，所以模式原样传下去；PG 侧靠 SQL 里的
-    ``ESCAPE ''`` 关掉默认的反斜杠转义来对齐（决策 D-16）。
-    ``%`` 与 ``_`` 故意不转义：用户输入里的通配符今天就是生效的
-    （``Gol%rand`` 是模糊匹配），两个引擎的元字符一样，这个行为免费保留。
-    """
-    return "%" + str(t) + "%"
 
 
 class Database:
@@ -1006,7 +759,7 @@ class Database:
         返回 True 表示本次确实做了状态转移，调用方可以触发回调入队。
         False 表示批次已经是 completed/failed/其他状态，不重复处理。
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         async with self._write_lock:
             await self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -1059,7 +812,7 @@ class Database:
         success=False: attempts+1；若达到 max_attempts 则 status='failed'，
                        否则更新 next_retry_at 等下次扫描
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         async with self._write_lock:
             await self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -1114,7 +867,7 @@ class Database:
 
     async def reset_callback_for_retry(self, batch_id: int) -> bool:
         """运维手动触发：把已经 failed 或 sent 的回调重置回 pending 立即重试。"""
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         async with self._write_lock:
             await self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -1208,7 +961,7 @@ class Database:
         从而最大化复用同一 session（避免每个任务都切换邮编）。多 worker 不同 prefer_zip
         时各自被分到对应邮编池，自然分流。
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         tasks = []
 
         async with self._write_lock("pull_tasks"):
@@ -1326,8 +1079,8 @@ class Database:
         """
         if not dead_worker_ids:
             dead_worker_ids = []
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        hard_cutoff = (datetime.utcnow() - timedelta(minutes=config.TASK_TIMEOUT_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
+        hard_cutoff = ts_from(utc_now() - timedelta(minutes=config.TASK_TIMEOUT_MINUTES))
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
@@ -1369,8 +1122,8 @@ class Database:
         """
         if max_auto_cycles <= 0:
             return 0
-        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        cutoff = (datetime.utcnow() - timedelta(minutes=delay_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+        now_str = now_ts()
+        cutoff = ts_from(utc_now() - timedelta(minutes=delay_minutes))
 
         # 动态构造 NOT IN (...) 子句
         no_retry_list = sorted(NO_AUTO_RETRY_ERROR_TYPES)
@@ -1471,7 +1224,7 @@ class Database:
 
         Returns: {"accepted": True/False, "stale": True/False}
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         async with self._write_lock:
             await self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -1524,7 +1277,7 @@ class Database:
         """
         if not tasks:
             return 0
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         released = 0
 
         # 按 epoch 分组批量更新
@@ -1701,7 +1454,7 @@ class Database:
 
         Returns: {"accepted":bool,"stale":bool,"discovered":int,"new_asins":int,"detail_tasks_created":int}
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         async with self._write_lock:
             await self._db.execute("BEGIN")
             try:
@@ -1854,7 +1607,7 @@ class Database:
                 cursor = await self._db.execute(
                     "UPDATE tasks SET status='done', updated_at=? "
                     "WHERE id=? AND worker_id=? AND lease_epoch=? AND status='processing'",
-                    (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                    (now_ts(),
                      task_id, worker_id, lease_epoch)
                 )
                 if cursor.rowcount == 0:
@@ -1895,7 +1648,7 @@ class Database:
         accepted = 0
         stale = 0
         failed = 0
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
 
         async with self._write_lock("accept_results_batch"):
             # 用 BEGIN IMMEDIATE 显式拿写锁，与 pull_tasks 一致
@@ -2010,7 +1763,7 @@ class Database:
         if not asin:
             return False
 
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         data["content_hash"] = _compute_content_hash(data)
         data["title_bullets_hash"] = _compute_title_bullets_hash(data)
 
@@ -2596,7 +2349,7 @@ class Database:
 
     async def update_screenshot_status(self, asin: str, batch_id: int, status: str,
                                        file_path: str = None, error: str = None) -> bool:
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         updated = False
         async with self._write_lock:
             await self._db.execute("BEGIN")

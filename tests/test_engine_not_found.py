@@ -72,11 +72,8 @@ def tearDownModule():
     logging.disable(_SAVED_LOG_LEVEL)
 
 
-from common.database import (  # noqa: E402
-    ASIN_DATA_FIELDS,
-    Database,
-    _is_parse_failure,
-)
+from common.core import ASIN_DATA_FIELDS, _is_parse_failure  # noqa: E402
+from common.database import Database  # noqa: E402
 from common.slowhash import SLOW_HASH_FIELDS  # noqa: E402
 from worker import engine as eng  # noqa: E402
 from worker.engine import Worker  # noqa: E402

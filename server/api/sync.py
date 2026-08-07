@@ -70,11 +70,12 @@ import json
 import logging
 import shutil
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Body, Query
 from fastapi.responses import JSONResponse
+
+from common.core.timeutil import iso_utc, now_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -180,17 +181,12 @@ _META_KEYS = ("contract_version", "gen", "instance_id",
 # 小工具
 # ============================================================
 
-def _iso(dt: Optional[datetime]) -> Optional[str]:
-    """RFC 3339 UTC，永远带 ``Z``。小数秒**可能**出现（库里就有）。"""
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _now_iso() -> str:
-    return _iso(datetime.now(timezone.utc))
+# `_iso` / `_now_iso` 现在是 common/core/timeutil 的**别名**（Phase 4.4）。
+# 之前 common/pgdb/retention.py 有一份逐字节相同的 `_iso`；真源落在 common/core
+# 而不是这里 —— retention 属于 common，让它 import server.api.sync 是分层倒置。
+# 别名保留原名：server/api/export_incremental.py 按 `_sync._iso(...)` 调它。
+_iso = iso_utc
+_now_iso = now_iso_utc
 
 
 def _as_int(v: Any) -> Optional[int]:

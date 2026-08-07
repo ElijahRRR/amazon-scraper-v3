@@ -94,6 +94,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import asyncpg
 
 from common import config
+from common.core.timeutil import iso_utc as _iso
 
 logger = logging.getLogger(__name__)
 
@@ -961,12 +962,11 @@ class RetentionMixin:
 # 模块级小工具（无状态，方便单测）
 # ============================================================
 
-def _iso(dt: Optional[datetime]) -> Optional[str]:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+# `_iso` 的本地副本已在 Phase 4.4 删除 —— 它与 server/api/sync.py 那份逐字节
+# 相同（含 `.replace("+00:00","Z")`）。真源在 common/core/timeutil.iso_utc，
+# 本模块在文件头 import 它并保留 `_iso` 这个名字（调用点一字未动）。
+# ⚠ 不要改成 `from server.api.sync import _iso`：common 是底座，依赖 server 是
+# 分层倒置。
 
 
 _INTERVAL_OK = re.compile(r"^\d+(ms|s|min)?$")

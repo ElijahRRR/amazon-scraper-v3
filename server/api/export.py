@@ -67,7 +67,7 @@ from fastapi.responses import StreamingResponse
 
 from common import config
 from common.models import EXPORTABLE_FIELDS
-from common.database import _parse_price_float
+from common.core import _parse_price_float
 
 
 def _srv():
@@ -99,6 +99,14 @@ BATCH_STATUS_EXPORT_HEADERS = [
     "产品库数据更新时间",
 ]
 
+# ⚠ **这条正则是另一条规则，故意不与 common/core/idents.py:ASIN_RE 统一。**
+# 别顺手改成 `from common.core.idents import ASIN_RE`——三处都不一样：
+#   1. **搜索**语义（`\b...\b` 词边界），ASIN_RE 是**整串校验**（`^...$`）；
+#   2. **不要求 B 前缀**（`[A-Z0-9]{10}`），ASIN_RE 是 `B` + 9 位；
+#   3. 带 **re.IGNORECASE**，ASIN_RE 没有。
+# 它的输入是 `variant_offset` 的 `error_detail` 自由文本（我们自己拼的诊断串），
+# 不是用户提交的 ASIN。换成 ASIN_RE 会让所有非 B 开头的 variant 诊断**静默**
+# 捞不到值，导出列「实际页面ASIN」变空——而黄金基线里没有这一步，不会响。
 _VARIANT_PAGE_ASIN_RE = re.compile(r"\bpage=([A-Z0-9]{10})\b", re.IGNORECASE)
 
 

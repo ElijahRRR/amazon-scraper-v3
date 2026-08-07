@@ -1,9 +1,8 @@
-"""common/pgdb/_shared.py —— 与 SQLite 实现**共享**的纯 Python 符号。
+"""common/core —— 后端无关的纯 Python 真源（**定义在这里**，别处只许再导出）。
 
-本模块**只做再导出**，不得定义任何常量/函数的副本。
-唯一真源自 Phase 4.1 起是 ``common/core/``（原先是 ``common/database.py``）；
-``common/database.py`` 现在与本文件一样，也只是从 ``common/core`` 逐名再导出，
-三个模块指向**同一批对象**（tests/pgdb/test_skeleton.py:85 的 ``is`` 断言钉这个）。
+本包是 `common/pgdb/_shared.py` 那批共享符号的**唯一定义处**。
+`common/database.py`（SQLite 后端）与 `common/pgdb/_shared.py`（PG 后端）
+现在都只是**逐名再导出**，三个模块指向同一批对象。
 
 理由（规格里已经论证过，这里复述以免后来人"顺手抄一份"）：
 
@@ -31,50 +30,80 @@
 * ``CLEAR_TABLES`` —— ``clear_all_data`` 的删除清单。两侧各有一份实现
   （SQLite 删 ``sqlite_sequence``、PG 做 identity RESTART），但**删哪些表**
   必须是同一份，否则两个后端「清空」之后剩下的东西悄悄不同。
+* ``as_int`` —— HTTP 边界的整数强转。原先在 ``common/pgdb/pool.py``，
+  而那个模块是模块级 ``import asyncpg``：纯函数被锁在只有 PG 才能 import
+  的模块里，没人能安全地复用（Phase 4.1 一并搬来）。
 
-导入 ``common.core`` 没有任何代价：它只依赖 ``common.config`` 与标准库
-（Phase 4.1 之前这里 import 的是 ``common.database``，那要顺带拖进 aiosqlite）。
+  ⚠ **它与上面那批的再导出路径不同，别套用同一条不变量**（Phase 4.1 审计指出）：
+  上面那批走 ``common/database.py`` 与 ``common/pgdb/_shared.py`` 两处再导出，
+  所以「三个模块对同一个名字给出同一个对象」对它们成立；
+  ``as_int`` **不在** ``_shared.__all__`` 里、``common/database.py`` 里也没有它，
+  它的再导出点是 ``common/pgdb/pool.py``（``pool.as_int is coerce.as_int`` 为真），
+  外加 ``PoolMixin.as_int`` 那个 4.1 之前就有的 staticmethod 薄壳。
+  验它要验这条链，验 ``getattr(common.database, "as_int")`` 会 AttributeError —— 那不是分叉，是它本来就不在那儿。
+
+（原 ``_shared.py`` 在这里还有一句「导入 common.database 的代价：它 import
+aiosqlite」——那正是这次搬迁消除掉的东西，故删去。本包只依赖 ``common.config``
+与标准库。）
+
+**逐名再导出，不要写成 ``from common.core import *``。**
+
+理由要说准，因为这里最初写错过一次（Phase 4.1 审计逮到）：
+「星号导入跳过下划线开头的名字」这条规则**只在模块没有 ``__all__`` 时成立**。
+本模块自己定义了 ``__all__`` 并把 16 个下划线名全列了进去，所以今天
+``from common.core import *`` 其实**能正常工作** —— 审计做过对照实验：
+照现状星号导入，28 个名字一个不少、全套门禁绿；**把 ``__all__`` 删掉**再星号导入，
+才出现 ``ImportError: cannot import name '_parse_price_float'`` 并连带 31 failed。
+
+所以真正的理由不是「会当场炸」，而是：
+
+* **逐名清单是显式的**。星号导入把「导出面」这件事的控制权交给了
+  ``__all__`` 的维护状态 —— 谁哪天在 ``__all__`` 里加一行、删一行，
+  下游的可见符号就跟着变，而**改动点和受影响点不在同一个文件里**。
+* 逐名写法下，``common/database.py`` 与 ``common/pgdb/_shared.py`` 的导入清单
+  本身就是那份契约，评审 diff 就能看见面的增减。
+* 而且一旦有人**顺手删掉本模块的 ``__all__``**（它看起来只是个冗余清单），
+  星号导入的下游会在导入期整批 NameError —— 逐名写法对这种改动免疫。
 
 **约束：本文件下方不得出现任何 ``def`` / 赋值新对象。只有 import。**
 """
 # flake8: noqa: F401  —— 全部是有意的再导出
-from common.core import (
-    # ---- 重试策略 ----
+from common.core.retry import (
     LIMITED_RETRY_ERROR_TYPES,
     NO_AUTO_RETRY_ERROR_TYPES,
     NO_RETRY_ERROR_TYPES,
     _fail_cap,
-    # ---- 锁仪表（必须与 SQLite 实现共用同一个全局容器）----
+)
+from common.core.lockmeter import (
     LOCK_STATS,
     TimedLock,
     _NamedLockCtx,
     _record_wait,
     _record_hold,
     record_stage,
-    # ---- 解析失败 / 截图路径归一 ----
+)
+from common.core.asindata import (
     _NA_VALUES,
     _normalize_screenshot_path,
     _is_parse_failure,
-    # ---- 变动比较器 ----
     _parse_price_float,
     _compare_price,
     _compare_stock_qty,
     _compare_stock_status,
-    # ---- hash ----
     _HASH_FIELDS,
     _TITLE_BULLETS_FIELDS,
     _compute_content_hash,
     _compute_title_bullets_hash,
-    # ---- asin_data 列清单 ----
     ASIN_DATA_FIELDS,
     _ASIN_DATA_COLUMN_SET,
-    # ---- 清库的表清单（DELETE /api/database）----
+)
+from common.core.dbtables import (
     CLEAR_TABLES,
-    # ---- 按 ASIN 删除 / 模糊搜索（DELETE /api/results）----
     ASIN_DELETE_CHUNK,
     ASIN_DELETE_TABLES,
     search_like_pattern,
 )
+from common.core.coerce import as_int
 
 __all__ = [
     "LIMITED_RETRY_ERROR_TYPES",
@@ -104,4 +133,5 @@ __all__ = [
     "ASIN_DELETE_CHUNK",
     "ASIN_DELETE_TABLES",
     "search_like_pattern",
+    "as_int",
 ]

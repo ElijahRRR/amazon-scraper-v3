@@ -15,7 +15,7 @@ OWNS（非公开基础设施，其余 mixin 只准通过这些入口碰数据库
     translate_sql()        ? -> $n（+ LIKE 的 ASCII 折叠改写）
     rowcount_from_tag()    'UPDATE 3' -> 3
     text_affinity()        复刻 SQLite TEXT affinity 的绑定强转
-    as_int()               HTTP 边界的整数强转
+    as_int()               HTTP 边界的整数强转（定义在 common/core/coerce.py，此处再导出）
 
 --------------------------------------------------------------------------
 为什么要有"垫片"而不是把 SQL 搬进方法里
@@ -74,6 +74,7 @@ from typing import Any, List, Optional, Sequence
 import asyncpg
 
 from common import config
+from common.core.coerce import as_int  # noqa: F401  —— 再导出，见下方 1) 节的说明
 from common.pgdb._shared import TimedLock
 
 logger = logging.getLogger(__name__)
@@ -211,22 +212,10 @@ def _maybe_strip_nul(s: str) -> str:
     return s
 
 
-def as_int(v: Any, default: Optional[int] = None) -> Optional[int]:
-    """HTTP 边界上的整数强转（task_id / lease_epoch / batch_id）。
-
-    SQLite 会把 ``id IN ('1')`` 里的 '1' 按列 affinity 转成 1 并命中；
-    asyncpg 直接 raise。这类值全部来自未经校验的 ``await request.json()``。
-    """
-    if v is None:
-        return default
-    if isinstance(v, bool):
-        return int(v)
-    if isinstance(v, int):
-        return v
-    try:
-        return int(str(v).strip())
-    except (ValueError, TypeError):
-        return default
+# ``as_int`` 曾经定义在这里。自 Phase 4.1 起真源是 common/core/coerce.py ——
+# 本模块是模块级 ``import asyncpg``，把纯函数留在这里等于只有 PG 后端能用它。
+# 文件顶部已再导出，所以 ``from common.pgdb.pool import as_int``
+# 与 ``Pool.as_int`` 两种既有写法都一字不用改。
 
 
 # ============================================================

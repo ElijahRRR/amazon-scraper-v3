@@ -115,7 +115,21 @@ def _assert_nothing_unregistered():
     """
     import inspect
 
-    from common.database import Database as _SqliteDatabase
+    try:
+        from common.database import Database as _SqliteDatabase
+    except ImportError:
+        # SQLite 侧不可用（比如将来只装 asyncpg 不装 aiosqlite 的 PG-only 部署，
+        # 或 SQLite 后端已退役）。这条断言的**前提**是「两个后端并存」，
+        # 前提不在时跳过，不是放水：
+        #   * 它要防的事故是「两侧都实现了但漏登记」——只有一侧时不存在；
+        #   * 另一个方向（PUBLIC_API 里有 pgdb 没实现的名字）由
+        #     _assert_api_complete 守着，那条不依赖 common.database，照常执行。
+        #
+        # ⚠ 这个 try 不是可有可无的：Phase 4.1 把共享符号搬进 common/core 之后，
+        #   common.pgdb 本来已经不需要 import common.database 了；
+        #   本函数（Phase 3.8 审计的产物）是当时**唯一**把那条边又接回来的地方。
+        #   写成 try 让「PG-only 部署不装 aiosqlite」这条路重新走得通。
+        return
 
     unregistered = sorted(
         n for n, _ in inspect.getmembers(_SqliteDatabase)

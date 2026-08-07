@@ -17,7 +17,8 @@ import types
 import pytest
 import pytest_asyncio
 
-from common.database import Database as SqliteDatabase, _normalize_screenshot_path
+from common.core import _normalize_screenshot_path
+from common.database import Database as SqliteDatabase
 
 pytest.importorskip("asyncpg", reason="tests/pgdb 需要 asyncpg")
 

@@ -123,7 +123,9 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import timedelta
+
+from common.core.timeutil import now_ts, ts_from, utc_now
 from typing import Dict, List, Optional
 
 from common import config
@@ -227,7 +229,7 @@ class TasksMixin:
         从而最大化复用同一 session（避免每个任务都切换邮编）。多 worker 不同 prefer_zip
         时各自被分到对应邮编池，自然分流。
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         tasks = []
 
         async with self._write_lock("pull_tasks"):
@@ -362,8 +364,8 @@ class TasksMixin:
         """
         if not dead_worker_ids:
             dead_worker_ids = []
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        hard_cutoff = (datetime.utcnow() - timedelta(minutes=config.TASK_TIMEOUT_MINUTES)).strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
+        hard_cutoff = ts_from(utc_now() - timedelta(minutes=config.TASK_TIMEOUT_MINUTES))
 
         async with self._write_lock:
             await self._db.execute("BEGIN")
@@ -417,8 +419,8 @@ class TasksMixin:
         """
         if max_auto_cycles <= 0:
             return 0
-        now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        cutoff = (datetime.utcnow() - timedelta(minutes=delay_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+        now_str = now_ts()
+        cutoff = ts_from(utc_now() - timedelta(minutes=delay_minutes))
 
         # 动态构造 NOT IN (...) 子句
         # COALESCE 保证左侧非 NULL，右侧全是字面量，所以 PG 的 NOT IN 三值逻辑
@@ -525,7 +527,7 @@ class TasksMixin:
 
         Returns: {"accepted": True/False, "stale": True/False}
         """
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         tid = self.as_int(task_id)
         wid = self.text_affinity(worker_id)
         epoch = self.as_int(lease_epoch)
@@ -622,7 +624,7 @@ class TasksMixin:
         """
         if not tasks:
             return 0
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = now_ts()
         released = 0
 
         # 按 epoch 分组批量更新

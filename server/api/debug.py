@@ -93,7 +93,7 @@ def _summary(samples: list) -> dict:
 @router.get("/api/_debug/lock-stats")
 async def api_debug_lock_stats():
     """返回锁等待 / 持锁 / 内部分阶段耗时分布。单位：毫秒。"""
-    from common.database import LOCK_STATS
+    from common.core import LOCK_STATS
     return {
         "waits": {k: _summary(list(v)) for k, v in LOCK_STATS["waits"].items()},
         "holds": {k: _summary(list(v)) for k, v in LOCK_STATS["holds"].items()},
@@ -140,7 +140,7 @@ async def api_debug_event_stream():
 @router.post("/api/_debug/lock-stats/reset")
 async def api_debug_lock_stats_reset():
     """清空所有计时统计（开始新一轮观察前调用）。"""
-    from common.database import LOCK_STATS
+    from common.core import LOCK_STATS
     LOCK_STATS["waits"].clear()
     LOCK_STATS["holds"].clear()
     LOCK_STATS["stage_timings"].clear()

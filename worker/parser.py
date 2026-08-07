@@ -17,6 +17,21 @@ from typing import Optional, List, Dict, Any, Tuple
 # zip_verify=confirmed 但 zip_effective_in_html 判 False 这种自相矛盾的记录。
 from worker.ziputil import _GLOW_LINE2_RE as _GLOW_INGRESS_LINE2_RE
 
+# P4.2：**worker -> common 的新依赖**（本文件此前只 import worker.ziputil）。
+# 打包上没问题 —— worker/engine.py、session.py、proxy.py、metrics.py、adaptive.py
+# 今天已经 `from common import config`，worker 侧运行环境本来就带着 common/。
+# common/core/idents.py 只依赖标准库 `re`，不碰 aiosqlite / asyncpg，
+# 所以这条新边**不会**把数据库驱动拖进 worker 进程。
+# （import 它会连带执行 common/core/__init__.py，把 retry / lockmeter / asindata /
+#  dbtables / coerce 五个兄弟模块也加载进来；实测那五个只依赖标准库与
+#  已经是 worker 依赖的 common.config，sys.modules 里不出现任何数据库驱动。）
+#
+# 收的是 `_ASIN_RE`：本文件与 server/app.py 原先各有一份逐字节相同的
+# `re.compile(r'^B[0-9A-Z]{9}$')`。**只换来源，不换值、不换逻辑**。
+# 局部的 `ASIN_RE = r'B[0-9A-Z]{9}'`（_extract_page_asin 里那个无锚点裸片段）
+# 是另一回事，**不搬**，理由写在 common/core/idents.py 的 docstring 里。
+from common.core.idents import ASIN_RE as _ASIN_RE
+
 # ==========================================================================
 # P4-7：crawl_time 的线格式
 # ==========================================================================
@@ -2531,7 +2546,8 @@ parser = AmazonParser()
 
 # ==================== 卖家店铺列表页解析（F-009）====================
 
-_ASIN_RE = re.compile(r'^B[0-9A-Z]{9}$')
+# `_ASIN_RE` 现在从 common/core/idents.py import（见文件头那段说明）。
+# 与 server/app.py 共用同一个编译对象；正则本身与旧的本地定义逐字节相同。
 
 
 def parse_seller_listing(html_text: str) -> Dict[str, Any]:

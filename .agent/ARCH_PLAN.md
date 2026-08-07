@@ -1104,6 +1104,35 @@ brand 恒为 `GoldenBrand`，`stock_status` 恒 `In Stock`，搜索样本全 ASC
 `tests/pgdb/test_admin.py:250` 的 `app.py:1497-1511`（真值 `:1606-1623`）、
 `common/slowhash.py:153-158` 里登记 parser 拼接方式写死的 `:764`（真值 `:987` 与 `:2490`）。
 
+### D0. Phase 4.1 审计照出的两个覆盖盲区（本轮登记，未修）
+
+**D0-1. `worker/parser.py::parse_seller_listing` 全仓零测试覆盖。**
+这恰好是 4.2 收口 ASIN 正则的**那一侧消费者**。审计把正则改坏之后，
+`tests/test_seller_api.py` + `tests/test_parser_quality.py` 共 40 passed 依然全绿，
+红的全是 `server/app.py:_normalize_asin` 那条路。
+即：门禁守得住 `ASIN_RE` 的**服务端**用法，守不住 **parser** 用法。
+今天两边共用同一个对象所以还安全，但将来有人只改 parser 侧的用法，没有任何门会响。
+
+**D0-2. `LIMITED_RETRY_ERROR_TYPES['variant_offset']` 只被 `tests/pgdb` 覆盖。**
+把它从 1 改成 2 之后：golden（两个后端）+ pytest sqlite + unittest 全绿，
+只有 `DB_BACKEND=postgres` 跑到 `tests/pgdb` 时才红。
+**SQLite 侧的重试上限策略实际上没有回归网。**
+注意这条与 Phase 0.1 的取舍相互作用：sqlite 列加了 `--ignore=tests/pgdb` 之后，
+这类「只有 tests/pgdb 覆盖」的策略常量在 sqlite 列里彻底不设防。
+
+**D0-3. 一处调用侧分叉（计划原文描述有误，已实测订正）。**
+计划 4.2 说「`worker/parser.py` 里直接 `_ASIN_RE.match` 不做大小写归一，
+而 server 侧 `_normalize_asin` 先 `.strip().upper()`」——**这个描述不准确**。
+实测 `parse_seller_listing` 的两条引擎分支在 match 之前**都**做了 `.strip().upper()`。
+真正的分叉在 `_extract_page_asin`：selectolax 分支读 `input#ASIN` 时归一后再匹配，
+而 **regex 兜底分支**（canonical / currentAsin / input 属性反序那三条）
+拿原始 HTML 直接匹配、不归一。
+实测判别：同一张小写 ASIN 的页面，tree 路径返回 `'B0G6KPHQ4G'`，regex 路径返回 `None`。
+
+**D0-4. 两份 `_ASIN_RE` 用的是 `$` 而不是 `\Z`**，所以 `'B0G6KPHQ4G\n'` 能匹配。
+两份副本今天都这样，属于搬迁范围外，已逐字保留并在 `common/core/idents.py` 标注。
+要收紧得单独立项（它会改变既有的接受面）。
+
 ### D. 工具与守卫的洞
 
 **D1. `tools/phase5_preflight.py:220-239` 的路由顺序守卫在 catch-all 为 None 时报绿**（`else: ok(...)`）。

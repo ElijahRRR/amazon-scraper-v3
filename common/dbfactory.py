@@ -14,9 +14,12 @@
   ``common.database.Database`` 类、同一个构造调用，连 import 都不会碰 asyncpg。
 * pgdb 是**惰性** import 的。只有真的选了 postgres 才会加载 asyncpg，
   所以 SQLite 部署不需要装 asyncpg。
-* 反过来，pgdb 内部会 import common.database（为了共享 LOCK_STATS /
-  ASIN_DATA_FIELDS / 比较器等纯 Python 符号），这是有意的：分叉一份副本
-  就等于制造两个真源。见 common/pgdb/_shared.py 的说明。
+* 两个后端共享的纯 Python 符号（LOCK_STATS / ASIN_DATA_FIELDS / 比较器等）
+  真源在 ``common/core/``——两边都从那里再导出，分叉一份副本就等于制造两个
+  真源。见 common/core/__init__.py 与 common/pgdb/_shared.py 的说明。
+  （Phase 4.1 之前 pgdb 是 import common.database 来拿这些；现在**这条**依赖没了。
+  pgdb 仍会在导入期 import common.database，但只为 common/pgdb/__init__.py 的
+  ``_assert_nothing_unregistered`` 做双向公开面比对——那是有意的契约断言。）
 """
 from __future__ import annotations
 

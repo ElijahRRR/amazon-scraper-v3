@@ -38,7 +38,7 @@ async def test_xxx(pgdb):     # pgdb 夹具 = 一个全新的临时库，用完�
 
 | 文件 | 状态 | 负责人 |
 |---|---|---|
-| `common/pgdb/_shared.py` | ✅ 已完成（纯再导出，**不准**加任何定义） | 骨架 |
+| `common/pgdb/_shared.py` | ✅ 已完成（纯再导出，**不准**加任何定义；真源自 Phase 4.1 起是 `common/core/`） | 骨架 |
 | `common/pgdb/pool.py` | ✅ 已完成（连接层 + aiosqlite 形状垫片） | 骨架 |
 | `common/pgdb/schema.py` | ✅ 已完成（完整 DDL + 列序断言） | 骨架 |
 | `common/pgdb/admin.py` | ✅ 已完成（4 个 no-op） | 骨架 |
@@ -351,9 +351,9 @@ D-61 必须与 D-41（relay 认双格式）同批，否则每条记录的 `colle
 
 1. **等价优先，改进其次。** 连 bug 一起移植。任何"顺手修好"都会让黄金校验的差异
    变成"要逐个解释"的噪声，而不是信号。有意的偏离必须写进本文件的决策台账。
-2. **不准从 `common.database` 复制任何常量或函数。** 一律
-   `from common.pgdb._shared import ...`。`test_shared_symbols_are_the_same_objects`
-   会逐个断言 `is` 同一个对象。
+2. **不准复制任何共享常量或函数。** 一律 `from common.pgdb._shared import ...`
+   （`_shared` 与 `common/database.py` 现在都只是从 `common/core/` 逐名再导出，
+   Phase 4.1）。`test_shared_symbols_are_the_same_objects` 会逐个断言 `is` 同一个对象。
 3. **不准自己 `import asyncpg` 建连接。** 只能用 `self._db` / `self.read()` /
    `self._tx()`。需要 asyncpg 专有能力时用 `proxy.raw`。
 4. **写路径必须在 `self._write_lock` 里**，并保留原有的 caller 名字符串。

@@ -25,6 +25,8 @@ from fastapi.staticfiles import StaticFiles
 import openpyxl
 
 from common import config
+from common.core.idents import ASIN_RE as _ASIN_RE
+from common.core.timeutil import now_ts, ts_from, utc_now
 from common.database import Database
 from common.dbfactory import create_database
 
@@ -344,7 +346,16 @@ _CN_TZ_OFFSET = timedelta(hours=8)
 
 
 def _cn_now():
-    """当前中国时间（Asia/Shanghai, UTC+8）。仅用于命名与调度判定，不用于 DB 存储。"""
+    """当前中国时间（Asia/Shanghai, UTC+8）。仅用于命名与调度判定，不用于 DB 存储。
+
+    ⚠ **它不是 ``common.core.timeutil.now_ts()``，两者永远不该互换。**
+    ``now_ts()`` 是**落库**的 UTC 时间戳（created_at / updated_at 那一族，
+    格式契约见 timeutil 的 docstring）；``_cn_now()`` 是**展示与调度**口径的
+    UTC+8 naive datetime，只喂批次名 / 导出文件名 / ``last_run_date`` 比对。
+    互换的后果：拿 now_ts() 命名 → 批次名和定时任务触发点整体偏 8 小时；
+    拿 _cn_now() 落库 → 往 UTC 列里灌 UTC+8，正是 Phase 4.3 修掉的那类错位。
+    Phase 4.3 因此**刻意不动这个函数**。
+    """
     return datetime.utcnow() + _CN_TZ_OFFSET
 
 
@@ -462,7 +473,7 @@ async def _timeout_task_loop():
             # （服务重启、内存队列丢失、_completion_watcher 漏检测 等场景的安全网）
             try:
                 if _callback_send_queue is not None:
-                    now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                    now_str = now_ts()
                     due = await db.list_callback_due(now_str, limit=50)
                     for row in due:
                         try:
@@ -698,7 +709,7 @@ async def _send_one_callback(client: httpx.AsyncClient, batch_id: int):
     delay_idx = min(attempts - 1, len(_CALLBACK_RETRY_DELAYS) - 1)
     delay = _CALLBACK_RETRY_DELAYS[delay_idx] if attempts < _CALLBACK_MAX_ATTEMPTS else 0
     next_retry = (
-        (datetime.utcnow() + timedelta(seconds=delay)).strftime('%Y-%m-%d %H:%M:%S')
+        ts_from(utc_now() + timedelta(seconds=delay))
         if attempts < _CALLBACK_MAX_ATTEMPTS else None
     )
     result = await db.mark_callback_attempt(
@@ -913,7 +924,9 @@ async def _is_safe_callback_url(url: str) -> tuple[bool, str]:
     return True, ""
 
 
-_ASIN_RE = re.compile(r'^B[0-9A-Z]{9}$')
+# `_ASIN_RE` 现在从 common/core/idents.py import（见文件头），本地不再定义。
+# 那份真源与 worker/parser.py 共用；`.strip().upper()` 的归一留在下面
+# `_normalize_asin` 里 —— 正则自己不做大小写归一。
 # 美国邮编：5 位数字（兼容 ZIP+4，前 5 位）
 _US_ZIP_RE = re.compile(r'^\d{5}$')
 
@@ -1156,7 +1169,7 @@ async def api_batch_status(batch_name: str):
     duration = None
     try:
         created_at = batch.get("created_at")
-        end_at = batch.get("completed_at") or datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        end_at = batch.get("completed_at") or now_ts()
         if created_at:
             start = datetime.strptime(created_at[:19], '%Y-%m-%d %H:%M:%S')
             stop = datetime.strptime(end_at[:19], '%Y-%m-%d %H:%M:%S')
@@ -1229,7 +1242,7 @@ async def api_retry_batch(batch_name: str, force: bool = False):
     是 Amazon 侧返回兄弟变体页的稳定问题，不再重试。
     返回 retried/skipped_no_retry 数量，前端可展示。
     """
-    from common.database import NO_AUTO_RETRY_ERROR_TYPES
+    from common.core import NO_AUTO_RETRY_ERROR_TYPES
     batch = await db.get_batch_by_name(batch_name)
     if not batch:
         raise HTTPException(404, f"批次不存在: {batch_name}")
@@ -1566,7 +1579,7 @@ async def api_create_schedule(request: Request,
         "needs_screenshot": needs_screenshot,
         "enabled": True,
         "last_run_date": yesterday,
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at": now_ts(),
     }
 
     schedules = _get_schedules()
@@ -1693,7 +1706,7 @@ async def api_legacy_add_schedule(request: Request):
         "needs_screenshot": False,
         "enabled": True,
         "last_run_date": "",
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at": now_ts(),
     }
     schedules = _get_schedules()
     schedules.append(sched)

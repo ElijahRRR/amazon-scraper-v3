@@ -43,13 +43,14 @@ class GoldenWithLiveRelayTest(unittest.TestCase):
 
         baseline = _load_baseline()
 
-        # ``LOCK_STATS`` 是**进程级**累加器，而且是与 common.database 共用的同一个
-        # 全局对象（D-3：黄金 step 56 钉死了它的 key 集合，所以 pgdb 不能拷一份）。
+        # ``LOCK_STATS`` 是**进程级**累加器，真源在 common/core/lockmeter.py，
+        # 两个后端共用同一个全局对象（D-3：黄金 step 56 钉死了它的 key 集合，
+        # 所以 pgdb 不能拷一份）。
         # 基线是在全新进程里录的；本用例在完整 ``pytest tests/`` 里排在几百个用例
         # 之后，那些用例已经往里灌了样本，``/api/_debug/lock-stats`` 的分位数
         # 因此对不上——实测差异正是 ``['lock_stats']``。清一次等价于"全新进程"。
         # （``tests/golden/test_golden.py`` 不需要这一手纯粹是因为它排在最前面。）
-        from common.database import LOCK_STATS
+        from common.core import LOCK_STATS
         for key in ("waits", "holds", "stage_timings"):
             LOCK_STATS[key].clear()
         LOCK_STATS["slow_holds"].clear()

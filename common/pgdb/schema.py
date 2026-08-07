@@ -55,6 +55,15 @@ from typing import Dict, List
 logger = logging.getLogger(__name__)
 
 # 时间戳列的默认值：与 SQLite 的 CURRENT_TIMESTAMP 逐字节同格式（UTC，无小数秒）
+#
+# ⚠ 交叉引用 `common/core/timeutil.py`：那边的 `TS_FMT = '%Y-%m-%d %H:%M:%S'` 是
+# **同一个格式的 Python 写法**，Python 写入路径（now_ts / ts_from）与本列默认值
+# 落进的是同一列。**两者必须永远一致**——格式一分叉，同一张表里就混着两种形状的
+# 字符串，而这些 text 列上的所有比较（updated_at < cutoff、callback_next_retry_at
+# <= now）都是字典序比较，会静默选错行。
+# 本行**故意保留为 SQL 方言字面量、不参数化**：它是 DDL 里的字符串，import 不了
+# Python 常量；改 timeutil 那边不会连带改这里，已建库的默认值更不会被重建。
+# Phase 4.3 因此不动这一行，只加这段交叉引用。
 TS_DEFAULT = "to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
 
 # ASCII-only 折叠函数。**不要**用 lower()/ILIKE：它们折叠全 Unicode，

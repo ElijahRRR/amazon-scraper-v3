@@ -25,10 +25,8 @@ import aiofiles
 import httpx
 
 from common import config
-from common.slowhash import SLOW_HASH_FIELDS
 from worker.proxy import get_proxy_manager
 from worker.session import AmazonSession
-from worker import parser as _parser_module
 from worker.parser import AmazonParser as _ParserClass
 from worker.metrics import MetricsCollector
 from worker.adaptive import AdaptiveController, TokenBucket
@@ -41,142 +39,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Phase 4：worker → server 的 `_` 前缀采集元数据
-#   计划 .agent/pg_migration_plan.md §2.1 的列定义 + 审计 §3.3 的键约定
-# ══════════════════════════════════════════════════════════════════════════
-# `_` 开头的键**永远不会落进 asin_data**：写入侧只遍历 ASIN_DATA_FIELDS
-# （common/database.py:1906 与 :1945 两个循环），未知键天然丢弃。
-# `_page_asin`（worker/parser.py:1398）是这个约定的先例，这里沿用它，
-# 所以下面这一组键**不改变任何既有导出列**。
-#
-# 它们有两个去处：
-#   1. 事件流 payload（jsonb 原样收下：common/pgdb/relay.py:1561 `"payload": result`）；
-#   2. relay 绑到 scrape_events 的同名列上 —— **这一半今天还没接**，
-#      relay.py:1545-1557 那四个 `# Phase 4` 占位就是缺口所在。
-#      worker 侧先把值送到线上，relay 侧接线是独立的一步。
-META_OUTCOME = "_outcome"
-META_ZIP_REQUESTED = "_zip_requested"
-META_ZIP_OBSERVED = "_zip_observed"
-META_ZIP_VERIFY = "_zip_verify"
-META_COMPLETENESS = "_completeness"
-META_PARSE_ENGINE = "_parse_engine"
-
-#: worker 只判定这两个 outcome。blocked / parse_failed / stale 都是**服务端**的
-#: 判定（relay.outcome_for_error_type / _is_parse_failure / 租约门），worker 不越权。
-OUTCOME_OK = "ok"
-OUTCOME_NOT_FOUND = "not_found"
-
-#: zip_verify 封闭集（计划 §2.1 的列定义）。
-ZIP_VERIFY_CONFIRMED = "confirmed"      # 页面 glow 显示的就是请求的邮编
-ZIP_VERIFY_ASSUMED = "assumed"          # 带外证据（切邮编那次验证过），本页无证据
-ZIP_VERIFY_MISMATCH = "mismatch"        # 页面 glow 显示的是**别的**邮编
-ZIP_VERIFY_UNVERIFIED = "unverified"    # 什么证据都没有
-ZIP_VERIFY_DOMAIN = frozenset({
-    ZIP_VERIFY_CONFIRMED, ZIP_VERIFY_ASSUMED,
-    ZIP_VERIFY_MISMATCH, ZIP_VERIFY_UNVERIFIED,
-})
-
-#: completeness 位图（契约 docs/sync_contract.md §6.4）。位的判定在 parser
-#: （P4-2，按 HTML 区块存在性），worker 这里只做值域校验：
-#: bit0 面包屑 / bit1 详情表 / bit2 主图集 / bit3 MEASURED。
-#: **绝不由 engine 自行点亮任何一位**——一个没测过却写着 8 的位图，
-#: 会让消费侧的 completeness_ok 变成谎言。
-COMPLETENESS_UNMEASURED = 0
-COMPLETENESS_MAX = 15
-
-#: parse_engine 值域（P4-9）。
-PARSE_ENGINE_VALUES = ("selectolax", "lxml")
-
-# ── 404 分支保留（= 不提交）的字段集 ──────────────────────────────────────
-# 服务端写入是逐字段的 `val = data.get(f); if val is not None:`
-# （common/database.py:1906-1912 UPDATE 分支 / 1945-1951 INSERT 分支）。
-# 因此在这套写入语义下，「不覆盖某一列」的**唯一**表达方式就是
-# **不提交那个键**——写 "N/A" 会覆盖，写 None 虽然也能保住旧值，
-# 但那会把 None 带进事件流 payload，让"这次没采到"和"这次是空"分不开。
-#
-# 集合的定义口径：**慢变/身份层字段**，即 common/slowhash.py 的 slow_hash 字段全集
-# （SLOW_HASH_FIELDS）加上三个同源/同族的目录字段。快变字段（价格/库存/配送/
-# BSR/评分/卖家）**照旧提交占位值**，因为 404 时它们确实不可得，
-# 留着上一次的价格比写 N/A 危险得多。
-_NOT_FOUND_PRESERVED_FIELDS = (
-    # image_ids 是 image_urls 归约出来的派生键（slowhash.extract_image_ids），
-    # result dict 里没有这个键，换成它的原始列 image_urls。
-    (frozenset(SLOW_HASH_FIELDS) - {"image_ids"}) | frozenset({
-        "image_urls",
-        "category_ids",     # 与 category_tree 同源（同一段面包屑的 href 与文本）
-        "ean_list",         # 与 upc_list 同族的 listing 资产
-        "variation_asins",  # 变体家族；不进哈希只因为跨进程顺序不定（P4-5），不是因为它快变
-    })
-)
-
-
-def derive_zip_verify(parser_value, glow_effective, session_zip, zip_requested) -> str:
-    """(parser 判定, 商品页 glow 判定, session 自认邮编, 请求邮编) -> zip_verify。
-
-    优先级：**页面级证据 > 带外证据 > 不知道**。
-
-    - parser 的 `_zip_verify`（P4-1，读 glow-ingress-line2）是页面级证据，最强；
-    - engine 自己的 `zip_effective_in_html`（worker/ziputil.py，同一个 line2 正则）
-      在 on_fetch 模式下已经跑过，是同源的页面级证据；
-    - 都没有时才退到带外证据：session 自认已经切到目标邮编（切换时 POST + 验证 GET
-      成功过，见 SessionSlot.ensure_zip → AmazonSession.change_zip_code(verify=True)）
-      ⇒ `assumed`；连这个都没有 ⇒ `unverified`。
-
-    绝不从 `data['zip_code']`（= 请求值）反推观测值或 confirmed：
-    common/pgdb/relay.py:223 已经把口径写死——
-    **一个错的 confirmed 比一个诚实的 unverified 更糟**。
-    """
-    pv = parser_value.strip() if isinstance(parser_value, str) else ""
-    if pv in (ZIP_VERIFY_CONFIRMED, ZIP_VERIFY_MISMATCH):
-        return pv
-    if glow_effective is True:
-        return ZIP_VERIFY_CONFIRMED
-    if glow_effective is False:
-        return ZIP_VERIFY_MISMATCH
-    if pv == ZIP_VERIFY_ASSUMED:
-        return ZIP_VERIFY_ASSUMED
-    req = (zip_requested or "").strip()
-    if req and (session_zip or "").strip() == req:
-        return ZIP_VERIFY_ASSUMED
-    return ZIP_VERIFY_UNVERIFIED
-
-
-def sanitize_completeness(value) -> int:
-    """parser 的 `_completeness` -> 0..15 的位图整数，拿不准一律 0（UNMEASURED）。
-
-    bool 被显式拒绝：`True` 是 int 的子类，直接放行会变成 bit0=1
-    ——"面包屑区块存在"，而那是一句没人测过的断言。
-    """
-    if isinstance(value, bool) or value is None:
-        return COMPLETENESS_UNMEASURED
-    try:
-        iv = int(value)
-    except (TypeError, ValueError):
-        return COMPLETENESS_UNMEASURED
-    if 0 <= iv <= COMPLETENESS_MAX:
-        return iv
-    return COMPLETENESS_UNMEASURED
-
-
-def resolve_parse_engine(value):
-    """parser 的 `_parse_engine` -> 'selectolax' | 'lxml' | None。
-
-    parser 还没接 P4-9 时的兜底：读 worker.parser 的模块级开关 `_USE_SELECTOLAX`
-    （worker/parser.py 用它在 parse_product 里二选一）。读不到就返回 None
-    ——**不猜**，null 在契约里是合法值（docs/sync_contract.md §6.3
-    "Phase 4 之前可能为 null"），猜错则是一条不可证伪的溯源信息。
-    """
-    if isinstance(value, str) and value.strip() in PARSE_ENGINE_VALUES:
-        return value.strip()
-    flag = getattr(_parser_module, "_USE_SELECTOLAX", None)
-    if flag is True:
-        return "selectolax"
-    if flag is False:
-        return "lxml"
-    return None
 
 
 class SessionSlot:
@@ -344,9 +206,6 @@ class Worker:
             "success": 0,
             "failed": 0,
             "blocked": 0,
-            # 404（P4-3）：计入 success，但单独记一笔。没有这个计数器，
-            # "这批的 404 率突然从 2% 跳到 40%" 在 worker 侧完全不可见。
-            "not_found": 0,
             "accepted": 0,
             "stale": 0,
             "start_time": None,
@@ -1210,90 +1069,6 @@ class Worker:
         except Exception as e:
             logger.debug(f"降级页 dump 失败 {asin}: {e}")
 
-    # ═══════════════════════════════════════════════
-    # Phase 4：采集元数据 + 404 提交体
-    # ═══════════════════════════════════════════════
-
-    def _attach_collection_meta(self, result_data: Dict, *, zip_requested: str,
-                                outcome: str, glow_zip_effective=None,
-                                session_zip=None, parsed: bool = True) -> Dict:
-        """把六个 `_` 前缀的采集元数据定形并挂到提交体上（就地修改并返回同一个 dict）。
-
-        与 parser 的接口（P4-1 / P4-2 / P4-9）：parser 在 result 里放
-        `_zip_observed` / `_zip_verify` / `_completeness` / `_parse_engine`；
-        engine 只做三件事——**补齐**（parser 还没接线时给出诚实的缺省）、
-        **校验值域**（越界一律降级到最保守的那个值）、**补上只有 engine 知道的事实**
-        （`_zip_requested` 来自 task，`_outcome` 来自采集分支）。
-
-        `_zip_requested` 由 engine 定，不由 parser 定：真正发出去的请求用的是
-        `target_zip`，而 parser 只知道它被喂进来的那个参数。这一个键是消费侧
-        分组键 (asin, marketplace, zip_requested) 的一部分（契约 §5.5 硬规则 2）。
-        """
-        result_data[META_OUTCOME] = (
-            outcome if outcome in (OUTCOME_OK, OUTCOME_NOT_FOUND) else OUTCOME_OK
-        )
-        result_data[META_ZIP_REQUESTED] = (zip_requested or "").strip()
-
-        # zip_observed 只可能来自 parser（glow-ingress-line2）。engine **不合成**：
-        # 手里唯一的邮编是请求值，拿它冒充观测值就是一个错的 confirmed。
-        observed = result_data.get(META_ZIP_OBSERVED)
-        result_data[META_ZIP_OBSERVED] = (
-            observed.strip() if isinstance(observed, str) and observed.strip() else None
-        )
-        result_data[META_ZIP_VERIFY] = derive_zip_verify(
-            result_data.get(META_ZIP_VERIFY), glow_zip_effective,
-            session_zip, result_data[META_ZIP_REQUESTED],
-        )
-        result_data[META_COMPLETENESS] = sanitize_completeness(
-            result_data.get(META_COMPLETENESS))
-        # 没解析过 HTML（404 分支）就没有 parse_engine 可言——写 None，不写猜测。
-        result_data[META_PARSE_ENGINE] = (
-            resolve_parse_engine(result_data.get(META_PARSE_ENGINE)) if parsed else None
-        )
-        return result_data
-
-    def _build_not_found_result(self, asin: str, zip_requested: str) -> Dict:
-        """404 的提交体（P4-3）：快变字段照旧写占位值，慢变/目录字段**一个都不提交**。
-
-        为什么是"删键"而不是"写占位符"：服务端写入是逐字段的
-        `val = data.get(f); if val is not None:`（common/database.py:1906-1912
-        与 1945-1951），**键不在 dict 里 ⇒ 那一列保持上一次采集的值**。
-        原实现把 `_default_result()` 整个交上去（30/40 个 "N/A"）外加
-        `title="[商品不存在]"`，于是每一次 404 都把 title/brand/category/UPC/
-        图片/五点 全部抹成占位符——一次假 404 就永久损坏一条目录记录。
-
-        保留（= 不提交）的字段集见 `_NOT_FOUND_PRESERVED_FIELDS`。
-
-        `stock_count` 保持 `_default_result` 的 `"0"`，这不是巧合而是**必须**：
-        服务端的 `_is_parse_failure`（common/database.py:181-195）要求
-        current_price/buybox_price/stock_count/stock_status/brand **全部**落在
-        `_NA_VALUES` 里才判为解析失败。title/brand 已经不提交了，
-        `"0"` 是唯一让这条记录不被误判成 parse_failure 的键
-        —— 误判的后果是任务被降级成 `status='failed', error_type='server_reject'`，
-        事件 outcome 变成 `parse_failed` 而不是 `not_found`，且**一个字段都不落库**。
-        tests/test_engine_not_found.py 里有一条用真实 `_default_result` +
-        真实 `_is_parse_failure` 的断言钉住这个耦合。
-        """
-        full = self.parser._default_result(asin, zip_requested)
-        result = {k: v for k, v in full.items()
-                  if k not in _NOT_FOUND_PRESERVED_FIELDS}
-        # 404 没有商品页可测：completeness=0（UNMEASURED）、parse_engine=None、
-        # zip_verify=unverified。最后一项特意**不给** session_zip，于是
-        # derive_zip_verify 落到 unverified 而不是 assumed —— 与 parser 对这两个值的
-        # 口径对齐：assumed = "商品页解析成功但没挂 glow"，unverified = "根本没测"
-        # （worker/parser.py 的 ZIP_VERIFY_* 注释）。404 属于后者。
-        result[META_COMPLETENESS] = COMPLETENESS_UNMEASURED
-        result.pop(META_ZIP_OBSERVED, None)
-        result.pop(META_ZIP_VERIFY, None)
-        return self._attach_collection_meta(
-            result,
-            zip_requested=zip_requested,
-            outcome=OUTCOME_NOT_FOUND,
-            glow_zip_effective=None,
-            session_zip=None,
-            parsed=False,
-        )
-
     async def _process_task(self, task: Dict, slot: "SessionSlot") -> tuple:
         """
         处理单个采集任务
@@ -1314,10 +1089,6 @@ class Worker:
         last_error_detail = ""
         attempt = 0
         zip_repost_tries = 0  # on_fetch 邮编未生效时的同 session 重发计数（冷轮换后清零）
-        # 本次成功提交时的 glow 判定（on_fetch 模式下才会被赋值）。
-        # True=页面 glow 就是目标邮编 / False=显示别的邮编 / None=页面没暴露邮编。
-        # 只喂给 derive_zip_verify，不参与任何重试决策。
-        zip_glow = None
         delivery_retry_tries = 0  # 疑似降级页（可售但无配送区）的轮换重采计数
         while attempt < max_retries:
             try:
@@ -1393,31 +1164,12 @@ class Worker:
                     self._stats["total"] += 1
                     return (False, True, resp_bytes)
 
-                # ── 404：商品不存在（P4-3）────────────────────────────────
-                # 不重试、不轮换 IP。四条理由（都能在本仓库里核对）：
-                #  1. 404 的来源是**可信的**：请求走 https://www.amazon.com/dp/...
-                #     （worker/session.py:353），代理是 CONNECT 隧道，TLS 端到端。
-                #     中间人伪造不出 404 —— 这个状态码只可能来自 Amazon 自己。
-                #  2. 仓库自己的模型就是"404 不是软封锁"：
-                #     AmazonSession.is_blocked 第一条就是 `if status == 404: return False`
-                #     （worker/session.py:442-443）。
-                #  3. 有实测教训：对某一整类事件逐次冷轮换会打爆隧道代理的 5 QPS
-                #     CONNECT 限额 → Session 初始化失败 → 全局吞吐崩溃
-                #     （见下面 variant 偏移分支 2026-05-20 复盘的注释）。
-                #     死 ASIN 在一份有货龄的语料里是常量比例，不是边角情况，
-                #     给这一类加一次轮换＝给整批加一次代理压力。
-                #  4. 误判的代价已经被这次改动**大幅削掉**：以前一次假 404 会把
-                #     title/brand/category/UPC 全写成占位符（永久损坏目录层），
-                #     现在慢变字段一个都不提交，最坏只是这一轮的快变字段写成
-                #     N/A + 一条 not_found 事件；而按契约 §6.3，
-                #     outcome != 'ok' 的记录只入 snapshots，不 upsert products。
-                #     下一轮定时采集自动纠正。
-                # 综上：确认成本（每个死 ASIN +1 请求 +1 次轮换）确定发生，
-                # 收益（区分假 404）不确定且很小 ⇒ 不做。
+                # 404 处理
                 if session.is_404(resp):
                     self._controller.record_result(req_elapsed, True, False, resp_bytes)
                     logger.info(f"ASIN {asin} 商品不存在 (404)")
-                    result_data = self._build_not_found_result(asin, target_zip)
+                    result_data = self.parser._default_result(asin, zip_code)
+                    result_data["title"] = "[商品不存在]"
                     result_data["batch_name"] = task.get("batch_name", "")
                     await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
                     if task.get("needs_screenshot") and self._enable_screenshot:
@@ -1428,20 +1180,12 @@ class Worker:
                             html_content=self._build_missing_product_html(asin),
                         )
                     self._stats["success"] += 1
-                    self._stats["not_found"] = self._stats.get("not_found", 0) + 1
                     self._stats["total"] += 1
                     return (True, False, resp_bytes)
 
                 # 解析页面
-                # zip 传 target_zip 而**不是** task 的原始 zip_code：真正发出去的
-                # 请求用的是 target_zip（`(zip_code or "").strip() or self.zip_code`），
-                # task.zip_code 为 None/"" 时两者不同。消费侧的分组键是
-                # (asin, marketplace, zip_requested)（契约 §5.5 硬规则 2），
-                # 把没请求过的邮编写进去会把一个商品的价格序列劈成两组；
-                # 更糟的是 None 会被 `if val is not None` 跳过，
-                # asin_data.zip_code 保留**上一次采集**的邮编（可能是别的邮编）。
                 t_parse_start = time.time()
-                result_data = self.parser.parse_product(resp.text, asin, target_zip)
+                result_data = self.parser.parse_product(resp.text, asin, zip_code)
                 t_parse = time.time() - t_parse_start
                 result_data["batch_name"] = task.get("batch_name", "")
 
@@ -1555,7 +1299,6 @@ class Worker:
                 if (getattr(config, "ZIP_VERIFY_MODE", "standalone") == "on_fetch"
                         and target_zip):
                     zip_eff = zip_effective_in_html(target_zip, resp.text)
-                    zip_glow = zip_eff   # P4-1：喂给 derive_zip_verify
                     if zip_eff is False:
                         self._zip_onfetch["mismatch"] += 1
                         self._controller.record_result(req_elapsed, False, False, resp_bytes)
@@ -1633,15 +1376,6 @@ class Worker:
 
                 # 成功
                 self._controller.record_result(req_elapsed, True, False, resp_bytes)
-                # P4-1/P4-2/P4-9：把采集参数与质量元数据挂到提交体上（`_` 键，不落 asin_data）
-                self._attach_collection_meta(
-                    result_data,
-                    zip_requested=target_zip,
-                    outcome=OUTCOME_OK,
-                    glow_zip_effective=zip_glow,
-                    session_zip=getattr(session, "zip_code", None),
-                    parsed=True,
-                )
                 await self._submit_result(task_id, result_data, success=True, batch_id=task.get("batch_id"), lease_epoch=lease_epoch)
                 self._stats["success"] += 1
                 self._stats["total"] += 1
@@ -2232,7 +1966,7 @@ class Worker:
             # 重置统计（保留 start_time）
             self._stats = {
                 "total": 0, "success": 0, "failed": 0, "blocked": 0,
-                "not_found": 0, "accepted": 0, "stale": 0,
+                "accepted": 0, "stale": 0,
                 "start_time": self._stats.get("start_time"),
             }
 
@@ -2316,7 +2050,6 @@ class Worker:
         logger.info(f"📊 Worker [{self.worker_id}] 统计")
         logger.info(f"   总采集: {total}")
         logger.info(f"   成功: {success} ({rate:.1f}%)")
-        logger.info(f"   其中 404: {self._stats.get('not_found', 0)}")
         logger.info(f"   失败: {self._stats['failed']}")
         logger.info(f"   被封: {self._stats['blocked']}")
         logger.info(f"   速度: {speed:.1f} 条/分钟")

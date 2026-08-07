@@ -76,34 +76,8 @@ class SlxDeliveryTests(unittest.TestCase):
     def _d(self, html):
         return self.p._slx_parse_delivery(_Slx(html))
 
-    def test_date_as_direct_text_node_no_dateparser(self):
-        """属性直读路径，用 Tomorrow 断言——不依赖 dateparser，装了 selectolax 就能跑。
-
-        这是「日期是属性 span 的直接文本节点、无子元素」这条回归的**常驻**守卫：
-        下面那条同义用例写的是 "Monday, July 20"，换算天数要 dateparser，没装就 skip，
-        于是常规环境里那条永远不执行。这里刻意让 span **不**套在
-        deliveryBlockMessage / delivery-message 里，回退选择器 '[attr] *' 取不到任何
-        子元素 → 只有属性直读能救回来，判别力比下面那条更强。
-        """
-        html = ('<span data-csa-c-delivery-time="Tomorrow">'
-                'FREE delivery Tomorrow</span>')
-        self.assertEqual(self._d(html), ("Tomorrow", "1"))
-
-    @unittest.skipUnless(_HAS_DP, "dateparser 未安装")
     def test_date_as_direct_text_node(self):
         # 日期是属性 span 的直接文本节点、无子元素：旧 '[attr] *' 抓不到 → 曾返回 N/A
-        #
-        # 必须 skipUnless(_HAS_DP)：断言的是 "Monday, July 20" 这种 "Month Day" 形式，
-        # 而 _delivery_raw_to_days 只有 Today/Tomorrow 是纯 Python，其余一律走
-        # `import dateparser`（worker/parser.py: _delivery_raw_to_days），没装就返回
-        # None → _pick_delivery 得不到候选 → ('N/A','N/A')，用例必挂。
-        # 同类的另外三条 "Month Day" 用例本来就带这个装饰器，只有这条漏了。
-        #
-        # 漏掉的后果是「幽灵 flake」：本仓库的 venv 不装 selectolax，整个类被
-        # skipUnless(_HAS_SLX) 跳过，平时看不见；一旦有人（或并发跑在同一个 venv 里的
-        # 另一个 agent）临时 `pip install selectolax`，这条就 100% 变红，且 skip 计数
-        # 会显示 _HAS_SLX 为真——正是 .agent/phase2/verify1 记的「无法复现的 flake」。
-        # 它不是 flake，是确定性失败，触发条件为 selectolax 已装 + dateparser 未装。
         html = ('<div id="deliveryBlockMessage">'
                 '<span data-csa-c-delivery-time="Monday, July 20">'
                 'FREE delivery Monday, July 20</span></div>')

@@ -2362,8 +2362,13 @@ class Database:
                     # 慢路径：含 < 3 字符的 term，trigram 无法加速，沿用旧 LIKE
                     or_clauses = []
                     for t in terms:
-                        or_clauses.append("(d.asin LIKE ? OR d.title LIKE ? OR d.brand LIKE ?)")
-                        where_params.extend([f"%{t}%", f"%{t}%", f"%{t}%"])
+                        # ⚠ 谓词文本与模式函数都必须与 find_asins_by_search（删除路径）
+                        #   共用真源。这两条路径给出不同的行集，就是 D-16 那起事故
+                        #   （同一个 search，GET 读出来的和 DELETE 删掉的不是同一批）。
+                        #   钉它的网：tests/test_search_like_escape_parity.py
+                        or_clauses.append(SEARCH_TERM_OR)
+                        pat = search_like_pattern(t)
+                        where_params.extend([pat, pat, pat])
                     where_parts.append(f"({' OR '.join(or_clauses)})")
                 else:
                     # 快路径：FTS5 trigram + UNION（每个 (term, column) 走独立 L1 索引）
@@ -2376,7 +2381,7 @@ class Database:
                     #   )
                     fts_subs = []
                     for t in terms:
-                        like_pattern = f"%{t}%"
+                        like_pattern = search_like_pattern(t)
                         fts_subs.append("SELECT rowid FROM asin_data_fts WHERE asin LIKE ?")
                         where_params.append(like_pattern)
                         fts_subs.append("SELECT rowid FROM asin_data_fts WHERE title LIKE ?")
@@ -2460,6 +2465,15 @@ class Database:
 
         与 ``get_all_asins`` 的区别是后者读 ``asin_data``（全库已采 ASIN），
         两者不可互换。
+
+        ⚠ **一处有意的行为对齐，Phase 3.8 显式声明**（原来只写成 asyncpg 传参细节，
+        读起来像纯移植，不对）：``batch_id`` 走 ``int()`` 强制转换。
+        这让 ``DELETE /api/results {"batch_id": "1"}``（JSON body 里字符串形状的 id）
+        在 **PG 上从 500（asyncpg DataError）变成 200**，与 SQLite 拉齐 ——
+        SQLite 靠类型亲和本来就吃字符串。
+        方向上是 C4 要的（同类残余差异 e21e2c6 的提交信息里以「已知残余」记过
+        ``/api/tasks/release`` 那条），但它是**行为变更**不是移植细节，
+        所以钉在 ``tests/test_results_delete_api.py::test_batch_id_accepts_string_form``。
         """
         async with self.read() as rc, rc.execute(
             "SELECT asin FROM batch_asins WHERE batch_id = ?", (batch_id,)

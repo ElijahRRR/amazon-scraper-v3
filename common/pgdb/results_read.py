@@ -298,6 +298,15 @@ class ResultsReadMixin:
 
         与 ``get_all_asins`` 的区别是后者读 ``asin_data``（全库已采 ASIN），
         两者不可互换。
+
+        ⚠ **一处有意的行为对齐，Phase 3.8 显式声明**（原来只写成 asyncpg 传参细节，
+        读起来像纯移植，不对）：``batch_id`` 走 ``int()`` 强制转换。
+        这让 ``DELETE /api/results {"batch_id": "1"}``（JSON body 里字符串形状的 id）
+        在 **PG 上从 500（asyncpg DataError）变成 200**，与 SQLite 拉齐 ——
+        SQLite 靠类型亲和本来就吃字符串。
+        方向上是 C4 要的（同类残余差异 e21e2c6 的提交信息里以「已知残余」记过
+        ``/api/tasks/release`` 那条），但它是**行为变更**不是移植细节，
+        所以钉在 ``tests/test_results_delete_api.py::test_batch_id_accepts_string_form``。
         """
         async with self.read() as rc, rc.execute(
             "SELECT asin FROM batch_asins WHERE batch_id = ?", (int(batch_id),)

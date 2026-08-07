@@ -97,6 +97,43 @@ def _assert_api_complete():
         raise AssertionError(f"common.pgdb.Database 缺少公开方法: {missing}")
 
 
+def _assert_nothing_unregistered():
+    """反向：SQLite 侧的公开方法**必须**都登记进 PUBLIC_API。
+
+    这条是补上来的，因为原来那三个方向里恰好漏了最要命的一个（Phase 3.8 审计实测）：
+
+      * PUBLIC_API 里有 pgdb 没实现的名字      -> _assert_api_complete 当场炸  ✅
+      * 只实现 pgdb 一侧、SQLite 没有          -> 导入照过，test_skeleton 测试期才红
+      * **两侧都实现了、但忘了登记进 PUBLIC_API** -> **原来什么都不响**
+
+    第三种最坏，而且不止是"名册少一个名字"：``test_signatures_match_sqlite`` 是
+    **遍历 PUBLIC_API** 做签名比对的，漏登记的方法连签名一致性都不会被检查——
+    于是两侧参数名/默认值可以悄悄分叉，而全套门禁一片绿。
+
+    白名单为空是有意的：今天 SQLite 侧 50 个公开名一个不少全在册。将来真要加
+    "不属于契约的公开方法"，把它写进 _NOT_IN_CONTRACT 并说明理由，别放宽这条断言。
+    """
+    import inspect
+
+    from common.database import Database as _SqliteDatabase
+
+    unregistered = sorted(
+        n for n, _ in inspect.getmembers(_SqliteDatabase)
+        if not n.startswith("_") and n not in PUBLIC_API and n not in _NOT_IN_CONTRACT
+    )
+    if unregistered:
+        raise AssertionError(
+            "SQLite 侧有公开方法没登记进 PUBLIC_API: "
+            f"{unregistered}\n"
+            "  后果不只是名册不全——test_signatures_match_sqlite 遍历 PUBLIC_API，\n"
+            "  没登记的方法连两侧签名一致性都不会被检查。"
+        )
+
+
+#: SQLite 侧公开、但**有意**不属于双后端契约的名字。今天为空。
+_NOT_IN_CONTRACT = frozenset()
+
+
 def _assert_single_owner():
     """同一个方法只准被一个 mixin 定义。
 
@@ -119,6 +156,7 @@ def _assert_single_owner():
 
 
 _assert_api_complete()
+_assert_nothing_unregistered()
 _assert_single_owner()
 
 __all__ = ["Database", "PUBLIC_API"]

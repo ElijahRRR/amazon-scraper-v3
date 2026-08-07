@@ -129,6 +129,24 @@ class DeleteResultsTests(unittest.TestCase):
             self.assertEqual(r.json(), {"ok": True, "deleted": 4})
             self.assertEqual(_remaining(client), ["B00RDEL005", "B00RDEL006"])
 
+    def test_batch_id_accepts_string_form(self):
+        """``{"batch_id": "1"}`` —— JSON body 里字符串形状的 id，两个后端都必须 200。
+
+        **这是 Phase 3.8 显式声明的一处行为对齐，不是移植副作用。**
+        改动前：SQLite 靠类型亲和吃字符串照常删；PG 抛 asyncpg DataError -> **500**。
+        改动后：``get_batch_asin_set`` 里 ``int(batch_id)``，两侧一致 200。
+
+        钉住它是因为它**没有别的网**：黄金 78 步不覆盖删除端点，
+        Phase 0.2 的裁判快照录的是 db 方法层、进不到这条 HTTP 参数形状。
+        这条一旦回退（比如有人把 int() 挪走），PG 侧会静默退回 500。
+        """
+        with isolated_server() as (client, _ctx):
+            ids = _seed(client)
+            r = _delete(client, {"batch_id": str(ids[_BATCH_A])})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json(), {"ok": True, "deleted": 4})
+            self.assertEqual(_remaining(client), ["B00RDEL005", "B00RDEL006"])
+
     def test_delete_batch_id_intersects_asins(self):
         """batch_id + asins：取交集，不在该批次里的 ASIN 不受影响。"""
         with isolated_server() as (client, _ctx):

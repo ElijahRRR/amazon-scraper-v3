@@ -22,6 +22,9 @@
 * ``search_like_pattern`` —— ``%term%``，**不转义**。读路径（``get_results``）
   与删除路径（``find_asins_by_search``）必须用同一个，否则同一个 search
   在 GET 和 DELETE 下选中不同的行（D-16 记的就是这个事故）。
+  两侧现在都做到了：PG 侧 ``results_read._like_pattern = search_like_pattern``，
+  SQLite 侧 ``get_results`` 的快慢两条路径也都调它（Phase 3.8 审计发现原来
+  只有 PG 侧做到，SQLite 读路径还留着自己的 ``f"%{t}%"``，已一并收口）。
 * ``CLEAR_TABLES`` —— ``clear_all_data`` 的删除清单。两侧各有一份实现
   （SQLite 删 ``sqlite_sequence``、PG 做 identity RESTART），但**删哪些表**
   必须是同一份，否则两个后端「清空」之后剩下的东西悄悄不同。

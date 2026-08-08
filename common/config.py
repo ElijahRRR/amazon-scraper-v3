@@ -69,6 +69,25 @@ DELIVERY_RETRY_MAX = int(os.environ.get("DELIVERY_RETRY_MAX", "2"))
 DUMP_DEGRADED_HTML = os.environ.get("DUMP_DEGRADED_HTML", "0") == "1"
 DEGRADED_DUMP_MAX = int(os.environ.get("DEGRADED_DUMP_MAX", "300"))
 
+# ============================================================
+# 内存管理（防长跑膨胀 / 泄漏兜底）
+# ============================================================
+# 截图子进程里 Chromium 是最大内存消耗源，且长跑必然缓慢膨胀（浏览器自身 + 页面
+# 缓存），跨平台皆然。两道闸门给 Chromium RSS 封顶：
+#   1) 渲染张数：每渲染 N 张就 close+relaunch 浏览器（原硬编码 500，偏高）。
+#   2) 进程树 RSS：截图子进程（含 Chromium 全部后代）RSS 超过此上限即 relaunch。
+# RSS 闸门需要 psutil；装了才生效，没装则只按张数闸门（另见 requirements.txt）。
+SCREENSHOT_BROWSER_RESTART_EVERY = int(
+    os.environ.get("SCREENSHOT_BROWSER_RESTART_EVERY", "200"))
+SCREENSHOT_RSS_RESTART_MB = int(
+    os.environ.get("SCREENSHOT_RSS_RESTART_MB", "1500"))  # 0=关闭 RSS 闸门
+
+# 内存诊断（默认关）：MEM_DIAG=1 时 worker 定期打印自身 RSS + 截图子进程树 RSS +
+# 各内部集合大小，用于在真机上定位"到底哪块在涨"。MEM_DIAG=2 额外打印 tracemalloc
+# Top 分配点。纯观测、无副作用，定位完可关。
+MEM_DIAG = int(os.environ.get("MEM_DIAG", "0"))
+MEM_DIAG_INTERVAL = int(os.environ.get("MEM_DIAG_INTERVAL", "60"))  # 秒
+
 # 变体自动展开安全阀：单个产品的候选同族变体数超过此值，视为巨型/定制类家族
 # （如定制尺寸围栏网，单族可达数千），跳过该产品的自动展开，防止一个种子炸成几千任务。
 VARIANT_EXPAND_FAMILY_CAP = 10

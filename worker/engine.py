@@ -18,11 +18,17 @@ import re
 import time
 import uuid
 import signal
+import subprocess
 import sys
 from typing import Optional, Dict, List
 
 import aiofiles
 import httpx
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from common import config
 from worker.proxy import get_proxy_manager
@@ -39,6 +45,53 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+_IS_WINDOWS = os.name == "nt"
+
+
+def _sigkill():
+    """SIGKILL if the platform has it, else SIGTERM (Windows 无 SIGKILL)。"""
+    return getattr(signal, "SIGKILL", signal.SIGTERM)
+
+
+def kill_process_tree(pid: Optional[int], pgid: Optional[int], force: bool = False) -> bool:
+    """跨平台杀掉一整棵进程树（含截图子进程底下的 Chromium 后代）。绝不抛异常。
+
+    - POSIX：子进程以 start_new_session=True 建组，pgid==pid，用 os.killpg 杀整组，
+      SIGTERM（优雅，留时间让 Playwright 收 Chromium）或 SIGKILL（强杀）。
+    - Windows：无 killpg/SIGKILL；用 taskkill /F /T /PID 杀进程树（/T 连子孙一起，
+      这是唯一能顺带干掉 Chromium 的办法——proc.terminate() 只杀 python 自身，
+      会把 Chromium 变孤儿）。
+    返回是否发出了终止指令。
+    """
+    killpg = getattr(os, "killpg", None)
+    if pgid and killpg is not None:
+        try:
+            killpg(pgid, signal.SIGTERM if not force else _sigkill())
+            return True
+        except ProcessLookupError:
+            return True  # 已经没了，视作成功
+        except Exception:
+            pass
+    if _IS_WINDOWS and pid:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=10,
+            )
+            return True
+        except Exception:
+            pass
+    # 兜底：单进程杀（POSIX 无 pgid 时 / taskkill 不可用时）
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM if not force else _sigkill())
+            return True
+        except ProcessLookupError:
+            return True
+        except Exception:
+            pass
+    return False
 
 
 class SessionSlot:
@@ -282,6 +335,10 @@ class Worker:
         self._degraded_dump_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "degraded_dump")
 
+        # 内存诊断（默认关，见 config.MEM_DIAG）：定位长跑内存增长在哪块。
+        self._mem_diag = int(getattr(config, "MEM_DIAG", 0) or 0)
+        self._mem_diag_interval = int(getattr(config, "MEM_DIAG_INTERVAL", 60) or 60)
+
     def _server_headers(self) -> dict:
         """与 ERP Server 通信的统一 header（含 API Key 认证）"""
         h = {}
@@ -307,6 +364,12 @@ class Worker:
         if self._dump_degraded:
             logger.info(f"   降级页样本采集: 开启 (上限 {self._degraded_dump_max}，"
                         f"目录 {self._degraded_dump_dir})")
+        logger.info(
+            f"   自动重启: {self._auto_restart_hours or 0}h (0=关闭，长跑建议设 6-12h 兜底内存膨胀) | "
+            f"Chromium 封顶: 每{getattr(config, 'SCREENSHOT_BROWSER_RESTART_EVERY', 200)}张 或 "
+            f"树RSS≥{getattr(config, 'SCREENSHOT_RSS_RESTART_MB', 1500)}MB")
+        if self._mem_diag > 0:
+            logger.info(f"   内存诊断: 开启 (级别 {self._mem_diag}，每 {self._mem_diag_interval}s 打印)")
 
         self._running = True
         self._stats["start_time"] = time.time()
@@ -345,6 +408,8 @@ class Worker:
             ]
             if self._auto_restart_hours and self._auto_restart_hours > 0:
                 coroutines.append(self._auto_restart_timer())
+            if self._mem_diag > 0:
+                coroutines.append(self._mem_diag_loop())
             await asyncio.gather(*coroutines)
         except asyncio.CancelledError:
             pass
@@ -1802,16 +1867,21 @@ class Worker:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            # start_new_session=True 下子进程成为新 session/pgroup leader，pgid 应等于 pid
-            try:
-                real_pgid = os.getpgid(self._screenshot_process.pid)
-                if real_pgid != self._screenshot_process.pid:
-                    logger.warning(
-                        f"📸 子进程 pgid({real_pgid}) != pid({self._screenshot_process.pid})，killpg 可能漏杀后代"
-                    )
-                self._screenshot_pgid = real_pgid
-            except Exception:
-                self._screenshot_pgid = self._screenshot_process.pid
+            # POSIX：start_new_session=True 下子进程成为新 session/pgroup leader，
+            # pgid==pid，记录下来供 os.killpg 杀整组。Windows 无 getpgid/killpg，
+            # pgid 保持 None，终止时改走 taskkill /T（按 pid 杀进程树）。
+            self._screenshot_pgid = None
+            getpgid = getattr(os, "getpgid", None)
+            if getpgid is not None:
+                try:
+                    real_pgid = getpgid(self._screenshot_process.pid)
+                    if real_pgid != self._screenshot_process.pid:
+                        logger.warning(
+                            f"📸 子进程 pgid({real_pgid}) != pid({self._screenshot_process.pid})，killpg 可能漏杀后代"
+                        )
+                    self._screenshot_pgid = real_pgid
+                except Exception:
+                    self._screenshot_pgid = self._screenshot_process.pid
         # 异步转发子进程日志
         self._screenshot_log_task = asyncio.create_task(
             self._forward_screenshot_logs(self._screenshot_process)
@@ -1832,28 +1902,86 @@ class Worker:
             pass
 
     async def _reap_screenshot_descendants(self, reason: str):
-        """清理截图子进程残留的浏览器后代进程（先 killpg，再兜底 kill PID）。"""
+        """强杀截图子进程整棵树（含 Chromium 后代）。跨平台、绝不抛异常。
+
+        POSIX 走 killpg(SIGKILL)，Windows 走 taskkill /F /T。这是防"孤儿 Chromium
+        累积吃内存"的关键兜底（子进程崩溃后 / 重启前 / 停止后都会调）。
+        """
         pgid = self._screenshot_pgid
         pid = self._screenshot_process.pid if self._screenshot_process else None
         if not pgid and not pid:
             return
-        try:
-            if pgid:
-                os.killpg(pgid, signal.SIGKILL)
-                logger.warning(f"📸 已强制清理截图进程组残留 (pgid={pgid}) | {reason}")
-        except ProcessLookupError:
-            pass
-        except Exception as e:
-            logger.warning(f"📸 清理截图进程组失败 (pgid={pgid}): {e}")
-        # 兜底：即便 killpg 失败或 pgid 已变，仍尝试 kill 主进程自身
-        if pid:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except Exception:
-                pass
+        if kill_process_tree(pid, pgid, force=True):
+            logger.warning(f"📸 已强制清理截图进程树 (pid={pid}, pgid={pgid}) | {reason}")
         self._screenshot_pgid = None
+
+    @staticmethod
+    def _proc_tree_rss_mb(pid: Optional[int]) -> Optional[float]:
+        """某进程 + 全部后代的 RSS 合计（MB）。需 psutil，否则 None。"""
+        if psutil is None or not pid:
+            return None
+        try:
+            proc = psutil.Process(pid)
+            total = proc.memory_info().rss
+            for child in proc.children(recursive=True):
+                try:
+                    total += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return total / (1024 * 1024)
+        except Exception:
+            return None
+
+    async def _mem_diag_loop(self):
+        """内存诊断（MEM_DIAG>0 时启用）：定期打印各处内存/集合大小，定位增长源。
+
+        纯观测，无副作用。MEM_DIAG>=2 时额外打印 tracemalloc Top 分配点。
+        """
+        tm = None
+        if self._mem_diag >= 2:
+            try:
+                import tracemalloc
+                tracemalloc.start(25)
+                tm = tracemalloc
+                logger.info("🧠 [mem] tracemalloc 已启用（MEM_DIAG>=2）")
+            except Exception as e:
+                logger.warning(f"🧠 [mem] tracemalloc 启用失败: {e}")
+        if psutil is None:
+            logger.warning("🧠 [mem] 未安装 psutil，RSS 无法采集（pip install psutil）；仅打印集合大小")
+        interval = max(10, self._mem_diag_interval)
+        while self._running:
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+                break  # shutdown
+            except asyncio.TimeoutError:
+                pass
+            try:
+                main_rss = self._proc_tree_rss_mb(os.getpid())
+                ss_pid = self._screenshot_process.pid if self._screenshot_process else None
+                ss_rss = self._proc_tree_rss_mb(ss_pid) if ss_pid else None
+                live_workers = len([t for t in self._worker_tasks if not t.done()])
+                records = len(getattr(self._metrics, "_records", []))
+                main_s = f"{main_rss:.0f}MB" if main_rss is not None else "n/a"
+                ss_s = f"{ss_rss:.0f}MB(pid={ss_pid})" if ss_rss is not None else (
+                    f"pid={ss_pid}" if ss_pid else "off")
+                logger.info(
+                    "🧠 [mem] 主进程树RSS=%s | 截图进程树RSS=%s | 协程=%d slot | "
+                    "队列: task=%d result=%d | 截图批次: pending=%d ids=%d | "
+                    "metrics记录=%d | 降级dump=%d | zip_onfetch=%s",
+                    main_s, ss_s, live_workers,
+                    self._task_queue.qsize() if self._task_queue else -1,
+                    self._result_queue.qsize() if self._result_queue else -1,
+                    len(self._screenshot_pending_batches),
+                    len(self._screenshot_batch_ids),
+                    records, self._degraded_dump_count, self._zip_onfetch,
+                )
+                if tm is not None:
+                    snapshot = tm.take_snapshot()
+                    top = snapshot.statistics("lineno")[:5]
+                    for i, stat in enumerate(top, 1):
+                        logger.info(f"🧠 [mem] tracemalloc #{i}: {stat}")
+            except Exception as e:
+                logger.warning(f"🧠 [mem] 诊断采集异常: {e}")
 
     async def _screenshot_gate_monitor(self):
         """监控截图子进程的 _uploaded 标记，完成后开门放行"""
@@ -1978,40 +2106,41 @@ class Worker:
             logger.error(f"🔄 软重启失败: {e}")
 
     async def _stop_screenshot_process(self):
-        """停止截图子进程"""
-        proc = self._screenshot_process
-        pgid = self._screenshot_pgid
-        if proc and proc.returncode is None:
-            try:
-                if pgid:
-                    os.killpg(pgid, signal.SIGTERM)
-                else:
-                    proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except asyncio.TimeoutError:
+        """停止截图子进程（跨平台、异常安全）。
+
+        整个过程包在 try 里：清理失败绝不能冒泡打断 stop()/_cleanup()/execv 自愈链
+        （历史上 Windows 因 os.killpg 抛 AttributeError 未被接住，直接让关停链崩溃、
+        且把 Chromium 变孤儿 → 累积吃内存）。
+        """
+        try:
+            proc = self._screenshot_process
+            pgid = self._screenshot_pgid
+            pid = proc.pid if proc else None
+            if proc and proc.returncode is None:
+                # 优雅停止：POSIX 发 SIGTERM 让 Playwright 收 Chromium；
+                # Windows 直接 taskkill /F /T 整棵树（proc.terminate 杀不到 Chromium）。
+                kill_process_tree(pid, pgid, force=_IS_WINDOWS)
                 try:
-                    if pgid:
-                        os.killpg(pgid, signal.SIGKILL)
-                    else:
-                        proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=3)
+                    await asyncio.wait_for(proc.wait(), timeout=10)
                 except asyncio.TimeoutError:
-                    logger.warning("📸 截图子进程强杀后仍未及时退出")
-            logger.info("📸 截图子进程已停止")
-        await self._reap_screenshot_descendants("停止截图子进程后兜底清理")
-        self._screenshot_process = None
-        if self._screenshot_log_task:
-            try:
-                await asyncio.wait_for(self._screenshot_log_task, timeout=1)
-            except Exception:
-                pass
-            self._screenshot_log_task = None
+                    kill_process_tree(pid, pgid, force=True)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        logger.warning("📸 截图子进程强杀后仍未及时退出")
+                logger.info("📸 截图子进程已停止")
+            # 兜底强杀整棵树，捞回可能逃出进程组的 Chromium 后代
+            await self._reap_screenshot_descendants("停止截图子进程后兜底清理")
+        except Exception as e:
+            logger.warning(f"📸 停止截图子进程时异常（已忽略，不影响关停）: {e}")
+        finally:
+            self._screenshot_process = None
+            if self._screenshot_log_task:
+                try:
+                    await asyncio.wait_for(self._screenshot_log_task, timeout=1)
+                except Exception:
+                    pass
+                self._screenshot_log_task = None
 
     # ═══════════════════════════════════════════════
     # 隧道模式 IP 轮换监控

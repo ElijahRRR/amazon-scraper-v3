@@ -16,7 +16,32 @@ from typing import Optional
 
 import httpx
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 logger = logging.getLogger("screenshot_worker")
+
+
+def _tree_rss_mb() -> Optional[float]:
+    """当前进程 + 全部后代（含 Chromium）的常驻内存合计，单位 MB。
+
+    需要 psutil；未安装时返回 None（调用方据此跳过 RSS 闸门）。跨平台。
+    """
+    if psutil is None:
+        return None
+    try:
+        proc = psutil.Process()
+        total = proc.memory_info().rss
+        for child in proc.children(recursive=True):
+            try:
+                total += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return total / (1024 * 1024)
+    except Exception:
+        return None
 
 
 class ScreenshotWorker:
@@ -35,7 +60,23 @@ class ScreenshotWorker:
         self._browser = None
         self._browser_lock = asyncio.Lock()
         self._render_count = 0
-        self._restart_every = 500
+        # Chromium 长跑必然缓慢膨胀 → 两道闸门给它 RSS 封顶（跨平台，Mac/Win/Linux 同理）。
+        # 张数闸门：每 N 张 relaunch（可用 SCREENSHOT_BROWSER_RESTART_EVERY 调，默认 200）。
+        try:
+            self._restart_every = int(
+                os.environ.get("SCREENSHOT_BROWSER_RESTART_EVERY", "200"))
+        except ValueError:
+            self._restart_every = 200
+        # RSS 闸门：进程树 RSS 超过此上限（MB）即 relaunch；需 psutil，0=关。
+        try:
+            self._rss_restart_mb = int(
+                os.environ.get("SCREENSHOT_RSS_RESTART_MB", "1500"))
+        except ValueError:
+            self._rss_restart_mb = 1500
+        if self._rss_restart_mb > 0 and psutil is None:
+            logger.warning(
+                "未安装 psutil，Chromium RSS 闸门失效，仅按渲染张数重启浏览器 "
+                "（pip install psutil 可启用 RSS 封顶）")
         self._running = True
         self._http_client: Optional[httpx.AsyncClient] = None
 
@@ -155,10 +196,21 @@ class ScreenshotWorker:
                 logger.error(f"截图任务未捕获异常: {type(result).__name__}: {result}")
 
         self._render_count += len(pending)
+        # 闸门 1：渲染张数
         if self._render_count >= self._restart_every:
-            logger.info(f"已渲染 {self._render_count} 张，重启浏览器")
+            logger.info(f"已渲染 {self._render_count} 张，重启浏览器（张数闸门）")
             await self._close_browser()
             self._render_count = 0
+            return
+        # 闸门 2：进程树 RSS（含 Chromium）超上限就 relaunch，直接给内存封顶
+        if self._rss_restart_mb > 0:
+            rss = _tree_rss_mb()
+            if rss is not None and rss >= self._rss_restart_mb:
+                logger.warning(
+                    f"截图进程树 RSS={rss:.0f}MB ≥ {self._rss_restart_mb}MB，"
+                    f"重启浏览器回收内存（RSS 闸门，已渲染 {self._render_count} 张）")
+                await self._close_browser()
+                self._render_count = 0
 
     # ==================== 单张截图 ====================
 
